@@ -23,8 +23,12 @@ jobs:
           BIN="target/release/ctx"
           [ -f "target/release/ctx.exe" ] && BIN="target/release/ctx.exe"
           "$BIN" mcp --protocol-check
-          TMP_HOME="$(mktemp -d)"
-          AGENT_CTX_HOME="$TMP_HOME" "$BIN" install --targets antigravity,claude
-          AGENT_CTX_HOME="$TMP_HOME" "$BIN" doctor
-          AGENT_CTX_HOME="$TMP_HOME" "$BIN" uninstall
+          TMP_HOME="$(pwd)/tmp-ci-home"
+          mkdir -p "$TMP_HOME"
+          export AGENT_CTX_HOME="$TMP_HOME"
+          export AGENT_CTX_RUNTIME_DIR="$TMP_HOME/rt"
+          export AGENT_CTX_SNAPSHOT_PATH="$TMP_HOME/cache/snapshot.bin"
+          "$BIN" install --targets antigravity,claude
+          "$BIN" doctor
+          "$BIN" uninstall
           rm -rf "$TMP_HOME"

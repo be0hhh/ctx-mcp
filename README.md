@@ -1,5 +1,10 @@
 # `ctx-mcp` — Zero-Dependency In-RAM Context Broker & MCP Server
 
+[![CI](https://github.com/be0hhh/ctx-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/be0hhh/ctx-mcp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/be0hhh/ctx-mcp)](https://github.com/be0hhh/ctx-mcp/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)
+
 `ctx-mcp` (`ctx`) is a single-binary, zero-dependency Rust `std` Context Broker and Model Context Protocol (MCP) server for AI coding agents (**Google Antigravity**, **Claude Code**, and **Codex CLI**).
 
 It keeps a shared 64-shard cache-line-padded in-RAM file & structural symbol index across parallel agents (up to `4 GiB` LRU), executes batched AVX2-accelerated searches (`q: ["Module:pattern", ...]`) with automatic `.hpp`/`.cpp`/module stem expansion, deduplicates repeated reads per agent session, and enforces strict workspace + secret-file boundaries (`.env*`, `*.pem`, `*.key`).
