@@ -1,6 +1,6 @@
-# Cx
+# CTX
 
-Cx is a local MCP server and CLI for finding source lines, symbols, and file
+CTX is a local MCP server and CLI for finding source lines, symbols, and file
 outlines. Codex and Antigravity can share one RAM cache and workspace memo board.
 Each client session tracks its own reads.
 
@@ -51,7 +51,7 @@ UTF-8 answer and defaults to 8192. Use `ctx help` for the CLI commands.
 ## Benchmark highlights
 
 Five parallel source-navigation tasks per client, comparing built-in search and
-file reads with Cx MCP. These measurements are from the November 2026 baseline.
+file reads with CTX MCP. These measurements are from the November 2026 baseline.
 
 | Metric | Codex GPT-6.2 Sol (Low) | Antigravity Gemini 4 Carbon (Low) |
 |---|---:|---:|
@@ -61,7 +61,7 @@ file reads with Cx MCP. These measurements are from the November 2026 baseline.
 | Full input tokens | 378,741 → 478,438 (+26.3%) | 286,149 → 197,547 (−31.0%) |
 | Output tokens | 1,213 → 1,545 (+27.4%) | 2,776 → 2,139 (−22.9%) |
 
-Cx reduced tool calls in both clients. Gemini used fewer input and output
+CTX reduced tool calls in both clients. Gemini used fewer input and output
 tokens in this run. Codex completed slightly faster and used more tokens.
 
 [Benchmark runner](benchmarks/README.md) ·

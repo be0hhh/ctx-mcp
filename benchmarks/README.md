@@ -1,8 +1,8 @@
-# Cx benchmarks
+# CTX benchmarks
 
 The [main README](../README.md#benchmark-highlights) contains the results.
 
-From the Cx root, run the local synthetic benchmark without model calls:
+From the CTX root, run the local synthetic benchmark without model calls:
 
 ```bash
 python3 -B benchmarks/run_benchmark.py --synthetic-only

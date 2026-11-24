@@ -1,4 +1,4 @@
-//! Cx unit tests. The test target compiles the production modules and attaches their private tests here.
+//! CTX unit tests. The test target compiles the production modules and attaches their private tests here.
 #![allow(dead_code)]
 
 #[path = "../src/hooks.rs"]
