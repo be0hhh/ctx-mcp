@@ -14,7 +14,8 @@ use crate::protocol::BrokerService;
 use crate::security::is_sensitive_path;
 use crate::store::{
     display_workspace_path, fnv1a_64, is_multimodal_or_binary_ext, norm_key_from_canon,
-    resolve_input_path, CachedFile, MissingResolution, RamStore, MAX_SINGLE_FILE_CACHE_BYTES,
+    resolve_input_path, restore_caller_path_style, CachedFile, MissingResolution, RamStore,
+    MAX_SINGLE_FILE_CACHE_BYTES,
 };
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -30,7 +31,7 @@ Outcome (answer/change + paths), Evidence (symbols/lines; `static-only` if unrun
 Boundaries (callers/shared files), Integration (risks). \
 Batch calls: ctx_inspect (dirs), ctx_search (`queries` <=4 or `query` + shorthand `roots`), ctx_symbols (`compact=true`), ctx_read (full files <=1MiB); CLI `ctx` if no MCP. Finish from search/symbols when sufficient.";
 
-const AGY_LAZY_MCP_SIGNATURES: &str = "Prefer eager mcp_agent_ctx_* tools (`ctx_inspect`, `ctx_search`, `ctx_read`, `ctx_symbols`, `ctx_capsule`); use call_mcp_tool for lazy tools (`ctx_outline`, `ctx_memo`) or CLI `ctx`.";
+const AGY_LAZY_MCP_SIGNATURES: &str = "Call eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_capsule`); use call_mcp_tool for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) or CLI `ctx`.";
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,13 +116,13 @@ pub fn should_skip_global_duplicate(flavor: &str, raw_stdin: &str) -> bool {
 fn extract_cwd(payload: &Json) -> Option<PathBuf> {
     if let Some(s) = payload.get_str("cwd") {
         if !s.trim().is_empty() {
-            return Some(PathBuf::from(s));
+            return Some(resolve_input_path(s, None));
         }
     }
     if let Some(arr) = payload.get("workspacePaths").and_then(|v| v.as_arr()) {
         if let Some(first) = arr.first().and_then(|v| v.as_str()) {
             if !first.trim().is_empty() {
-                return Some(PathBuf::from(first));
+                return Some(resolve_input_path(first, None));
             }
         }
     }
@@ -134,7 +135,8 @@ fn register_payload_workspaces(svc: &BrokerService, payload: &Json) -> Option<Pa
         for item in arr {
             if let Some(s) = item.as_str() {
                 if !s.trim().is_empty() {
-                    if let Some(r) = svc.allowlist.register_hint(Path::new(s), false) {
+                    let resolved = resolve_input_path(s, None);
+                    if let Some(r) = svc.allowlist.register_hint(&resolved, false) {
                         if primary_ws.is_none() {
                             primary_ws = Some(r);
                         }
@@ -628,7 +630,8 @@ fn candidate_agy_messages_dirs(payload: &Json, conv_id: &str) -> Vec<PathBuf> {
     };
     if let Some(tp_str) = payload.get_str("transcriptPath").filter(|s| !s.trim().is_empty()) {
         // `<brain>/<conv_id>/.system_generated/logs/transcript.jsonl` -> `.system_generated/messages`
-        if let Some(sys_gen) = Path::new(tp_str).parent().and_then(|p| p.parent()) {
+        let tp_resolved = resolve_input_path(tp_str, None);
+        if let Some(sys_gen) = tp_resolved.parent().and_then(|p| p.parent()) {
             push_unique(sys_gen.join("messages"));
         }
     }
@@ -636,7 +639,8 @@ fn candidate_agy_messages_dirs(payload: &Json, conv_id: &str) -> Vec<PathBuf> {
         .get_str("artifactDirectoryPath")
         .filter(|s| !s.trim().is_empty())
     {
-        push_unique(Path::new(art_str).join(".system_generated").join("messages"));
+        let art_resolved = resolve_input_path(art_str, None);
+        push_unique(art_resolved.join(".system_generated").join("messages"));
     }
     if let Ok(home) = std::env::var("AGENT_CTX_HOME")
         .or_else(|_| std::env::var("HOME"))
@@ -644,20 +648,15 @@ fn candidate_agy_messages_dirs(payload: &Json, conv_id: &str) -> Vec<PathBuf> {
     {
         if !home.trim().is_empty() && !conv_id.contains('/') && !conv_id.contains('\\') {
             let h = Path::new(&home).join(".gemini");
-            push_unique(
-                h.join("antigravity-cli")
-                    .join("brain")
-                    .join(conv_id)
-                    .join(".system_generated")
-                    .join("messages"),
-            );
-            push_unique(
-                h.join("antigravity")
-                    .join("brain")
-                    .join(conv_id)
-                    .join(".system_generated")
-                    .join("messages"),
-            );
+            for surface in ["antigravity-cli", "antigravity", "antigravity-ide"] {
+                push_unique(
+                    h.join(surface)
+                        .join("brain")
+                        .join(conv_id)
+                        .join(".system_generated")
+                        .join("messages"),
+                );
+            }
         }
     }
     dirs
@@ -724,9 +723,9 @@ fn inspect_agy_inbox_messages(payload: &Json, conv_id: &str) -> AgyStartupKind {
 fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupKind {
     // 1. Check transcript entries if already flushed to disk
     if let Some(tp_str) = payload.get_str("transcriptPath").filter(|s| !s.trim().is_empty()) {
-        let tp = Path::new(tp_str);
+        let tp = resolve_input_path(tp_str, None);
         if tp.is_file() {
-            let entries = read_first_transcript_entries(tp, 16);
+            let entries = read_first_transcript_entries(&tp, 16);
             let mut idx = 0usize;
             while idx < entries.len() {
                 let e = &entries[idx];
@@ -1385,7 +1384,7 @@ fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                                 }
                                 new_args.push((
                                     path_key.to_string(),
-                                    Json::Str(real_path.to_string_lossy().into_owned()),
+                                    Json::Str(restore_caller_path_style(raw_path, &real_path)),
                                 ));
                                 return Json::obj(vec![
                                     ("decision", Json::Str("ask".to_string())),
@@ -1507,7 +1506,8 @@ fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                             .map(|r| format!("\"{}\"", r))
                             .collect();
                         let reason = format!(
-                            "[RAM-Ctx] Broad `find` over >40 source files truncates >10KB output into `output.txt` and wastes a turn. Query the in-RAM index directly in 1 step via `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_inspect\", Arguments={{\"paths\": [{}], \"max_files\": 80}})` or `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_search\", Arguments={{\"query\": \"...\", \"roots\": [{}]}})`. (Repeat this exact `find` once if raw filesystem paths are strictly required.)",
+                            "[RAM-Ctx] Broad `find` over >40 source files truncates >10KB output into `output.txt` and wastes a turn. Query the in-RAM index directly in 1 step via `mcp_agent_ctx_ctx_inspect({{\"paths\": [{}], \"max_files\": 80}})` / `mcp_agent_ctx_ctx_search({{\"query\": \"...\", \"roots\": [{}]}})` (or `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_inspect\", Arguments={{\"paths\": [{}], \"max_files\": 80}})`). (Repeat this exact `find` once if raw filesystem paths are strictly required.)",
+                            paths_json.join(", "),
                             paths_json.join(", "),
                             paths_json.join(", ")
                         );

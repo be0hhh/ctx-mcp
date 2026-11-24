@@ -440,15 +440,23 @@ pub fn display_workspace_path(path: &Path, ws_root: Option<&Path>) -> String {
     s
 }
 
-pub fn resolve_input_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
-    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            return PathBuf::from(home).join(rest);
-        }
-    }
+/// Translates Windows UNC WSL paths (`\\wsl.localhost\<Distro>\...`, `\\wsl$\<Distro>\...`)
+/// and mounted Windows drive paths (`C:\...` -> `/mnt/c/...`) into Unix paths when running
+/// on Unix / WSL2 so Windows Desktop App MCP & hook payloads resolve natively in RAM.
+pub fn translate_host_path_str(raw: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
+        let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+        let norm = trimmed.replace('\\', "/");
+        for prefix in ["//wsl.localhost/", "//wsl$/"] {
+            if norm.len() > prefix.len() && norm[..prefix.len()].eq_ignore_ascii_case(prefix) {
+                let after = &norm[prefix.len()..];
+                if let Some((_distro, rest)) = after.split_once('/') {
+                    return Some(PathBuf::from(format!("/{}", rest.trim_start_matches('/'))));
+                }
+                return Some(PathBuf::from("/"));
+            }
+        }
         let bytes = trimmed.as_bytes();
         if bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
@@ -456,12 +464,95 @@ pub fn resolve_input_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
             && (bytes[2] == b'\\' || bytes[2] == b'/')
         {
             let drive = (bytes[0] as char).to_ascii_lowercase();
-            let tail = trimmed[3..].replace('\\', "/");
-            let candidate = PathBuf::from(format!("/mnt/{}/{}", drive, tail));
-            if candidate.exists() {
-                return candidate;
+            let mnt_drive = PathBuf::from(format!("/mnt/{}", drive));
+            if mnt_drive.is_dir() {
+                let tail = norm[3..].trim_start_matches('/');
+                return Some(if tail.is_empty() {
+                    mnt_drive
+                } else {
+                    mnt_drive.join(tail)
+                });
             }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = raw;
+    }
+    None
+}
+
+/// Restores the caller's original Windows UNC or drive-letter path style when rewriting
+/// a resolved Unix path back to a Windows Desktop App client over WSL2.
+pub fn restore_caller_path_style(raw_original: &str, resolved: &Path) -> String {
+    #[cfg(unix)]
+    {
+        let trimmed = raw_original.trim().trim_matches('"').trim_matches('\'');
+        let use_backslash = trimmed.contains('\\');
+        let norm = trimmed.replace('\\', "/");
+        for prefix in ["//wsl.localhost/", "//wsl$/"] {
+            if norm.len() > prefix.len() && norm[..prefix.len()].eq_ignore_ascii_case(prefix) {
+                let raw_prefix = &trimmed[..prefix.len()];
+                let after = &norm[prefix.len()..];
+                let distro = after.split('/').next().unwrap_or("");
+                if !distro.is_empty() {
+                    let rel = resolved.to_string_lossy();
+                    let sep = if use_backslash { '\\' } else { '/' };
+                    let body = if use_backslash {
+                        rel.trim_start_matches('/').replace('/', "\\")
+                    } else {
+                        rel.trim_start_matches('/').to_string()
+                    };
+                    let head = if use_backslash {
+                        raw_prefix.replace('/', "\\")
+                    } else {
+                        raw_prefix.replace('\\', "/")
+                    };
+                    return if body.is_empty() {
+                        format!("{}{}", head, distro)
+                    } else {
+                        format!("{}{}{}{}", head, distro, sep, body)
+                    };
+                }
+            }
+        }
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            let drive_char = bytes[0] as char;
+            let mnt_prefix = format!("/mnt/{}", drive_char.to_ascii_lowercase());
+            let res_str = resolved.to_string_lossy();
+            if res_str == mnt_prefix || res_str.starts_with(&format!("{}/", mnt_prefix)) {
+                let tail = res_str[mnt_prefix.len()..].trim_start_matches('/');
+                let sep = if use_backslash { '\\' } else { '/' };
+                let formatted_tail = if use_backslash {
+                    tail.replace('/', "\\")
+                } else {
+                    tail.to_string()
+                };
+                return format!("{}:{}{}", drive_char, sep, formatted_tail);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = raw_original;
+    }
+    resolved.to_string_lossy().into_owned()
+}
+
+pub fn resolve_input_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if let Some(translated) = translate_host_path_str(trimmed) {
+        return translated;
     }
     let p = PathBuf::from(trimmed);
     if p.is_absolute() {

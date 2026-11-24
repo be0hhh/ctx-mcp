@@ -104,13 +104,16 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
                     ("protocolVersion", Json::Str(chosen.to_string())),
                     (
                         "capabilities",
-                        Json::obj(vec![("tools", Json::Obj(Vec::new()))]),
+                        Json::obj(vec![
+                            ("tools", Json::Obj(Vec::new())),
+                            ("resources", Json::Obj(Vec::new())),
+                        ]),
                     ),
                     (
                         "serverInfo",
                         Json::obj(vec![
                             ("name", Json::Str("agent_ctx".to_string())),
-                            ("version", Json::Str("2.2.0".to_string())),
+                            ("version", Json::Str("2.3.0".to_string())),
                         ]),
                     ),
                     (
@@ -135,6 +138,23 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
             req_id,
             Json::obj(vec![("tools", tool_schemas())]),
         )),
+        "resources/list" => Some(rpc_result(
+            req_id,
+            Json::obj(vec![("resources", resource_schemas())]),
+        )),
+        "resources/templates/list" => Some(rpc_result(
+            req_id,
+            Json::obj(vec![("resourceTemplates", Json::Arr(Vec::new()))]),
+        )),
+        "resources/read" => {
+            let Some(uri) = params.get_str("uri") else {
+                return Some(rpc_error(req_id, -32602, "missing resource uri"));
+            };
+            match read_mcp_resource(uri, repo_root) {
+                Ok(result) => Some(rpc_result(req_id, result)),
+                Err(msg) => Some(rpc_error(req_id, -32602, &msg)),
+            }
+        }
         "tools/call" => {
             let Some(name) = params.get_str("name") else {
                 return Some(rpc_error(req_id, -32602, "missing tool name"));
@@ -593,6 +613,84 @@ fn tool_schemas() -> Json {
     Json::Arr(tools)
 }
 
+fn resource_schemas() -> Json {
+    Json::Arr(vec![
+        Json::obj(vec![
+            ("uri", Json::Str("ctx://status".to_string())),
+            ("name", Json::Str("RAM Context Broker Status".to_string())),
+            (
+                "description",
+                Json::Str(
+                    "Live in-RAM cache, shard, session, and snapshot telemetry for agent_ctx."
+                        .to_string(),
+                ),
+            ),
+            ("mimeType", Json::Str("application/json".to_string())),
+        ]),
+        Json::obj(vec![
+            ("uri", Json::Str("ctx://memos".to_string())),
+            ("name", Json::Str("Workspace Findings Board".to_string())),
+            (
+                "description",
+                Json::Str(
+                    "Shared workspace invariants and findings with automatic [STALE] FNV-1a tracking."
+                        .to_string(),
+                ),
+            ),
+            ("mimeType", Json::Str("text/markdown".to_string())),
+        ]),
+    ])
+}
+
+fn read_mcp_resource(uri: &str, repo_root: Option<&Path>) -> Result<Json, String> {
+    match uri {
+        "ctx://status" => {
+            let reply = call_daemon_or_inproc(Json::obj(vec![("op", Json::Str("status".to_string()))]));
+            let payload = reply.get("status").unwrap_or(&reply).to_json_string();
+            Ok(Json::obj(vec![(
+                "contents",
+                Json::Arr(vec![Json::obj(vec![
+                    ("uri", Json::Str("ctx://status".to_string())),
+                    ("mimeType", Json::Str("application/json".to_string())),
+                    ("text", Json::Str(payload)),
+                ])]),
+            )]))
+        }
+        "ctx://memos" => {
+            let reply = call_daemon_or_inproc(Json::obj(vec![
+                ("op", Json::Str("memo".to_string())),
+                ("action", Json::Str("list".to_string())),
+                ("cwd", Json::Str(workspace_cwd_str(repo_root))),
+                ("explicit_root", Json::Bool(repo_root.is_some())),
+            ]));
+            let mut md = String::from("# Workspace Findings Board (`ctx://memos`)\n\n");
+            if let Some(items) = reply.get("memos").and_then(Json::as_arr) {
+                if items.is_empty() {
+                    md.push_str("_No workspace memos recorded yet._\n");
+                } else {
+                    for item in items {
+                        let topic = item.get_str("topic").unwrap_or("untitled");
+                        let status = item.get_str("status").unwrap_or("fresh");
+                        let kind = item.get_str("kind").unwrap_or("finding");
+                        md.push_str(&format!("- **`{}`** (`{}`, status: `{}`)\n", topic, kind, status));
+                    }
+                }
+            } else {
+                md.push_str("_No workspace memos recorded yet._\n");
+            }
+            Ok(Json::obj(vec![(
+                "contents",
+                Json::Arr(vec![Json::obj(vec![
+                    ("uri", Json::Str("ctx://memos".to_string())),
+                    ("mimeType", Json::Str("text/markdown".to_string())),
+                    ("text", Json::Str(md)),
+                ])]),
+            )]))
+        }
+        other => Err(format!("unknown resource uri: {other}")),
+    }
+}
+
 pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
     let init = Json::obj(vec![
         ("jsonrpc", Json::Str("2.0".to_string())),
@@ -606,9 +704,23 @@ pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
         ("method", Json::Str("tools/list".to_string())),
         ("params", Json::Obj(Vec::new())),
     ]);
+    let res_list = Json::obj(vec![
+        ("jsonrpc", Json::Str("2.0".to_string())),
+        ("id", Json::Int(3)),
+        ("method", Json::Str("resources/list".to_string())),
+        ("params", Json::Obj(Vec::new())),
+    ]);
     let reply = handle_mcp_message_scoped(&init, repo_root, None).ok_or("initialize did not reply")?;
     if reply.get("result").and_then(|r| r.get_str("protocolVersion")) != Some(DEFAULT_WIRE_VER) {
         return Err("initialize did not return the default protocol version".into());
+    }
+    if reply
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .and_then(|c| c.get("resources"))
+        .is_none()
+    {
+        return Err("initialize did not advertise resources capability".into());
     }
     let reply = handle_mcp_message_scoped(&list, repo_root, None).ok_or("tools/list did not reply")?;
     let mut actual: Vec<_> = reply.get("result")
@@ -622,6 +734,18 @@ pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
     expected.sort_unstable();
     if !actual.iter().copied().eq(expected.iter().map(String::as_str)) {
         return Err(format!("tools/list mismatch: expected {expected:?}, got {actual:?}"));
+    }
+    let r_reply = handle_mcp_message_scoped(&res_list, repo_root, None).ok_or("resources/list did not reply")?;
+    let uris: Vec<_> = r_reply
+        .get("result")
+        .and_then(|r| r.get("resources"))
+        .and_then(Json::as_arr)
+        .ok_or("resources/list did not return a resources array")?
+        .iter()
+        .filter_map(|item| item.get_str("uri"))
+        .collect();
+    if uris != ["ctx://status", "ctx://memos"] {
+        return Err(format!("resources/list mismatch: got {uris:?}"));
     }
     Ok(actual.len())
 }

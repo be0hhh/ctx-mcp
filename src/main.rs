@@ -572,8 +572,8 @@ fn print_usage() {
     eprintln!(
         "Usage: ctx <command> [args]\n\
          Commands:\n\
-         \x20 ctx setup                                      Interactive harness scanner & installer\n\
-         \x20 ctx install [--targets agy,claude,codex] [--interactive] [--check]\n\
+         \x20 ctx setup [--eager core|search|all|none]       Interactive harness scanner & installer\n\
+         \x20 ctx install [--targets agy,claude,codex] [--eager core|search|all|none] [--no-wsl-bridge] [--check]\n\
          \x20 ctx uninstall [--targets agy,claude,codex] [--keep-binary]\n\
          \x20 ctx doctor [--json]\n\
          \x20 ctx bench [--agents 1,10,50,100,200] [--ops 20] [--json]\n\

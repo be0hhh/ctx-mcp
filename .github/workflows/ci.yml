@@ -36,6 +36,10 @@ jobs:
           export AGENT_CTX_HOME="$TMP_HOME"
           export AGENT_CTX_RUNTIME_DIR="$TMP_HOME/rt"
           export AGENT_CTX_SNAPSHOT_PATH="$TMP_HOME/cache/snapshot.bin"
+          "$BIN" install
+          "$BIN" doctor
+          "$BIN" install --eager=search
+          "$BIN" doctor
           "$BIN" install --targets antigravity,claude
           "$BIN" doctor
           "$BIN" uninstall

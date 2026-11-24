@@ -1829,6 +1829,71 @@ impl Drop for SearchProcess {
     }
 }
 
+fn resolve_rg_binary() -> &'static Path {
+    static RG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    RG_PATH
+        .get_or_init(|| {
+            let exe = if cfg!(windows) { "rg.exe" } else { "rg" };
+            if let Some(path_var) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    let cand = dir.join(exe);
+                    if cand.is_file() {
+                        return cand;
+                    }
+                }
+            }
+            // Desktop GUI apps (macOS / Linux / Windows) often spawn MCP & hook processes
+            // with a minimal system PATH omitting Homebrew, Cargo, WinGet, or ~/.local/bin.
+            let mut extra_dirs: Vec<PathBuf> = Vec::new();
+            #[cfg(unix)]
+            {
+                for sys_dir in [
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    "/home/linuxbrew/.linuxbrew/bin",
+                    "/usr/bin",
+                    "/bin",
+                ] {
+                    extra_dirs.push(PathBuf::from(sys_dir));
+                }
+            }
+            if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+                if !home.trim().is_empty() {
+                    let h = PathBuf::from(home);
+                    extra_dirs.push(h.join(".cargo").join("bin"));
+                    extra_dirs.push(h.join(".local").join("bin"));
+                    #[cfg(windows)]
+                    {
+                        extra_dirs.push(h.join("scoop").join("shims"));
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+                    if !local_app.trim().is_empty() {
+                        let la = PathBuf::from(local_app);
+                        extra_dirs.push(la.join("Microsoft").join("WinGet").join("Links"));
+                        extra_dirs.push(la.join("Programs").join("ripgrep"));
+                    }
+                }
+                if let Ok(pf) = std::env::var("ProgramFiles") {
+                    if !pf.trim().is_empty() {
+                        extra_dirs.push(PathBuf::from(pf).join("ripgrep"));
+                    }
+                }
+            }
+            for dir in extra_dirs {
+                let cand = dir.join(exe);
+                if cand.is_file() {
+                    return cand;
+                }
+            }
+            PathBuf::from(exe)
+        })
+        .as_path()
+}
+
 fn run_rg_once(
     query: &str,
     roots: &[PathBuf],
@@ -1836,7 +1901,7 @@ fn run_rg_once(
     fixed_strings: bool,
 ) -> Result<(), RgError> {
     search_time_left(collection.deadline).map_err(|_| RgError::Timeout)?;
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(resolve_rg_binary());
     cmd.arg("--no-config")
         .arg("--with-filename")
         .arg("--null")

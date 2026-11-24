@@ -251,7 +251,7 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
     let cwd = context
         .as_ref()
         .map(|context| context.workspace.clone())
-        .or_else(|| req.get_str("cwd").map(PathBuf::from));
+        .or_else(|| req.get_str("cwd").map(|s| crate::store::resolve_input_path(s, None)));
     if let Some(ref c) = cwd {
         let explicit = context.is_none() && req.get_bool("explicit_root").unwrap_or(false);
         if let Some(ws_root) = svc.allowlist.register_hint(c, explicit) {

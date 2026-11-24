@@ -104,10 +104,16 @@ def run_agy_task(
             "Use ONLY direct local rg/grep via run_command (or built-in grep_search / view_file). "
             "Batch searches where useful. Do NOT call call_mcp_tool or agent_ctx MCP."
         )
+    elif route.startswith("ctx:"):
+        r_prompt = (
+            "Use agent_ctx (`mcp_agent_ctx_ctx_search` directly when declared, or `call_mcp_tool` when lazy) "
+            'with `{"q": ["ModOrDir:pattern", ...]}` (1-4 parallel searches; bare module stem matches '
+            "all extensions; lowercase = smart-case). Finish directly from search matches when sufficient."
+        )
     else:
         r_prompt = (
-            'Use ONLY agent_ctx MCP via call_mcp_tool(ServerName="agent_ctx", ToolName="ctx_search", '
-            'Arguments={"q": ["ModOrDir:pattern", ...]}) (1-4 parallel searches; bare module stem matches '
+            'Use ONLY agent_ctx MCP via `mcp_agent_ctx_ctx_search` (or `call_mcp_tool` if lazy) with '
+            '`{"q": ["ModOrDir:pattern", ...]}` (1-4 parallel searches; bare module stem matches '
             "all extensions; lowercase = smart-case). Finish directly from search matches when sufficient."
         )
     prompt = (
@@ -133,6 +139,8 @@ def run_agy_task(
     result_obj: dict[str, Any] = {}
     tool_calls = 0
     mcp_calls = 0
+    direct_eager_mcp_calls = 0
+    lazy_wrapper_mcp_calls = 0
     result_bytes = 0
     tool_ms = 0.0
     for ev in events:
@@ -144,10 +152,12 @@ def run_agy_task(
                 ti = su.get("tool_info") or {}
                 result_bytes += len(str(ti.get("output") or "").encode("utf-8"))
                 tname = su.get("tool_name") or ti.get("name") or ""
-                if tname.startswith("mcp_agent_ctx_") or (
-                    tname == "call_mcp_tool" and (ti.get("parameters") or {}).get("ServerName") == "agent_ctx"
-                ):
+                if tname.startswith("mcp_agent_ctx_"):
                     mcp_calls += 1
+                    direct_eager_mcp_calls += 1
+                elif tname == "call_mcp_tool" and (ti.get("parameters") or {}).get("ServerName") == "agent_ctx":
+                    mcp_calls += 1
+                    lazy_wrapper_mcp_calls += 1
         elif ev.get("event") == "result":
             result_obj = ev.get("result") or {}
     usage = result_obj.get("usage") or {}
@@ -168,6 +178,8 @@ def run_agy_task(
         "seconds": round(float(result_obj.get("duration_seconds") or wall_s), 3),
         "tool_calls": tool_calls,
         "mcp_calls": mcp_calls,
+        "direct_eager_mcp_calls": direct_eager_mcp_calls,
+        "lazy_wrapper_mcp_calls": lazy_wrapper_mcp_calls,
         "tool_exec_total_ms": round(tool_ms, 3),
         "tool_result_bytes": result_bytes,
         "total_input_tokens": in_uncached + in_cached,
@@ -218,6 +230,11 @@ def main() -> int:
     ap.add_argument("--tasks-json", type=Path, default=None, help="JSON file defining benchmark tasks")
     ap.add_argument("--harnesses", default="agy", help="Comma-separated harnesses: agy")
     ap.add_argument("--agy-model", default="gemini-4-carbon-low", help="Antigravity model name")
+    ap.add_argument(
+        "--eager-profiles",
+        default=None,
+        help="Optional comma-separated Antigravity eager modes to compare (e.g. none,search,core)",
+    )
     ap.add_argument("--parallel", type=int, default=5, help="Parallel task workers per wave")
     args = ap.parse_args()
 
@@ -243,16 +260,42 @@ def main() -> int:
         if "agy" in harnesses or "antigravity" in harnesses:
             agy_bin = shutil.which("agy") or str(Path.home() / ".gemini/antigravity-cli/bin/agy")
             runs: dict[str, list[dict[str, Any]]] = {}
-            for route in ("direct", "ctx"):
+            if args.eager_profiles:
+                profiles = [p.strip() for p in args.eager_profiles.split(",") if p.strip()]
+                routes = ["direct"] + [f"ctx:{p}" for p in profiles]
+            else:
+                profiles = []
+                routes = ["direct", "ctx"]
+            for route in routes:
+                if route.startswith("ctx:"):
+                    prof = route.split(":", 1)[1]
+                    subprocess.run(
+                        [str(ctx_bin), "install", "--targets", "agy", f"--eager={prof}"],
+                        check=True,
+                        timeout=30,
+                    )
                 with ThreadPoolExecutor(max_workers=args.parallel) as pool:
                     futs = [pool.submit(run_agy_task, agy_bin, args.agy_model, ws, t, gt[t["id"]], route, args.parallel) for t in tasks]
                     rows = [f.result() for f in as_completed(futs)]
                 rows.sort(key=lambda r: r["task"])
                 runs[route] = rows
-            report["antigravity"] = {
-                "summary": summarize_pair(runs["direct"], runs["ctx"]),
-                "runs": runs,
-            }
+            if profiles:
+                subprocess.run(
+                    [str(ctx_bin), "install", "--targets", "agy", "--eager=core"],
+                    check=True,
+                    timeout=30,
+                )
+                report["antigravity"] = {
+                    "summaries_vs_direct": {
+                        f"ctx:{p}": summarize_pair(runs["direct"], runs[f"ctx:{p}"]) for p in profiles
+                    },
+                    "runs": runs,
+                }
+            else:
+                report["antigravity"] = {
+                    "summary": summarize_pair(runs["direct"], runs["ctx"]),
+                    "runs": runs,
+                }
 
         print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0

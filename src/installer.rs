@@ -27,16 +27,15 @@ const GLOBAL_BLOCK_BEGIN: &str = "<!-- BEGIN AGENT_CTX GLOBAL RULES -->";
 const GLOBAL_BLOCK_END: &str = "<!-- END AGENT_CTX GLOBAL RULES -->";
 
 const GLOBAL_RULES_SNIPPET: &str = "<!-- BEGIN AGENT_CTX GLOBAL RULES -->\n\
-## Быстрый контекст в ОЗУ (`ctx` / MCP `agent_ctx`)\n\
+## In-RAM Context Broker (`ctx` / MCP `agent_ctx`)\n\
 \n\
-- В Antigravity используй объявленные `mcp_agent_ctx_*` напрямую. Для lazy-инструмента используй `call_mcp_tool` с теми же аргументами. Файлы схем `mcp/agent_ctx/*.json` читать не нужно.\n\
-  - пакетный триаж папок/слайсов (`до 1 МиБ` на 40–80 файлов: точные строки, флаги `[>=600L]` / `[OVER 800L]`, `namespace`, `#include`, символы `[L_start-L_end]`): `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_inspect\", Arguments={\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80})` (CLI: `ctx inspect <paths...>`);\n\
-  - подробный структурный outline: `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_outline\", Arguments={\"paths\": [\"dir_or_file\"], \"max_files\": 40})` (CLI: `ctx outline <paths...>`);\n\
-  - точные тела структур/функций: `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_symbols\", Arguments={\"requests\": [\"path#Symbol\"], \"compact\": true})` (CLI: `ctx sym \"path#Symbol\" --compact`);\n\
-  - поиск кода (короткий пакет `q` до 4 параллельных запросов; имя модуля без расширения само подхватывает `.hpp`+`.cpp`): `ctx_search` с `{\"q\": [\"ModOrDir:pat\", ...]}` или `{\"query\": \"pat\", \"roots\": [\"dir\"]}` (CLI: `ctx search -q \"Mod:pat\"`);\n\
-  - общие заметки воркспейса: `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_memo\", Arguments={\"action\": \"list\"})` (или `\"put\"` с `\"topic\"`, `\"summary\"`, `\"paths\"`).\n\
-- Используй `[RAM-Ctx Startup]`, если он передан. Для десятков файлов передай нужные пути или директории одним массивом `paths` в `ctx_inspect` с `max_files=80`. Выбранные полные файлы читай одним `ctx_read` с массивом `paths`, точные тела одним `ctx_symbols`. По умолчанию на каждый пакет выделен 1 МиБ. При нескольких известных путях стремись выполнить не менее 90% запросов контекста пачками.\n\
-- Целые файлы читай за **1 вызов** (`read_file` в Antigravity до `800` строк / `46 КБ` инлайн для редактируемых файлов; `ctx_read` / `ctx read <path>` до `1 MiB` для файлов `> 800` строк в CLI/Codex/Claude). Не нарезай файлы окнами по `100–400` строк (`sed -n`, `head`, `nl`) и не перечитывай неизменившиеся файлы.\n\
+- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_capsule`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
+  - Parallel search (`1-4` queries in `q`, `8 KiB` cap; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
+  - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
+  - Exact struct/function bodies: `ctx_symbols` with `{\"requests\": [\"ModOrPath#Symbol\"], \"compact\": true}` (CLI: `ctx sym \"Mod#Sym\" --compact`).\n\
+  - Full files or slices (`<=1 MiB`, no 800-line cap): `ctx_read` with `{\"paths\": [\"path\" | \"path:1-250\"]}` (CLI: `ctx read <paths...>`).\n\
+  - Shared workspace findings board: `ctx_memo` with `{\"action\": \"list\" | \"put\", \"topic\": \"...\", \"summary\": \"...\", \"paths\": [...]}`.\n\
+- Reuse `[RAM-Ctx Startup]` when provided. Batch known paths into a single `ctx_inspect`, `ctx_read`, or `ctx_symbols` call (`1 MiB` default budget per batch), finish directly from grouped search hits or compact symbols when sufficient, and never slice files in `100-400` line shell loops (`sed`/`head`/`nl`) or re-read unchanged files already in context.\n\
 <!-- END AGENT_CTX GLOBAL RULES -->";
 
 fn effective_home_dir() -> Result<PathBuf, String> {
@@ -151,6 +150,9 @@ impl InstallPlan {
 
     fn json(&mut self, path: &Path) -> Result<Json, String> {
         let Some(raw) = self.text(path)? else { return Ok(Json::Obj(vec![])); };
+        if raw.trim().is_empty() {
+            return Ok(Json::Obj(vec![]));
+        }
         let val = json::parse_config(&raw).map_err(|e| format!("{}: invalid JSON: {}", path.display(), e))?;
         if val.as_obj().is_none() { return Err(format!("{}: expected JSON object", path.display())); }
         Ok(val)
@@ -334,8 +336,55 @@ fn format_pretty_json(val: &Json, indent: usize) -> String {
     }
 }
 
-fn build_agy_context_hook_cfg(ctx_bin: &Path) -> Json {
-    let cmd_str = format!("\"{}\" hook agy --global", ctx_bin.display());
+pub const AGY_CORE_EAGER_TOOLS: &[&str] = &[
+    "ctx_search",
+    "ctx_inspect",
+    "ctx_read",
+    "ctx_symbols",
+    "ctx_capsule",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EagerMode {
+    Core,
+    Search,
+    All,
+    None,
+}
+
+impl EagerMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "core" | "default" => Ok(Self::Core),
+            "search" | "minimal" => Ok(Self::Search),
+            "all" | "full" => Ok(Self::All),
+            "none" | "lazy" | "off" => Ok(Self::None),
+            other => Err(format!(
+                "unknown --eager mode `{other}` (expected core, search, all, or none)"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Search => "search",
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
+
+    pub fn eager_tool_names(self) -> Vec<String> {
+        match self {
+            Self::Core => AGY_CORE_EAGER_TOOLS.iter().map(|&s| s.to_string()).collect(),
+            Self::Search => vec!["ctx_search".to_string()],
+            Self::All => expected_tool_names(),
+            Self::None => Vec::new(),
+        }
+    }
+}
+
+fn build_agy_context_hook_cfg_cmd(cmd_str: String) -> Json {
     let hook_cmd = Json::obj(vec![
         ("type", Json::Str("command".to_string())),
         ("command", Json::Str(cmd_str)),
@@ -383,7 +432,72 @@ fn executable_name(command: &str) -> &str {
     command.trim_matches('"').rsplit(['/', '\\']).next().unwrap_or("")
 }
 
-fn plan_mcp(plan: &mut InstallPlan, path: &Path, bin: &Path, claude: bool) -> Result<(), String> {
+fn is_owned_agent_ctx_mcp_entry(entry: &Json) -> bool {
+    let exe = executable_name(entry.get_str("command").unwrap_or(""));
+    let args = entry.get("args").and_then(Json::as_arr).unwrap_or(&[]);
+    if matches!(exe, "ctx" | "ctx.exe") && args.first().and_then(Json::as_str) == Some("mcp") {
+        return true;
+    }
+    if matches!(exe, "wsl" | "wsl.exe") {
+        let len = args.len();
+        if len >= 2 && args[len - 1].as_str() == Some("mcp") {
+            let inner = executable_name(args[len - 2].as_str().unwrap_or(""));
+            if matches!(inner, "ctx" | "ctx.exe") {
+                return true;
+            }
+        }
+    }
+    matches!(exe, "python" | "python3" | "python.exe" | "python3.exe")
+        && args
+            .iter()
+            .filter_map(Json::as_str)
+            .any(|a| executable_name(a) == "run_ctx.py")
+}
+
+fn apply_agy_eager_tools(
+    entry: &mut Vec<(String, Json)>,
+    mode: EagerMode,
+    force_override: bool,
+    path: &Path,
+) -> Result<(), String> {
+    let existing_tools = match entry.iter().find(|(k, _)| k == "tools").map(|(_, v)| v) {
+        Some(Json::Obj(fields)) => fields.clone(),
+        None => Vec::new(),
+        _ => return Err(format!("{}: expected agent_ctx.tools to be an object", path.display())),
+    };
+    let desired_names = mode.eager_tool_names();
+    if desired_names.is_empty() {
+        if force_override {
+            remove_obj_field(entry, "tools");
+        }
+        return Ok(());
+    }
+    let mut merged = if force_override {
+        Vec::new()
+    } else {
+        existing_tools
+    };
+    for tool_name in desired_names {
+        if force_override || !merged.iter().any(|(k, _)| k == &tool_name) {
+            upsert_obj_field(
+                &mut merged,
+                &tool_name,
+                Json::obj(vec![("eager", Json::Bool(true))]),
+            );
+        }
+    }
+    upsert_obj_field(entry, "tools", Json::Obj(merged));
+    Ok(())
+}
+
+fn plan_mcp_custom(
+    plan: &mut InstallPlan,
+    path: &Path,
+    command_str: String,
+    args_vec: Vec<String>,
+    claude: bool,
+    agy_eager: Option<(EagerMode, bool)>,
+) -> Result<(), String> {
     let old = plan.json(path)?;
     let mut root = old.as_obj().unwrap().to_vec();
     let mut servers = object_field(&old, "mcpServers", path)?;
@@ -392,9 +506,7 @@ fn plan_mcp(plan: &mut InstallPlan, path: &Path, bin: &Path, claude: bool) -> Re
         let exe = executable_name(entry.get_str("command").unwrap_or(""));
         let args = entry.get("args").and_then(Json::as_arr).unwrap_or(&[]);
         let owned = if name == "agent_ctx" {
-            matches!(exe, "ctx" | "ctx.exe") && args.first().and_then(Json::as_str) == Some("mcp")
-                || matches!(exe, "python" | "python3" | "python.exe" | "python3.exe") &&
-                    args.iter().filter_map(Json::as_str).any(|a| executable_name(a) == "run_ctx.py")
+            is_owned_agent_ctx_mcp_entry(entry)
         } else {
             matches!(exe, "python" | "python3" | "python.exe" | "python3.exe") &&
                 args.iter().filter_map(Json::as_str).any(|a| a.replace('\\', "/").ends_with("tools/Codex/CxetMcpServer.py"))
@@ -406,11 +518,35 @@ fn plan_mcp(plan: &mut InstallPlan, path: &Path, bin: &Path, claude: bool) -> Re
         .and_then(|(_, v)| v.as_obj()).unwrap_or(&[]).to_vec();
     remove_obj_field(&mut entry, "cwd");
     if claude { upsert_obj_field(&mut entry, "type", Json::Str("stdio".into())); }
-    upsert_obj_field(&mut entry, "command", Json::Str(bin.to_string_lossy().into_owned()));
-    upsert_obj_field(&mut entry, "args", Json::Arr(vec![Json::Str("mcp".into())]));
+    upsert_obj_field(&mut entry, "command", Json::Str(command_str));
+    upsert_obj_field(
+        &mut entry,
+        "args",
+        Json::Arr(args_vec.into_iter().map(Json::Str).collect()),
+    );
+    if let Some((mode, force)) = agy_eager {
+        apply_agy_eager_tools(&mut entry, mode, force, path)?;
+    }
     upsert_obj_field(&mut servers, "agent_ctx", Json::Obj(entry));
     upsert_obj_field(&mut root, "mcpServers", Json::Obj(servers));
     plan.set_json(path, &old, Json::Obj(root))
+}
+
+fn plan_mcp(
+    plan: &mut InstallPlan,
+    path: &Path,
+    bin: &Path,
+    claude: bool,
+    agy_eager: Option<(EagerMode, bool)>,
+) -> Result<(), String> {
+    plan_mcp_custom(
+        plan,
+        path,
+        bin.to_string_lossy().into_owned(),
+        vec!["mcp".into()],
+        claude,
+        agy_eager,
+    )
 }
 
 fn plan_rules(plan: &mut InstallPlan, path: &Path, codex: bool) -> Result<(), String> {
@@ -687,11 +823,21 @@ fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<String, Stri
 fn owned_handler(item: &Json, flavor: &str, guard: Option<&str>) -> bool {
     let Some(cmd) = item.get_str("command") else { return false; };
     let suffix = format!(" hook {} --global", flavor);
-    if let Some(binary) = cmd.strip_suffix(&suffix) {
-        let single = if let Some(quoted) = binary.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+    if let Some(prefix) = cmd.strip_suffix(&suffix) {
+        let single = if let Some(quoted) = prefix.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             !quoted.contains('"')
-        } else { !binary.chars().any(char::is_whitespace) };
-        if single && matches!(executable_name(binary), "ctx" | "ctx.exe") { return true; }
+        } else { !prefix.chars().any(char::is_whitespace) };
+        if single && matches!(executable_name(prefix), "ctx" | "ctx.exe") {
+            return true;
+        }
+        let trimmed = prefix.trim();
+        let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+        if matches!(executable_name(first_tok), "wsl" | "wsl.exe") {
+            let last_tok = trimmed.split_whitespace().next_back().unwrap_or("");
+            if matches!(executable_name(last_tok), "ctx" | "ctx.exe") {
+                return true;
+            }
+        }
     }
     guard == Some(cmd)
 }
@@ -729,12 +875,18 @@ fn command_group(matcher: Option<&str>, cmd: &str) -> Json {
     Json::obj(fields)
 }
 
-fn plan_hooks(plan: &mut InstallPlan, path: &Path, bin: &Path, flavor: &str, guard: Option<&str>) -> Result<(), String> {
+fn plan_hooks_with_cmd(
+    plan: &mut InstallPlan,
+    path: &Path,
+    cmd_str: String,
+    flavor: &str,
+    guard: Option<&str>,
+) -> Result<(), String> {
     let old = plan.json(path)?;
     let key = if flavor == "agy" { "agent-context" } else { "hooks" };
     let current = Json::Obj(object_field(&old, key, path)?);
     let generated = if flavor == "agy" {
-        build_agy_context_hook_cfg(bin)
+        build_agy_context_hook_cfg_cmd(cmd_str)
     } else {
         let events: &[(&str, Option<&str>)] = if flavor == "codex" {
             &[("SessionStart", Some("^(compact|clear)$")), ("SubagentStart", None),
@@ -744,7 +896,6 @@ fn plan_hooks(plan: &mut InstallPlan, path: &Path, bin: &Path, flavor: &str, gua
             &[("SubagentStart", None), ("PreCompact", None), ("PreToolUse", Some("Agent|Task|Read|Bash|mcp__agent_ctx__ctx_.*")),
               ("PostToolUse", Some("Agent|Task|Read|Edit|MultiEdit|Write|Bash"))]
         };
-        let cmd = format!("\"{}\" hook {} --global", bin.display(), flavor);
         let fields = events.iter().map(|&(name, matcher)| {
             let mut groups = vec![];
             if let Some(guard) = guard {
@@ -754,7 +905,7 @@ fn plan_hooks(plan: &mut InstallPlan, path: &Path, bin: &Path, flavor: &str, gua
                     _ => {}
                 }
             }
-            groups.push(command_group(matcher, &cmd));
+            groups.push(command_group(matcher, &cmd_str));
             (name.to_string(), Json::Arr(groups))
         }).collect();
         Json::Obj(fields)
@@ -763,6 +914,11 @@ fn plan_hooks(plan: &mut InstallPlan, path: &Path, bin: &Path, flavor: &str, gua
     let mut root = old.as_obj().unwrap().to_vec();
     upsert_obj_field(&mut root, key, fields);
     plan.set_json(path, &old, Json::Obj(root))
+}
+
+fn plan_hooks(plan: &mut InstallPlan, path: &Path, bin: &Path, flavor: &str, guard: Option<&str>) -> Result<(), String> {
+    let cmd = format!("\"{}\" hook {} --global", bin.display(), flavor);
+    plan_hooks_with_cmd(plan, path, cmd, flavor, guard)
 }
 
 fn plan_cxet_python(plan: &mut InstallPlan, repo: &Path, home: &Path, codex: &Path) -> Result<(), String> {
@@ -813,6 +969,10 @@ pub struct TargetSet {
 impl TargetSet {
     pub const fn all() -> Self {
         Self { agy: true, claude: true, codex: true }
+    }
+
+    pub const fn agy_only() -> Self {
+        Self { agy: true, claude: false, codex: false }
     }
 
     pub const fn is_all(self) -> bool {
@@ -872,6 +1032,29 @@ fn load_saved_targets(bin: &Path) -> Option<TargetSet> {
     Some(set)
 }
 
+fn load_saved_eager(bin: &Path) -> Option<EagerMode> {
+    let txt = fs::read_to_string(targets_stamp_path(bin)).ok()?;
+    let parsed = json::parse_config(&txt).ok()?;
+    parsed.get_str("eager").and_then(|s| EagerMode::parse(s).ok())
+}
+
+fn write_targets_stamp(bin: &Path, targets: TargetSet, eager: EagerMode) {
+    let t_stamp = targets_stamp_path(bin);
+    let mut arr = Vec::new();
+    if targets.agy { arr.push(Json::Str("antigravity".into())); }
+    if targets.claude { arr.push(Json::Str("claude".into())); }
+    if targets.codex { arr.push(Json::Str("codex".into())); }
+    let body = format!(
+        "{}\n",
+        Json::obj(vec![
+            ("targets", Json::Arr(arr)),
+            ("eager", Json::Str(eager.as_str().into())),
+        ])
+        .to_json_string()
+    );
+    let _ = fs::write(&t_stamp, body);
+}
+
 fn which_in_path(exe_stem: &str) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else { return false; };
     for dir in std::env::split_paths(&path_var) {
@@ -888,10 +1071,99 @@ fn which_in_path(exe_stem: &str) -> bool {
     false
 }
 
+fn detect_wsl_windows_gemini_dirs(enable_bridge: bool) -> Option<(String, Vec<PathBuf>)> {
+    if !enable_bridge {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let (distro, users_root) = if let Ok(test_users) = std::env::var("AGENT_CTX_WSL_WIN_USERS_DIR") {
+            let d = std::env::var("AGENT_CTX_WSL_DISTRO")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Ubuntu".to_string());
+            if test_users.trim().is_empty() {
+                return None;
+            }
+            (d, PathBuf::from(test_users))
+        } else {
+            if std::env::var("AGENT_CTX_HOME").is_ok() {
+                return None;
+            }
+            let d = std::env::var("WSL_DISTRO_NAME").ok()?.trim().to_string();
+            if d.is_empty() {
+                return None;
+            }
+            (d, PathBuf::from("/mnt/c/Users"))
+        };
+        let rd = fs::read_dir(&users_root).ok()?;
+        let mut found = Vec::new();
+        for entry in rd.flatten() {
+            let user_dir = entry.path();
+            let Some(name) = user_dir.file_name().and_then(|s| s.to_str()) else { continue; };
+            if matches!(name, "Public" | "Default" | "Default User" | "All Users")
+                || name.starts_with('.')
+            {
+                continue;
+            }
+            if !user_dir.is_dir() {
+                continue;
+            }
+            let gemini = user_dir.join(".gemini");
+            let has_agy = gemini.join("antigravity").is_dir()
+                || gemini.join("antigravity-ide").is_dir()
+                || gemini.join("config").is_dir()
+                || user_dir.join("AppData/Local/Programs/Antigravity").is_dir();
+            if has_agy {
+                found.push(gemini);
+            }
+        }
+        found.sort();
+        if found.is_empty() {
+            None
+        } else {
+            Some((distro, found))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn detect_antigravity_desktop_app(home: &Path) -> bool {
+    if home.join(".gemini/antigravity").is_dir()
+        || home.join(".gemini/antigravity-ide").is_dir()
+        || Path::new("/Applications/Antigravity.app").exists()
+        || home.join("Applications/Antigravity.app").exists()
+        || which_in_path("antigravity")
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        for var in ["LOCALAPPDATA", "ProgramFiles"] {
+            if let Ok(base) = std::env::var(var) {
+                if !base.trim().is_empty() {
+                    let b = PathBuf::from(base);
+                    if b.join("Programs").join("Antigravity").is_dir()
+                        || b.join("Programs").join("Antigravity IDE").is_dir()
+                        || b.join("Antigravity").is_dir()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    detect_wsl_windows_gemini_dirs(true).is_some()
+}
+
 fn scan_detected_harnesses(home: &Path, codex_home: &Path) -> (bool, bool, bool) {
     let agy = home.join(".gemini/config").is_dir()
         || home.join(".gemini/antigravity-cli").is_dir()
-        || which_in_path("agy");
+        || which_in_path("agy")
+        || detect_antigravity_desktop_app(home);
     let claude = home.join(".claude").is_dir()
         || home.join(".claude.json").is_file()
         || which_in_path("claude");
@@ -899,14 +1171,10 @@ fn scan_detected_harnesses(home: &Path, codex_home: &Path) -> (bool, bool, bool)
     (agy, claude, codex)
 }
 
-fn recommended_default_targets(home: &Path, codex_home: &Path) -> TargetSet {
-    let (agy_det, claude_det, _codex_det) = scan_detected_harnesses(home, codex_home);
-    if !agy_det && !claude_det {
-        // Fresh machine: pre-select Antigravity + Claude; keep Codex off by default.
-        TargetSet { agy: true, claude: true, codex: false }
-    } else {
-        TargetSet { agy: agy_det, claude: claude_det, codex: false }
-    }
+fn recommended_default_targets(_home: &Path, _codex_home: &Path) -> TargetSet {
+    // Antigravity (CLI + Desktop App 2.0 + IDE) is the primary validated default;
+    // Claude Code and Codex CLI remain opt-in via interactive toggle or `--targets`.
+    TargetSet::agy_only()
 }
 
 fn open_interactive_tty() -> Option<(Box<dyn BufRead>, Box<dyn Write>)> {
@@ -940,19 +1208,19 @@ fn prompt_targets_interactive(home: &Path, codex_home: &Path) -> Result<Option<T
         let _ = writeln!(writer, "  ctx-mcp setup — select AI harnesses to configure:");
         let _ = writeln!(
             writer,
-            "    [{}] 1. Antigravity (Gemini)   {}  * Recommended (-45% time, -38% new tokens)",
+            "    [{}] 1. Antigravity (CLI, App 2.0 & IDE) {}  * Default (5 eager tools, -45% time, -38% new tokens)",
             mark(sel.agy),
             tag(agy_det)
         );
         let _ = writeln!(
             writer,
-            "    [{}] 2. Claude Code            {}  * Recommended",
+            "    [{}] 2. Claude Code                      {}  (optional)",
             mark(sel.claude),
             tag(claude_det)
         );
         let _ = writeln!(
             writer,
-            "    [{}] 3. Codex CLI (GPT/Sol)    {}  (off by default: deferred MCP token overhead)",
+            "    [{}] 3. Codex CLI (GPT/Sol)              {}  (optional: deferred MCP token overhead)",
             mark(sel.codex),
             tag(codex_det)
         );
@@ -1017,9 +1285,12 @@ fn plan_remove_mcp(plan: &mut InstallPlan, path: &Path) -> Result<(), String> {
         }
         let exe = executable_name(entry.get_str("command").unwrap_or(""));
         let args = entry.get("args").and_then(Json::as_arr).unwrap_or(&[]);
-        let owned = matches!(exe, "ctx" | "ctx.exe") && args.first().and_then(Json::as_str) == Some("mcp")
-            || matches!(exe, "python" | "python3" | "python.exe" | "python3.exe")
-                && args.iter().filter_map(Json::as_str).any(|a| executable_name(a) == "run_ctx.py" || a.replace('\\', "/").ends_with("tools/Codex/CxetMcpServer.py"));
+        let owned = if name == "agent_ctx" {
+            is_owned_agent_ctx_mcp_entry(entry)
+        } else {
+            matches!(exe, "python" | "python3" | "python.exe" | "python3.exe")
+                && args.iter().filter_map(Json::as_str).any(|a| a.replace('\\', "/").ends_with("tools/Codex/CxetMcpServer.py"))
+        };
         !owned
     });
     if servers.len() != before_len {
@@ -1147,12 +1418,110 @@ fn plan_remove_codex_toml(plan: &mut InstallPlan, path: &Path) -> Result<(), Str
     Ok(())
 }
 
+fn plan_wsl_windows_bridge(
+    plan: &mut InstallPlan,
+    win_gemini: &Path,
+    distro: &str,
+    wsl_ctx_bin: &Path,
+    eager: (EagerMode, bool),
+) -> Result<(), String> {
+    let cfg = win_gemini.join("config");
+    let bin_str = wsl_ctx_bin.to_string_lossy().into_owned();
+    plan_mcp_custom(
+        plan,
+        &cfg.join("mcp_config.json"),
+        "wsl.exe".to_string(),
+        vec![
+            "-d".to_string(),
+            distro.to_string(),
+            "--".to_string(),
+            bin_str.clone(),
+            "mcp".to_string(),
+        ],
+        false,
+        Some(eager),
+    )?;
+    let hook_bin = if bin_str.contains(' ') {
+        format!("\"{}\"", bin_str)
+    } else {
+        bin_str
+    };
+    let hook_cmd = format!("wsl.exe -d {} -- {} hook agy --global", distro, hook_bin);
+    plan_hooks_with_cmd(plan, &cfg.join("hooks.json"), hook_cmd, "agy", None)?;
+    plan_rules(plan, &cfg.join("AGENTS.md"), false)
+}
+
+fn plan_remove_wsl_windows_bridge(plan: &mut InstallPlan, win_gemini: &Path) -> Result<(), String> {
+    let cfg = win_gemini.join("config");
+    plan_remove_mcp(plan, &cfg.join("mcp_config.json"))?;
+    plan_remove_hooks(plan, &cfg.join("hooks.json"), "agy")?;
+    plan_remove_rules(plan, &cfg.join("AGENTS.md"))
+}
+
+fn check_agy_config_dir(cfg_dir: &Path) -> (bool, String) {
+    let mcp_path = cfg_dir.join("mcp_config.json");
+    let hooks_path = cfg_dir.join("hooks.json");
+    let Ok(mcp_raw) = fs::read_to_string(&mcp_path) else {
+        return (false, format!("missing {}", mcp_path.display()));
+    };
+    let Ok(mcp_json) = json::parse_config(&mcp_raw) else {
+        return (false, format!("invalid JSON in {}", mcp_path.display()));
+    };
+    let Some(entry) = mcp_json.get("mcpServers").and_then(|s| s.get("agent_ctx")) else {
+        return (false, format!("missing mcpServers.agent_ctx in {}", mcp_path.display()));
+    };
+    if !is_owned_agent_ctx_mcp_entry(entry) {
+        return (false, format!("unrecognized agent_ctx command in {}", mcp_path.display()));
+    }
+    let eager_count = entry
+        .get("tools")
+        .and_then(Json::as_obj)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(_, v)| v.get_bool("eager") == Some(true))
+                .count()
+        })
+        .unwrap_or(0);
+    let Ok(hooks_raw) = fs::read_to_string(&hooks_path) else {
+        return (false, format!("missing {}", hooks_path.display()));
+    };
+    let Ok(hooks_json) = json::parse_config(&hooks_raw) else {
+        return (false, format!("invalid JSON in {}", hooks_path.display()));
+    };
+    let Some(ac) = hooks_json.get("agent-context") else {
+        return (false, format!("missing agent-context hook in {}", hooks_path.display()));
+    };
+    for ev in ["SessionStart", "PreInvocation", "PreToolUse", "PostToolUse"] {
+        let has_ev = ac
+            .get(ev)
+            .and_then(Json::as_arr)
+            .is_some_and(|arr| !arr.is_empty());
+        if !has_ev {
+            return (
+                false,
+                format!("missing agent-context.{ev} in {}", hooks_path.display()),
+            );
+        }
+    }
+    (
+        true,
+        format!(
+            "{}: agent_ctx ok ({} eager tools), hooks ok",
+            cfg_dir.display(),
+            eager_count
+        ),
+    )
+}
+
 fn prepare_install(
     home: &Path,
     codex: &Path,
     bin: &Path,
     repo: Option<&Path>,
     targets: TargetSet,
+    eager: (EagerMode, bool),
+    wsl_bridge: bool,
 ) -> Result<InstallPlan, String> {
     let mut plan = InstallPlan::default();
     plan_binary(&mut plan, bin)?;
@@ -1176,7 +1545,7 @@ fn prepare_install(
         guard_cmd = Some(format!("{} -B \"{}\"", py, dest.display()));
     } else {
         if targets.agy {
-            plan_mcp(&mut plan, &agy.join("mcp_config.json"), bin, false)?;
+            plan_mcp(&mut plan, &agy.join("mcp_config.json"), bin, false, Some(eager))?;
             plan_hooks(&mut plan, &agy.join("hooks.json"), bin, "agy", None)?;
             plan_rules(&mut plan, &agy.join("AGENTS.md"), false)?;
         } else {
@@ -1195,6 +1564,16 @@ fn prepare_install(
         plan_rules(&mut plan, &agy.join("AGENTS.md"), false)?;
     }
 
+    if let Some((distro, win_dirs)) = detect_wsl_windows_gemini_dirs(wsl_bridge) {
+        for win_gemini in win_dirs {
+            if targets.agy || repo.is_some() {
+                plan_wsl_windows_bridge(&mut plan, &win_gemini, &distro, bin, eager)?;
+            } else {
+                plan_remove_wsl_windows_bridge(&mut plan, &win_gemini)?;
+            }
+        }
+    }
+
     if repo.is_some() || targets.codex {
         let cfg = codex.join("config.toml");
         let current = plan.text(&cfg)?.unwrap_or_default();
@@ -1208,7 +1587,7 @@ fn prepare_install(
 
     if repo.is_some() || targets.claude {
         plan_hooks(&mut plan, &home.join(".claude/settings.json"), bin, "claude", None)?;
-        plan_mcp(&mut plan, &home.join(".claude.json"), bin, true)?;
+        plan_mcp(&mut plan, &home.join(".claude.json"), bin, true, None)?;
     } else {
         plan_remove_hooks(&mut plan, &home.join(".claude/settings.json"), "claude")?;
         plan_remove_mcp(&mut plan, &home.join(".claude.json"))?;
@@ -1220,7 +1599,9 @@ pub fn run_install_cli(args: &[String]) -> i32 {
     let mut cxet_mode = false;
     let mut check_only = false;
     let mut interactive = false;
+    let mut wsl_bridge = true;
     let mut explicit_targets: Option<TargetSet> = None;
+    let mut explicit_eager: Option<EagerMode> = None;
     let mut explicit_root: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -1229,6 +1610,7 @@ pub fn run_install_cli(args: &[String]) -> i32 {
             "--cxet" => cxet_mode = true,
             "--check" => check_only = true,
             "--interactive" | "-i" => interactive = true,
+            "--no-wsl-bridge" => wsl_bridge = false,
             "--all" => explicit_targets = Some(TargetSet::all()),
             "--targets" if i + 1 < args.len() => {
                 i += 1;
@@ -1240,6 +1622,19 @@ pub fn run_install_cli(args: &[String]) -> i32 {
             arg if arg.starts_with("--targets=") => {
                 match TargetSet::parse_csv(&arg["--targets=".len()..]) {
                     Ok(t) => explicit_targets = Some(t),
+                    Err(e) => { eprintln!("ctx install error: {e}"); return 1; }
+                }
+            }
+            "--eager" if i + 1 < args.len() => {
+                i += 1;
+                match EagerMode::parse(&args[i]) {
+                    Ok(m) => explicit_eager = Some(m),
+                    Err(e) => { eprintln!("ctx install error: {e}"); return 1; }
+                }
+            }
+            arg if arg.starts_with("--eager=") => {
+                match EagerMode::parse(&arg["--eager=".len()..]) {
+                    Ok(m) => explicit_eager = Some(m),
                     Err(e) => { eprintln!("ctx install error: {e}"); return 1; }
                 }
             }
@@ -1261,6 +1656,11 @@ pub fn run_install_cli(args: &[String]) -> i32 {
     };
     let codex_home = effective_codex_home(&home);
     let ctx_bin = target_ctx_bin(&home);
+    let saved_targets = load_saved_targets(&ctx_bin);
+    let saved_eager = load_saved_eager(&ctx_bin);
+    let eager_mode = explicit_eager.or(saved_eager).unwrap_or(EagerMode::Core);
+    let eager_spec = (eager_mode, explicit_eager.is_some());
+
     let targets = if cxet_mode {
         TargetSet::all()
     } else if let Some(t) = explicit_targets {
@@ -1277,10 +1677,8 @@ pub fn run_install_cli(args: &[String]) -> i32 {
                 return 1;
             }
         }
-    } else if check_only {
-        load_saved_targets(&ctx_bin).unwrap_or_else(TargetSet::all)
     } else {
-        TargetSet::all()
+        saved_targets.unwrap_or_else(TargetSet::agy_only)
     };
 
     if targets.is_empty() && !check_only {
@@ -1292,7 +1690,15 @@ pub fn run_install_cli(args: &[String]) -> i32 {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Some(explicit_root.or_else(|| find_superproject_root(&cwd)).unwrap_or(cwd))
     } else { None };
-    let plan = match prepare_install(&home, &codex_home, &ctx_bin, repo.as_deref(), targets) {
+    let plan = match prepare_install(
+        &home,
+        &codex_home,
+        &ctx_bin,
+        repo.as_deref(),
+        targets,
+        eager_spec,
+        wsl_bridge,
+    ) {
         Ok(p) => p,
         Err(e) => { eprintln!("ctx install error: {}", e); return 1; }
     };
@@ -1309,26 +1715,17 @@ pub fn run_install_cli(args: &[String]) -> i32 {
     }
 
     if let Err(e) = plan.apply(&ctx_bin) { eprintln!("ctx install error: {}", e); return 1; }
-    let t_stamp = targets_stamp_path(&ctx_bin);
-    if targets.is_all() {
-        let _ = fs::remove_file(&t_stamp);
-    } else {
-        let mut arr = Vec::new();
-        if targets.agy { arr.push(Json::Str("antigravity".into())); }
-        if targets.claude { arr.push(Json::Str("claude".into())); }
-        if targets.codex { arr.push(Json::Str("codex".into())); }
-        let body = format!("{}\n", Json::obj(vec![("targets", Json::Arr(arr))]).to_json_string());
-        let _ = fs::write(&t_stamp, body);
-    }
+    write_targets_stamp(&ctx_bin, targets, eager_mode);
     #[cfg(windows)]
     if std::env::var("AGENT_CTX_HOME").is_err() {
         if let Some(dir) = ctx_bin.parent() { ensure_windows_user_path(dir); }
     }
     println!(
-        "ctx install{}: OK (binary={}, targets={}, updated {} file(s))",
+        "ctx install{}: OK (binary={}, targets={}, eager={}, updated {} file(s))",
         if cxet_mode { " --cxet" } else { "" },
         ctx_bin.display(),
         targets.summary(),
+        eager_mode.as_str(),
         stale.len()
     );
     0
@@ -1337,11 +1734,13 @@ pub fn run_install_cli(args: &[String]) -> i32 {
 pub fn run_uninstall_cli(args: &[String]) -> i32 {
     let mut explicit_targets: Option<TargetSet> = None;
     let mut keep_binary = false;
+    let mut wsl_bridge = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--all" => explicit_targets = Some(TargetSet::all()),
             "--keep-binary" => keep_binary = true,
+            "--no-wsl-bridge" => wsl_bridge = false,
             "--targets" if i + 1 < args.len() => {
                 i += 1;
                 match TargetSet::parse_csv(&args[i]) {
@@ -1376,6 +1775,11 @@ pub fn run_uninstall_cli(args: &[String]) -> i32 {
             plan_remove_mcp(&mut plan, &agy.join("mcp_config.json"))?;
             plan_remove_hooks(&mut plan, &agy.join("hooks.json"), "agy")?;
             plan_remove_rules(&mut plan, &agy.join("AGENTS.md"))?;
+            if let Some((_distro, win_dirs)) = detect_wsl_windows_gemini_dirs(wsl_bridge) {
+                for win_gemini in win_dirs {
+                    plan_remove_wsl_windows_bridge(&mut plan, &win_gemini)?;
+                }
+            }
         }
         if remove_set.codex {
             plan_remove_codex_toml(&mut plan, &codex_home.join("config.toml"))?;
@@ -1395,18 +1799,14 @@ pub fn run_uninstall_cli(args: &[String]) -> i32 {
 
     let t_stamp = targets_stamp_path(&ctx_bin);
     if partial || keep_binary {
-        let prev = load_saved_targets(&ctx_bin).unwrap_or_else(TargetSet::all);
+        let prev = load_saved_targets(&ctx_bin).unwrap_or_else(TargetSet::agy_only);
+        let eager = load_saved_eager(&ctx_bin).unwrap_or(EagerMode::Core);
         let remaining = TargetSet {
             agy: prev.agy && !remove_set.agy,
             claude: prev.claude && !remove_set.claude,
             codex: prev.codex && !remove_set.codex,
         };
-        let mut arr = Vec::new();
-        if remaining.agy { arr.push(Json::Str("antigravity".into())); }
-        if remaining.claude { arr.push(Json::Str("claude".into())); }
-        if remaining.codex { arr.push(Json::Str("codex".into())); }
-        let body = format!("{}\n", Json::obj(vec![("targets", Json::Arr(arr))]).to_json_string());
-        let _ = fs::write(&t_stamp, body);
+        write_targets_stamp(&ctx_bin, remaining, eager);
         println!("ctx uninstall: detached from {} (binary retained at {})", remove_set.summary(), ctx_bin.display());
     } else {
         let _ = stop_daemon_for_install();
@@ -1592,17 +1992,9 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
 
     // 6. Global configs check (respects selective harness installation in `.ctx.targets.json`)
     if let Ok(home) = effective_home_dir() {
-        let selected = load_saved_targets(&target_ctx_bin(&home)).unwrap_or_else(TargetSet::all);
-        let agy_ok = home
-            .join(".gemini")
-            .join("config")
-            .join("mcp_config.json")
-            .is_file()
-            && home
-                .join(".gemini")
-                .join("config")
-                .join("hooks.json")
-                .is_file();
+        let selected = load_saved_targets(&target_ctx_bin(&home)).unwrap_or_else(TargetSet::agy_only);
+        let agy_cfg_dir = home.join(".gemini").join("config");
+        let (agy_ok, agy_detail) = check_agy_config_dir(&agy_cfg_dir);
         let codex_home = effective_codex_home(&home);
         let cx_ok = codex_home.join("config.toml").is_file()
             && codex_home.join("hooks.json").is_file();
@@ -1630,6 +2022,15 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
                 fmt_slot(selected.claude, cl_ok)
             ),
         );
+        if selected.agy {
+            record("antigravity_mcp", agy_ok, agy_detail);
+            if let Some((_distro, win_dirs)) = detect_wsl_windows_gemini_dirs(true) {
+                for win_gemini in win_dirs {
+                    let (w_ok, w_detail) = check_agy_config_dir(&win_gemini.join("config"));
+                    record("wsl_windows_bridge", w_ok, w_detail);
+                }
+            }
+        }
 
         // Codex layers are checked when Codex is selected (or when `[mcp_servers.agent_ctx]` is present).
         let expected = expected_tool_names();

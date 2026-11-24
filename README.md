@@ -8,10 +8,10 @@
 `ctx-mcp` (`ctx`) is a fast, single-binary **in-RAM Context Broker and Model Context Protocol (MCP) server** written in pure Rust (`0` external crates). Instead of letting every AI coding agent blindly scan your repository from scratch on every prompt, `ctx-mcp` keeps a live, auto-invalidated index of your codebase in memory and answers multi-file navigation, symbol, and read queries in **one compact round-trip**.
 
 > [!IMPORTANT]
-> **Current Validation Status — Battle-Tested on Google Antigravity:**
-> - **Google Antigravity (Gemini):** **Thoroughly benchmarked and proven.** In end-to-end 5-agent parallel waves, `ctx-mcp` cuts **parallel wave time by `-51.8%`**, **mean task time by `-44.7%`**, **tool round-trips by `-64.3%`**, and **new (uncached) input tokens by `-38.5%`** while maintaining `100%` (`20/20`) `file:line` accuracy ([see full comparison table below](#1-google-antigravity--gemini-4-carbon-low-5-parallel-tasks)).
-> - **Claude Code:** Eager MCP and lifecycle hooks are fully supported; extended live-model benchmark runs are currently being collected.
-> - **Codex CLI (`GPT / Sol`):** Reported transparently below. Although `ctx` search itself runs in `1.23 ms`, Codex CLI's deferred MCP `tool_search` wrapper adds an extra API turn (`~19k` cached tokens) on short tasks, so **Codex CLI is unchecked `[ ]` by default** during setup.
+> **Current Validation Status — Battle-Tested on Google Antigravity (CLI, Desktop App 2.0 & IDE):**
+> - **Google Antigravity (Gemini):** **Primary default target, thoroughly benchmarked and proven.** Clean install automatically enables **5 eager navigation tools** (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_capsule`), lifecycle hooks across CLI/App/IDE, and an automatic **WSL2 <-> Windows Desktop App bridge**. In end-to-end 5-agent parallel waves, `ctx-mcp` cuts **parallel wave time by `-51.8%`**, **mean task time by `-44.7%`**, **tool round-trips by `-64.3%`**, and **new (uncached) input tokens by `-38.5%`** while maintaining `100%` (`20/20`) `file:line` accuracy ([see full comparison table below](#1-google-antigravity--gemini-4-carbon-low-5-parallel-tasks)).
+> - **Claude Code:** Opt-in (`--targets antigravity,claude` or toggle `2` in `ctx setup`); stdio MCP and lifecycle hooks are supported.
+> - **Codex CLI (`GPT / Sol`):** Opt-in (`--targets codex` or toggle `3`). Reported transparently below: although `ctx` search itself runs in `1.23 ms`, Codex CLI's deferred MCP `tool_search` wrapper adds an extra API turn (`~19k` cached tokens) on short tasks, so **Codex CLI stays off by default**.
 
 ---
 
@@ -48,26 +48,34 @@ npx github:be0hhh/ctx-mcp
 ```
 
 ### Interactive Setup Menu
-`ctx setup` detects which AI harnesses are present on your machine and pre-selects the recommended targets:
+`ctx setup` detects Antigravity (CLI `agy`, Desktop App 2.0, and Antigravity IDE — including Windows host installs when run inside WSL2) and pre-selects Antigravity with the `core` 5-tool eager profile:
 
 ```text
 Downloaded prebuilt ctx-linux-x86_64 from GitHub Releases (SHA-256 verified).
 
   ctx-mcp setup — select AI harnesses to configure:
-    [x] 1. Antigravity (Gemini)   [detected]   * Recommended (-45% time, -38% new tokens)
-    [x] 2. Claude Code            [detected]   * Recommended
-    [ ] 3. Codex CLI (GPT/Sol)    [detected]   (off by default: deferred MCP token overhead)
+    [x] 1. Antigravity (CLI, App 2.0 & IDE) [detected]   * Default (5 eager tools, -45% time, -38% new tokens)
+    [ ] 2. Claude Code                      [detected]   (optional)
+    [ ] 3. Codex CLI (GPT/Sol)              [detected]   (optional: deferred MCP token overhead)
 
   Press Enter to confirm, type 1/2/3 to toggle (or 'all' / 'none' / 'q' to cancel):
 ```
 
-- **Non-interactive / CI setup:**
+- **Zero-prompt Antigravity install (CLI + Desktop App 2.0 + IDE + WSL2 <-> Windows bridge):**
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/be0hhh/ctx-mcp/main/setup/install.sh | bash -s -- --targets antigravity,claude
+  curl -fsSL https://raw.githubusercontent.com/be0hhh/ctx-mcp/main/setup/install.sh | bash -s -- --targets antigravity
+  ```
+- **Select Antigravity eager tool profile (`core` = default 5 tools, `search` = minimal `ctx_search` only, `all` = all 8 tools, `none` = all lazy):**
+  ```bash
+  ctx install --targets antigravity --eager=core
+  ```
+- **Include Claude Code or Codex CLI explicitly:**
+  ```bash
+  ctx install --targets antigravity,claude
   ```
 - **Force compile from source** (optional, requires `rustc`): pass `--from-source`
 - **Re-configure harnesses anytime:** `ctx setup`
-- **Verify daemon IPC, snapshot & config health:** `ctx doctor`
+- **Verify daemon IPC, snapshot, eager MCP tools, hooks & WSL2 bridge health:** `ctx doctor`
 
 ### Clean Uninstall
 Stops the background daemon, removes only `agent_ctx` MCP & hook entries (preserving your other MCP servers, hooks, and `.bak` backups), and deletes `~/.local/bin/ctx`:
@@ -219,8 +227,15 @@ Measured on a ~1,800-file C++26 & Python repository across **5 independent 4-anc
 | `ctx_read` | `ctx read <path[:s-e]>` | Full-file or line-range read from RAM up to `1 MiB` (no 800-line truncation) |
 | `ctx_outline` | `ctx outline <path...>` | Structural `[L_start-L_end]` symbol spans across files/directories |
 | `ctx_memo` | `ctx memo <put\|get\|list>` | Shared workspace findings board with automatic `[STALE]` FNV-1a tracking |
-| `ctx_capsule` | `ctx capsule <prepare\|claim>` | Host-verified subagent task capsule handoff |
-| `ctx_elf_audit` | `ctx elf --elf <bin>` | Optional static ELF64 section/symbol audit |
+| `ctx_capsule` | `ctx capsule <prepare\|claim>` | Host-verified subagent task capsule handoff *(eager by default)* |
+| `ctx_elf_audit` | `ctx elf --elf <bin>` | Optional static ELF64 section/symbol audit *(lazy by default)* |
+
+### MCP Resources (Inspectable in Desktop App / IDE UI)
+
+| Resource URI | MIME Type | Purpose |
+|---|---|---|
+| `ctx://status` | `application/json` | Live in-RAM cache, shard, active session, and `ACTXSNP2` snapshot telemetry |
+| `ctx://memos` | `text/markdown` | Workspace findings board (`ctx_memo`) with automatic `[STALE]` FNV-1a status |
 
 ## License
 
