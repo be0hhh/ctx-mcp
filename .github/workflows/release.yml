@@ -10,6 +10,9 @@ on:
         required: true
         default: "v2.2.0"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
 
@@ -19,42 +22,67 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            asset: ctx-linux-x86_64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            asset: ctx-linux-aarch64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: ctx-macos-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset: ctx-macos-x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: ctx-windows-x86_64.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-musl
+          - name: macos-universal-pair
+            os: macos-latest
+            targets: aarch64-apple-darwin, x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Build release binary
+          targets: ${{ matrix.targets }}
+      - name: Build static/native release binaries & verify protocol
         shell: bash
         run: |
-          cargo build --release --target "${{ matrix.target }}"
           mkdir -p dist
-          if [[ "${{ matrix.asset }}" == *.exe ]]; then
-            cp "target/${{ matrix.target }}/release/ctx.exe" "dist/${{ matrix.asset }}"
-          else
-            cp "target/${{ matrix.target }}/release/ctx" "dist/${{ matrix.asset }}"
-            chmod 0755 "dist/${{ matrix.asset }}"
-          fi
+          case "${{ matrix.name }}" in
+            linux-x86_64)
+              cargo build --release --target x86_64-unknown-linux-musl
+              cp target/x86_64-unknown-linux-musl/release/ctx dist/ctx-linux-x86_64
+              chmod 0755 dist/ctx-linux-x86_64
+              if strings dist/ctx-linux-x86_64 | grep '^GLIBC_' >/dev/null; then
+                echo "error: unexpected dynamic GLIBC symbol in static musl binary" >&2
+                exit 1
+              fi
+              ./dist/ctx-linux-x86_64 mcp --protocol-check
+              ;;
+            linux-aarch64)
+              cargo build --release --target aarch64-unknown-linux-musl
+              cp target/aarch64-unknown-linux-musl/release/ctx dist/ctx-linux-aarch64
+              chmod 0755 dist/ctx-linux-aarch64
+              if strings dist/ctx-linux-aarch64 | grep '^GLIBC_' >/dev/null; then
+                echo "error: unexpected dynamic GLIBC symbol in static musl binary" >&2
+                exit 1
+              fi
+              ./dist/ctx-linux-aarch64 mcp --protocol-check
+              ;;
+            macos-universal-pair)
+              cargo build --release --target aarch64-apple-darwin
+              cargo build --release --target x86_64-apple-darwin
+              cp target/aarch64-apple-darwin/release/ctx dist/ctx-macos-arm64
+              cp target/x86_64-apple-darwin/release/ctx dist/ctx-macos-x86_64
+              chmod 0755 dist/ctx-macos-arm64 dist/ctx-macos-x86_64
+              ./dist/ctx-macos-arm64 mcp --protocol-check
+              ;;
+            windows-x86_64)
+              cargo build --release --target x86_64-pc-windows-msvc
+              cp target/x86_64-pc-windows-msvc/release/ctx.exe dist/ctx-windows-x86_64.exe
+              ./dist/ctx-windows-x86_64.exe mcp --protocol-check
+              ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
-          name: bin-${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: bin-${{ matrix.name }}
+          path: dist/ctx-*
 
   publish:
     needs: build
@@ -72,6 +100,7 @@ jobs:
           cd artifacts
           chmod 0755 ctx-linux-* ctx-macos-* || true
           sha256sum ctx-* > SHA256SUMS
+          cat SHA256SUMS
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" ctx-* SHA256SUMS --clobber --repo "$REPO"

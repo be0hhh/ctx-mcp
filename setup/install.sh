@@ -70,21 +70,23 @@ find_rustc() {
   fi
 }
 
-# 1. If invoked from a local source checkout and rustc is available, compile fresh local sources directly;
-#    otherwise fetch prebuilt release binary first (zero Rust required!) and fall back to source build.
+# 1. Always prefer the prebuilt verified binary from GitHub Releases first (including npx & git clone),
+#    unless --from-source was explicitly requested. Zero Rust toolchain required.
 BUILT=0
-if [ "$FROM_SOURCE" -eq 0 ] && [ ! -f "${LOCAL_MAIN:-}" ]; then
+if [ "$FROM_SOURCE" -eq 0 ]; then
   if ASSET="$(detect_asset)" && command -v curl >/dev/null 2>&1; then
     BASE_URL="https://github.com/${REPO}/releases/latest/download"
     if curl -fsSL "${BASE_URL}/${ASSET}" -o "$CTX_TMP" 2>/dev/null \
        && curl -fsSL "${BASE_URL}/SHA256SUMS" -o "$TMP_DIR/SHA256SUMS" 2>/dev/null \
        && verify_sha256 "$CTX_TMP" "$TMP_DIR/SHA256SUMS" "$ASSET"; then
       chmod 0755 "$CTX_TMP"
+      printf 'Downloaded prebuilt %s from GitHub Releases (SHA-256 verified).\n' "$ASSET"
       BUILT=1
     fi
   fi
 fi
 
+# 2. Fallback to rustc only when --from-source is passed or no prebuilt release exists for this OS/CPU.
 if [ "$BUILT" -eq 0 ]; then
   if [ -f "${LOCAL_MAIN:-}" ] && RUSTC_BIN="$(find_rustc)"; then
     printf 'Building ctx from local source (%s)...\n' "$RUSTC_BIN"

@@ -1,8 +1,20 @@
 # One-command terminal installer for ctx-mcp (Windows PowerShell).
 # Usage:
 #   irm https://raw.githubusercontent.com/be0hhh/ctx-mcp/main/setup/install.ps1 | iex
+#   powershell -ExecutionPolicy Bypass -File setup/install.ps1 [--targets antigravity,claude] [--from-source]
 $ErrorActionPreference = "Stop"
 $Repo = if ($env:CTX_MCP_REPO) { $env:CTX_MCP_REPO } else { "be0hhh/ctx-mcp" }
+$FromSource = $false
+$ForwardArgs = @()
+
+foreach ($a in $args) {
+    if ($a -eq "--from-source") {
+        $FromSource = $true
+    } else {
+        $ForwardArgs += $a
+    }
+}
+
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ctx-mcp-setup-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
@@ -10,9 +22,11 @@ try {
     $CtxTmp = Join-Path $TmpDir "ctx.exe"
     $Asset = "ctx-windows-x86_64.exe"
     $Built = $false
-
     $LocalMain = if ($PSScriptRoot) { Join-Path $PSScriptRoot "..\src\main.rs" } else { "" }
-    if (-not ($LocalMain -and (Test-Path $LocalMain))) {
+
+    # 1. Always prefer the prebuilt verified binary from GitHub Releases first (including npx & git clone),
+    #    unless --from-source was explicitly requested. Zero Rust toolchain required.
+    if (-not $FromSource) {
         try {
             $BaseUrl = "https://github.com/$Repo/releases/latest/download"
             Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$Asset" -OutFile $CtxTmp
@@ -25,6 +39,7 @@ try {
                 if ($ExpectedHash -ne $ActualHash) {
                     throw "SHA256 mismatch for $Asset"
                 }
+                Write-Host "Downloaded prebuilt $Asset from GitHub Releases (SHA-256 verified)."
                 $Built = $true
             }
         } catch {
@@ -32,6 +47,7 @@ try {
         }
     }
 
+    # 2. Fallback to rustc only when --from-source is passed or prebuilt download failed.
     if (-not $Built) {
         $Rustc = Get-Command rustc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
         if (-not $Rustc -and (Test-Path "$HOME\.cargo\bin\rustc.exe")) {
@@ -56,7 +72,11 @@ try {
         }
     }
 
-    & $CtxTmp setup
+    if ($ForwardArgs.Count -gt 0) {
+        & $CtxTmp install @ForwardArgs
+    } else {
+        & $CtxTmp setup
+    }
 } finally {
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 }
