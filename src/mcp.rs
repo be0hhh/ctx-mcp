@@ -113,20 +113,15 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
                         "serverInfo",
                         Json::obj(vec![
                             ("name", Json::Str("agent_ctx".to_string())),
-                            ("version", Json::Str("2.3.0".to_string())),
+                            ("version", Json::Str("2.3.1".to_string())),
                         ]),
                     ),
                     (
                         "instructions",
                         Json::Str(
-                            "In-RAM Context Broker. Batch paths/searches; finish from search or compact symbols when sufficient.\n\
-                             - ctx_search: {\"q\":[\"ModOrDir:pat\",...]} (1-4 parallel searches, 8KiB cap; bare stem matches .hpp+.cpp; lowercase = smart-case)\n\
-                             - ctx_inspect: {\"paths\":[\"dir1\",\"dir2\"],\"max_files\":80} (lines, >=600L/>800L flags, ns, #include, symbols)\n\
-                             - ctx_symbols: {\"requests\":[\"ModOrPath#Sym\"],\"compact\":false} (compact=true: <=24L + continuation)\n\
-                             - ctx_read: {\"paths\":[\"file\"|\"file:1-250\"],\"max_bytes\":1048576,\"force\":false}\n\
-                             - ctx_outline: {\"paths\":[\"dir_or_file\"],\"max_files\":40}\n\
-                             - ctx_memo: {\"action\":\"put|get|list\",\"topic\":\"key\",\"summary\":\"...\",\"paths\":[\"file\"]}\n\
-                             - ctx_elf_audit: {\"elf_path\":\"bin\",\"asm_path\":\"opt\"}"
+                            "Batch related lookups. For ctx_search q arrays, use a known root in every item, \
+                             for example graph:scan_manifests. Limit hits per query with max_results. \
+                             Finish when the hits answer the question. If exact bodies are needed, use one compact ctx_symbols call."
                                 .to_string(),
                         ),
                     ),
@@ -252,7 +247,7 @@ fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: O
                 ("cwd".into(), Json::Str(cwd)),
                 ("explicit_root".into(), Json::Bool(explicit_root)),
             ];
-            for key in ["q", "query", "roots", "max_results", "context_lines", "detail", "queries"] {
+            for key in ["q", "query", "roots", "max_results", "context_lines", "detail", "max_bytes", "queries"] {
                 if let Some(value) = args.get(key) {
                     fields.push((key.into(), value.clone()));
                 }
@@ -495,7 +490,9 @@ fn tool_schemas() -> Json {
             (
                 "description",
                 Json::Str(
-                    "Fast RAM/SIMD search. Prefer `q`: [\"ModOrDir:pattern\", ...] (1-4 parallel searches; bare module stem matches .hpp+.cpp; lowercase = smart-case; `a|b` alternation). `query`+`roots` or `queries` also supported."
+                    "Search source. Batch 1-4 `root:pattern` strings in q, e.g. `graph:scan_manifests`. \
+                     Use a known file, directory, or module stem as each root. Use lowercase patterns for smart-case. \
+                     Use `query` for an unscoped lookup. Answer from sufficient hits."
                         .to_string(),
                 ),
             ),
@@ -509,8 +506,20 @@ fn tool_schemas() -> Json {
                             ("q", str_array.clone()),
                             ("query", Json::obj(vec![("type", Json::Str("string".to_string()))])),
                             ("roots", str_array.clone()),
-                            ("max_results", Json::obj(vec![("type", Json::Str("integer".to_string()))])),
-                            ("context_lines", Json::obj(vec![("type", Json::Str("integer".to_string()))])),
+                            ("max_results", Json::obj(vec![
+                                ("type", Json::Str("integer".to_string())),
+                                ("description", Json::Str("Per-query hit limit.".to_string())),
+                            ])),
+                            ("context_lines", Json::obj(vec![
+                                ("type", Json::Str("integer".to_string())),
+                                ("description", Json::Str("Adjacent lines when needed. Default 0.".to_string())),
+                            ])),
+                            ("max_bytes", Json::obj(vec![
+                                ("type", Json::Str("integer".to_string())),
+                                ("minimum", Json::Int(1)),
+                                ("maximum", Json::Int(crate::engine::SEARCH_RESPONSE_BYTES as i64)),
+                                ("description", Json::Str("Total UTF-8 text budget. Default 8192.".to_string())),
+                            ])),
                             ("detail", Json::obj(vec![
                                 ("type", Json::Str("string".to_string())),
                                 ("enum", Json::Arr(vec![Json::Str("compact".to_string()), Json::Str("scopes".to_string())])),

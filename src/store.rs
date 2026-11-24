@@ -1,8 +1,4 @@
-//! Sharded concurrent RAM store (`64` 64B-cache-padded `RwLock` file shards +
-//! RAII `InflightGuard` singleflight disk loader + `64` 64B-cache-padded `Mutex`
-//! agent-session shards + `PathId(u32)` interning + `32B` POD `ReadSpan` +
-//! arena-backed `WorkspaceFiles` with 64-bit trigram Bloom filter +
-//! `0600` metadata-only `ACTXSNP2` reboot snapshot).
+// Sharded source cache, per-file load coordination, and per-session read state.
 
 use crate::parser::{extract_symbols, SymbolKind, SymbolSpan};
 use crate::security::{
@@ -18,7 +14,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_SINGLE_FILE_CACHE_BYTES: usize = 1_048_576; // 1 MiB full-file read/cache ceiling
 pub const HARD_RAM_CAP_BYTES: usize = 4usize << 30; // 4 GiB ceiling
@@ -621,8 +617,20 @@ pub struct FileMetaStamp {
     pub size_bytes: u64,
 }
 
+impl FileMetaStamp {
+    fn matches(self, entry: &CachedFile) -> bool {
+        self.mtime_ns == entry.mtime_ns
+            && self.ctime_ns == entry.ctime_ns
+            && self.ino == entry.ino
+            && self.size_bytes == u64::from(entry.size_bytes)
+    }
+}
+
 pub fn file_stat(path: &Path) -> Result<FileMetaStamp, String> {
-    let meta = fs::metadata(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    stamp_metadata(&fs::metadata(path).map_err(|e| format!("{}: {}", path.display(), e))?, path)
+}
+
+fn stamp_metadata(meta: &fs::Metadata, path: &Path) -> Result<FileMetaStamp, String> {
     if !meta.is_file() {
         return Err(format!("not a regular file: {}", path.display()));
     }
@@ -1268,34 +1276,7 @@ impl RamStore {
         canon_path: &Path,
         ws_root: Option<&Path>,
     ) -> Result<Arc<CachedFile>, String> {
-        if is_sensitive_path(canon_path) {
-            return Err(format!("refusing sensitive path: {}", canon_path.display()));
-        }
-        let st = file_stat(canon_path)?;
-        if st.size_bytes as usize > MAX_SINGLE_FILE_CACHE_BYTES {
-            return Err(format!(
-                "file exceeds 1 MiB cache limit ({} bytes)",
-                st.size_bytes
-            ));
-        }
-        let key = norm_key_from_canon(canon_path);
-        let s_idx = shard_idx_for(&key);
-        if let Ok(guard) = self.shards[s_idx].read() {
-            if let Some(existing) = guard.get(key.as_str()) {
-                if existing.mtime_ns == st.mtime_ns
-                    && existing.ctime_ns == st.ctime_ns
-                    && existing.ino == st.ino
-                    && existing.size_bytes as u64 == st.size_bytes
-                {
-                    existing
-                        .last_access
-                        .store(self.next_tick(), Ordering::Relaxed);
-                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Arc::clone(existing));
-                }
-            }
-        }
-        self.get_full_entry(canon_path, ws_root)
+        self.get_entry(canon_path, ws_root, false)
     }
 
     pub fn get_full_entry(
@@ -1303,98 +1284,115 @@ impl RamStore {
         canon_path: &Path,
         ws_root: Option<&Path>,
     ) -> Result<Arc<CachedFile>, String> {
+        self.get_entry(canon_path, ws_root, true)
+    }
+
+    fn get_entry(
+        &self,
+        canon_path: &Path,
+        ws_root: Option<&Path>,
+        require_content: bool,
+    ) -> Result<Arc<CachedFile>, String> {
         if is_sensitive_path(canon_path) {
             return Err(format!("refusing sensitive path: {}", canon_path.display()));
         }
-        let st = file_stat(canon_path)?;
-        if st.size_bytes as usize > MAX_SINGLE_FILE_CACHE_BYTES {
-            return Err(format!(
-                "file exceeds 1 MiB full-cache limit ({} bytes): {}; request a line slice path:start-end",
-                st.size_bytes,
-                canon_path.display()
-            ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let key = norm_key_from_canon(canon_path);
+        let shard = &self.shards[shard_idx_for(&key)];
+        let timeout = || format!("timed out loading a stable version of {}", canon_path.display());
+        let cached = |stamp: FileMetaStamp| {
+            let entries = shard.read().map_err(|_| "shard lock poisoned".to_string())?;
+            let entry = entries.get(key.as_str());
+            let hit = entry.filter(|entry| stamp.matches(entry) && (!require_content || entry.content.is_some()));
+            if let Some(hit) = hit {
+                hit.last_access.store(self.next_tick(), Ordering::Relaxed);
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok::<_, String>((hit.is_some(), entry.cloned()))
+        };
+
+        loop {
+            if Instant::now() >= deadline {
+                return Err(timeout());
+            }
+            let stamp = file_stat(canon_path)?;
+            if stamp.size_bytes > MAX_SINGLE_FILE_CACHE_BYTES as u64 {
+                return Err(format!(
+                    "file exceeds 1 MiB full-cache limit ({} bytes): {}; request a line slice path:start-end",
+                    stamp.size_bytes,
+                    canon_path.display()
+                ));
+            }
+            let (hit, previous) = cached(stamp)?;
+            if hit {
+                return Ok(previous.expect("cache hit has an entry"));
+            }
+
+            let mut loads = self.inflight.lock().map_err(|_| "inflight lock poisoned".to_string())?;
+            if let Some(wait_slot) = loads.get(key.as_str()).cloned() {
+                drop(loads);
+                let done = wait_slot.done.lock().map_err(|_| "inflight slot poisoned".to_string())?;
+                let (done, _) = wait_slot.cv.wait_timeout_while(
+                    done, deadline.saturating_duration_since(Instant::now()), |done| !*done,
+                ).map_err(|_| "inflight slot poisoned".to_string())?;
+                if !*done {
+                    return Err(timeout());
+                }
+                continue;
+            }
+
+            // A loader can publish and leave the in-flight table between the
+            // first cache lookup and acquisition of the load lock.
+            let (hit, previous) = cached(stamp)?;
+            if hit {
+                return Ok(previous.expect("cache hit has an entry"));
+            }
+            let (path_id, key_arc) = match &previous {
+                Some(entry) => (entry.path_id, Arc::clone(&entry.norm_path)),
+                None => self.intern_path(&key),
+            };
+            let slot = Arc::new(InflightSlot { done: Mutex::new(false), cv: Condvar::new() });
+            loads.insert(Arc::clone(&key_arc), Arc::clone(&slot));
+            let _loader = InflightGuard { map: &self.inflight, key: Arc::clone(&key_arc), slot };
+            drop(loads);
+
+            if let Some(entry) = self.load_full_entry(canon_path, ws_root, stamp, (path_id, key_arc), previous.as_deref())? {
+                return Ok(entry);
+            }
         }
+    }
 
-        let raw_key = norm_key_from_canon(canon_path);
-        let s_idx = shard_idx_for(&raw_key);
-
-        let prev_cached = {
-            let guard = self.shards[s_idx]
-                .read()
-                .map_err(|_| "shard lock poisoned".to_string())?;
-            if let Some(existing) = guard.get(raw_key.as_str()) {
-                if existing.mtime_ns == st.mtime_ns
-                    && existing.ctime_ns == st.ctime_ns
-                    && existing.ino == st.ino
-                    && existing.size_bytes as u64 == st.size_bytes
-                    && existing.content.is_some()
-                {
-                    existing
-                        .last_access
-                        .store(self.next_tick(), Ordering::Relaxed);
-                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Arc::clone(existing));
-                }
-                Some(Arc::clone(existing))
-            } else {
-                None
-            }
-        };
-
-        let (path_id, key_arc) = match &prev_cached {
-            Some(prev) => (prev.path_id, Arc::clone(&prev.norm_path)),
-            None => self.intern_path(&raw_key),
-        };
-
-        let inflight_guard = {
-            let mut map = self
-                .inflight
-                .lock()
-                .map_err(|_| "inflight lock poisoned".to_string())?;
-            if let Some(wait_slot) = map.get(&key_arc).cloned() {
-                drop(map);
-                if let Ok(done_guard) = wait_slot.done.lock() {
-                    let _ = wait_slot
-                        .cv
-                        .wait_timeout_while(done_guard, Duration::from_secs(5), |done| !*done);
-                }
-                if let Ok(guard) = self.shards[s_idx].read() {
-                    if let Some(loaded) = guard.get(&key_arc) {
-                        if loaded.content.is_some() {
-                            loaded
-                                .last_access
-                                .store(self.next_tick(), Ordering::Relaxed);
-                            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                            return Ok(Arc::clone(loaded));
-                        }
-                    }
-                }
-                None
-            } else {
-                let slot = Arc::new(InflightSlot {
-                    done: Mutex::new(false),
-                    cv: Condvar::new(),
-                });
-                map.insert(Arc::clone(&key_arc), Arc::clone(&slot));
-                Some(InflightGuard {
-                    map: &self.inflight,
-                    key: Arc::clone(&key_arc),
-                    slot,
-                })
-            }
-        };
-
+    fn load_full_entry(
+        &self,
+        canon_path: &Path,
+        ws_root: Option<&Path>,
+        st: FileMetaStamp,
+        (path_id, key_arc): (PathId, Arc<str>),
+        previous: Option<&CachedFile>,
+    ) -> Result<Option<Arc<CachedFile>>, String> {
+        let read_error = |error| format!("read {}: {error}", canon_path.display());
+        let file = File::open(canon_path).map_err(read_error)?;
+        if stamp_metadata(&file.metadata().map_err(read_error)?, canon_path)? != st {
+            return Ok(None);
+        }
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-        let raw_bytes =
-            fs::read(canon_path).map_err(|e| format!("read {}: {}", canon_path.display(), e))?;
-        let scanned = scan_source_bytes(raw_bytes).map_err(|err| match err {
+        let mut raw_bytes = Vec::with_capacity(st.size_bytes as usize);
+        file.take(MAX_SINGLE_FILE_CACHE_BYTES as u64 + 1)
+            .read_to_end(&mut raw_bytes).map_err(read_error)?;
+        if raw_bytes.len() as u64 != st.size_bytes {
+            return Ok(None);
+        }
+        let scanned = scan_source_bytes(raw_bytes);
+        if file_stat(canon_path)? != st {
+            return Ok(None);
+        }
+        let scanned = scanned.map_err(|err| match err {
             ScanError::Binary => format!("binary file rejected: {}", canon_path.display()),
             ScanError::NonUtf8 => format!("non-UTF8 text file: {}", canon_path.display()),
         })?;
 
         let fnv64 = fnv1a_64(scanned.text.as_bytes());
-        let symbols: Arc<[SymbolSpan]> = match &prev_cached {
+        let symbols: Arc<[SymbolSpan]> = match previous {
             Some(prev)
                 if prev.fnv64 == fnv64
                     && !prev.symbols.is_empty()
@@ -1413,7 +1411,7 @@ impl RamStore {
         let charge_bytes = content_len + (scanned.line_offsets.len() << 2);
         self.evict_if_needed(charge_bytes);
 
-        let rel_path: Box<str> = match &prev_cached {
+        let rel_path: Box<str> = match previous {
             Some(prev) if !prev.rel_path.is_empty() => prev.rel_path.clone(),
             _ => display_workspace_path(canon_path, ws_root).into_boxed_str(),
         };
@@ -1435,8 +1433,11 @@ impl RamStore {
             last_access: AtomicU64::new(self.next_tick()),
         });
 
+        if file_stat(canon_path)? != st {
+            return Ok(None);
+        }
         {
-            let mut guard = self.shards[s_idx]
+            let mut guard = self.shards[shard_idx_for(&key_arc)]
                 .write()
                 .map_err(|_| "shard write poisoned".to_string())?;
             if let Some(old) = guard.insert(key_arc, Arc::clone(&new_entry)) {
@@ -1449,8 +1450,7 @@ impl RamStore {
             self.dirty_since_save.store(true, Ordering::Relaxed);
         }
 
-        drop(inflight_guard);
-        Ok(new_entry)
+        Ok(Some(new_entry))
     }
 
     pub fn stream_large_slice(

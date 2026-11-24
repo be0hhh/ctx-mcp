@@ -513,7 +513,9 @@ pub fn run_bench_cli(args: &[String]) -> i32 {
 
                     match send_bench_rpc(port, &tok, &req) {
                         Ok(rep) => {
-                            if (step == 5 || step == 7) && matches!(rep.get_str("code"), Some("search_busy" | "daemon_busy")) {
+                            let search_busy_reply = matches!(rep.get_str("code"), Some("search_busy" | "daemon_busy"))
+                                || rep.get_str("text").is_some_and(|text| text.lines().any(|line| line == "Error: search busy"));
+                            if (step == 5 || step == 7) && search_busy_reply {
                                 search_busy += 1;
                                 lats.push(t0.elapsed().as_micros() as u64);
                                 continue;

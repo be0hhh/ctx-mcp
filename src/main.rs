@@ -15,6 +15,7 @@ mod json;
 mod mcp;
 mod parser;
 mod protocol;
+mod search_render;
 mod security;
 mod simd;
 mod store;
@@ -300,89 +301,21 @@ fn dispatch(args: &[String]) -> i32 {
             ]));
             print_reply(&reply)
         }
-        "search" => {
-            if args.get(1).is_some_and(|arg| arg == "--batch-json") {
-                let [_, _, payload] = args else {
-                    eprintln!("usage: ctx search --batch-json '<array>'");
-                    return 2;
-                };
-                let queries = match json::parse(payload) {
-                    Ok(Json::Arr(items)) => Json::Arr(items),
-                    _ => {
-                        eprintln!("--batch-json expects a JSON array");
-                        return 2;
-                    }
-                };
-                let reply = call_daemon_or_inproc(Json::obj(vec![
-                    ("op", Json::Str("search".to_string())),
-                    ("cwd", Json::Str(workspace_cwd_str(None))),
-                    ("queries", queries),
-                ]));
-                return print_reply(&reply);
-            }
-            let mut max_results: i64 = 40;
-            let mut context_lines: i64 = 0;
-            let mut detail: Option<String> = None;
-            let mut q_specs: Vec<Json> = Vec::new();
-            let mut pos = Vec::new();
-            let mut i = 1;
-            while i < args.len() {
-                if (args[i] == "-q" || args[i] == "--q") && i + 1 < args.len() {
-                    i += 1;
-                    q_specs.push(Json::Str(args[i].clone()));
-                } else if args[i] == "--max-results" && i + 1 < args.len() {
-                    i += 1;
-                    if let Ok(v) = args[i].parse::<i64>() {
-                        max_results = v;
-                    }
-                } else if args[i] == "--context-lines" && i + 1 < args.len() {
-                    i += 1;
-                    if let Ok(n) = args[i].parse::<i64>() {
-                        context_lines = n;
-                    }
-                } else if args[i] == "--detail" && i + 1 < args.len() {
-                    i += 1;
-                    detail = Some(args[i].clone());
+        "search" => match parse_search_cli(&args[1..]) {
+            Ok(request) => {
+                let reply = call_daemon_or_inproc(request);
+                if let Some(text) = reply.get_str("text") {
+                    print!("{text}");
+                    0
                 } else {
-                    pos.push(args[i].clone());
+                    print_reply(&reply)
                 }
-                i += 1;
             }
-            if !q_specs.is_empty() {
-                if !pos.is_empty() {
-                    eprintln!("usage: ctx search -q <root:query> [-q ...] (do not mix with positional query)");
-                    return 2;
-                }
-                let reply = call_daemon_or_inproc(Json::obj(vec![
-                    ("op", Json::Str("search".to_string())),
-                    ("cwd", Json::Str(workspace_cwd_str(None))),
-                    ("q", Json::Arr(q_specs)),
-                ]));
-                return print_reply(&reply);
+            Err(error) => {
+                eprintln!("{error}");
+                2
             }
-            let Some(query) = pos.first().cloned() else {
-                eprintln!("usage: ctx search <query> [roots...]");
-                return 2;
-            };
-            let effective_detail = detail.unwrap_or_else(|| {
-                if context_lines > 0 {
-                    "compact".to_string()
-                } else {
-                    "scopes".to_string()
-                }
-            });
-            let roots: Vec<Json> = pos[1..].iter().map(|s| Json::Str(s.clone())).collect();
-            let reply = call_daemon_or_inproc(Json::obj(vec![
-                ("op", Json::Str("search".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("query", Json::Str(query)),
-                ("roots", Json::Arr(roots)),
-                ("max_results", Json::Int(max_results)),
-                ("detail", Json::Str(effective_detail)),
-                ("context_lines", Json::Int(context_lines)),
-            ]));
-            print_reply(&reply)
-        }
+        },
         "memo" => {
             let action = args.get(1).map(|s| s.as_str()).unwrap_or("list");
             let mut topic = String::new();
@@ -509,6 +442,81 @@ fn dispatch(args: &[String]) -> i32 {
     }
 }
 
+fn parse_search_cli(args: &[String]) -> Result<Json, String> {
+    let mut fields: Vec<(String, Json)> = vec![
+        ("op".into(), Json::Str("search".into())),
+        ("cwd".into(), Json::Str(workspace_cwd_str(None))),
+    ];
+    let mut args = args.iter();
+    let mut shorthand = Vec::new();
+    let mut batch = None;
+    let mut positional = Vec::new();
+    let mut has_detail = false;
+    let mut wants_context = false;
+    while let Some(arg) = args.next() {
+        let option = arg.as_str();
+        let value = |args: &mut std::slice::Iter<'_, String>| {
+            args.next().cloned().ok_or_else(|| format!("missing value for {option}"))
+        };
+        match option {
+            "-q" | "--q" => shorthand.push(Json::Str(value(&mut args)?)),
+            "--batch-json" => {
+                if batch.is_some() {
+                    return Err("provide --batch-json once".into());
+                }
+                batch = match json::parse(&value(&mut args)?) {
+                    Ok(array @ Json::Arr(_)) => Some(array),
+                    _ => return Err("--batch-json expects a JSON array".into()),
+                };
+            }
+            "--max-results" | "--context-lines" | "--max-bytes" => {
+                let number = value(&mut args)?.parse::<i64>()
+                    .map_err(|_| format!("{option} expects an integer"))?;
+                let key = match option {
+                    "--max-results" => "max_results",
+                    "--context-lines" => {
+                        wants_context = number > 0;
+                        "context_lines"
+                    }
+                    _ => "max_bytes",
+                };
+                fields.retain(|(name, _)| name != key);
+                fields.push((key.into(), Json::Int(number)));
+            }
+            "--detail" => {
+                has_detail = true;
+                fields.retain(|(name, _)| name != "detail");
+                fields.push(("detail".into(), Json::Str(value(&mut args)?)));
+            }
+            "--" => {
+                positional.extend(args.map(|value| Json::Str(value.clone())));
+                break;
+            }
+            _ => positional.push(Json::Str(arg.clone())),
+        }
+    }
+    let positionals = !positional.is_empty();
+    let has_shorthand = !shorthand.is_empty();
+    if u8::from(positionals) + u8::from(has_shorthand) + u8::from(batch.is_some()) != 1 {
+        return Err("provide one search form: <query> [roots...], -q <root:query> [-q ...], or --batch-json '<array>'".into());
+    }
+    if let Some(batch) = batch {
+        fields.push(("queries".into(), batch));
+    } else if has_shorthand {
+        fields.push(("q".into(), Json::Arr(shorthand)));
+    } else {
+        if !has_detail && !wants_context {
+            fields.push(("detail".into(), Json::Str("scopes".into())));
+        }
+        let mut items = positional.into_iter();
+        if let Some(query) = items.next() {
+            fields.push(("query".into(), query));
+        }
+        fields.push(("roots".into(), Json::Arr(items.collect())));
+    }
+    Ok(Json::Obj(fields))
+}
+
 fn print_reply(reply: &Json) -> i32 {
     if reply.get_bool("ok") == Some(true) {
         if let Some(txt) = reply.get_str("text") {
@@ -581,9 +589,9 @@ fn print_usage() {
          \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--force]\n\
          \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-bytes N]\n\
          \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--max-bytes 1048576]\n\
-         \x20 ctx search -q <ModOrDir:query> [-q ...]\n\
-         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes]\n\
-         \x20 ctx search --batch-json '<array>'\n\
+         \x20 ctx search -q <ModOrDir:query> [-q ...] [--max-bytes 8192]\n\
+         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--max-bytes 8192]\n\
+         \x20 ctx search --batch-json '<array>' [--max-bytes 8192]\n\
          \x20 ctx memo <put|get|list|clear> [--topic K] [--summary S] [--kind finding|observation] [paths...]\n\
          \x20 ctx capsule <claim|prepare> [key] [--assignment TEXT] [--workspace inherit|branch|share]\n\
          \x20 ctx elf <--elf path> [--asm path]\n\

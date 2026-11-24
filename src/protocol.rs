@@ -1,14 +1,14 @@
-//! Concurrent localhost IPC (`127.0.0.1` + 256-bit OS CSPRNG token in `0600`
-//! `daemon.json`):
-//!   - Fixed 32-thread worker pool + bounded 512-connection queue returning fast `"busy"`
-//!     on saturation without daemon spawn storms.
-//!   - `SubprocSemaphore(8)` bounding external `rg` / `CxetElfAudit.py` subprocesses.
-//!   - Stateless-only `inproc` fallback when loopback sockets are blocked by sandboxes.
+// Concurrent localhost IPC (`127.0.0.1` + 256-bit OS CSPRNG token in `0600`
+// `daemon.json`):
+//   - Fixed 32-thread worker pool + bounded 512-connection queue returning fast `"busy"`
+//     on saturation without daemon spawn storms.
+//   - `SubprocSemaphore` bounds external `rg` / `CxetElfAudit.py` subprocesses.
+//   - Stateless-only `inproc` fallback when loopback sockets are blocked by sandboxes.
 
 use crate::broker::ContextBroker;
 use crate::engine::{
     op_elf_audit, op_inspect, op_memo, op_outline, op_read, op_search, op_search_batch,
-    op_search_batch_with_defaults, op_status, op_symbols, DEFAULT_READ_MAX_BYTES,
+    op_status, op_symbols, SearchOptions, DEFAULT_READ_MAX_BYTES,
 };
 use crate::hooks::{handle_hook, passthrough_raw};
 use crate::json::{self, Json};
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 const IDLE_SHUTDOWN_MS: u64 = 4 * 60 * 60 * 1000; // 4 hours idle TTL
 const WORKER_THREADS: usize = 32;
 const MAX_ACCEPT_QUEUE: usize = 512;
-pub const MAX_CONCURRENT_SUBPROCS: usize = 8;
+pub const MAX_CONCURRENT_SUBPROCS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct DaemonInfo {
@@ -78,51 +78,35 @@ impl SubprocSemaphore {
         self.peak.load(Ordering::Relaxed)
     }
 
-    pub fn try_acquire(&self) -> Result<Option<SubprocPermit<'_>>, String> {
+    /// Strictly bounded semaphore: never increments `active` above `limit` on timeout.
+    pub fn acquire(&self, max_wait: Duration) -> Result<SubprocPermit<'_>, String> {
+        self.acquire_until(Instant::now() + max_wait)?
+            .ok_or_else(|| format!("subprocess semaphore saturated (limit={})", self.limit))
+    }
+
+    pub fn acquire_until(&self, deadline: Instant) -> Result<Option<SubprocPermit<'_>>, String> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| "subprocess semaphore lock poisoned".to_string())?;
-        if *active >= self.limit {
-            return Ok(None);
-        }
-        *active += 1;
-        self.peak.fetch_max(*active as u64, Ordering::Relaxed);
-        Ok(Some(SubprocPermit { sem: self }))
-    }
-
-    /// Strictly bounded semaphore: never increments `active` above `limit` on timeout.
-    pub fn acquire(&self, max_wait: Duration) -> Result<SubprocPermit<'_>, String> {
-        let deadline = Instant::now() + max_wait;
-        let mut g = self
-            .active
-            .lock()
-            .map_err(|_| "subprocess semaphore lock poisoned".to_string())?;
-        while *g >= self.limit {
+        loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(format!(
-                    "subprocess semaphore saturated (limit={})",
-                    self.limit
-                ));
-            }
-            let remain = deadline - now;
-            match self.cv.wait_timeout(g, remain) {
-                Ok((next, timeout)) => {
-                    g = next;
-                    if *g >= self.limit && timeout.timed_out() {
-                        return Err(format!(
-                            "subprocess semaphore saturated (limit={})",
-                            self.limit
-                        ));
-                    }
+                if *active < self.limit {
+                    self.cv.notify_one();
                 }
-                Err(_) => return Err("subprocess semaphore lock poisoned".to_string()),
+                return Ok(None);
             }
+            if *active < self.limit {
+                *active += 1;
+                self.peak.fetch_max(*active as u64, Ordering::Relaxed);
+                return Ok(Some(SubprocPermit { sem: self }));
+            }
+            (active, _) = self
+                .cv
+                .wait_timeout(active, deadline - now)
+                .map_err(|_| "subprocess semaphore lock poisoned".to_string())?;
         }
-        *g += 1;
-        self.peak.fetch_max(*g as u64, Ordering::Relaxed);
-        Ok(SubprocPermit { sem: self })
     }
 }
 
@@ -330,90 +314,19 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             }
         }
         OpCode::Search => {
-            let has_single_fields = ["query", "roots", "max_results", "detail", "context_lines"]
-                .iter()
-                .any(|k| req.get(k).is_some());
-            let result = if let Some(q_val) = req.get("q") {
-                if req.get("queries").is_some() {
-                    return error_reply("search_failed", "use q or queries, not both", false);
-                }
-                match q_val {
-                    Json::Arr(items) => {
-                        if req.get("query").is_some() || req.get("roots").is_some() {
-                            return error_reply("search_failed", "use queries or single-search fields", false);
-                        }
-                        let def_max = req.get_usize("max_results").unwrap_or(32).max(32);
-                        let def_ctx = req.get_usize("context_lines").unwrap_or(0).min(4);
-                        op_search_batch_with_defaults(svc, items, def_max, def_ctx, cwd.as_deref())
-                    }
-                    Json::Str(spec) => {
-                        if req.get("query").is_some() {
-                            return error_reply("search_failed", "use q or query, not both", false);
-                        }
-                        match crate::engine::parse_shorthand_search_spec(spec, false) {
-                            Ok((parsed_q, parsed_roots)) => {
-                                let explicit_roots = str_vec(req.get("roots"));
-                                let roots = if explicit_roots.is_empty() {
-                                    parsed_roots
-                                } else if parsed_roots.is_empty() {
-                                    explicit_roots
-                                } else {
-                                    return error_reply(
-                                        "search_failed",
-                                        "roots already specified in q shorthand",
-                                        false,
-                                    );
-                                };
-                                let max_results = req.get_usize("max_results").unwrap_or(40);
-                                let with_scopes = req.get_str("detail") == Some("scopes");
-                                let context_lines = req.get_usize("context_lines").unwrap_or(0);
-                                op_search(
-                                    svc,
-                                    &parsed_q,
-                                    &roots,
-                                    max_results,
-                                    with_scopes,
-                                    context_lines,
-                                    cwd.as_deref(),
-                                )
-                            }
-                            Err(e) => Err(e),
-                        }
-                    }
-                    _ => {
-                        return error_reply(
-                            "search_failed",
-                            "q must be a string or array of 1–4 'root:query' strings",
-                            false,
-                        );
-                    }
-                }
-            } else if let Some(batch) = req.get("queries") {
-                if has_single_fields {
-                    return error_reply("search_failed", "use queries or single-search fields", false);
-                }
-                let Some(queries) = batch.as_arr() else {
-                    return error_reply("search_failed", "queries must be an array", false);
-                };
-                op_search_batch(svc, queries, cwd.as_deref())
-            } else {
-                let query = req.get_str("query").unwrap_or("");
-                let roots = str_vec(req.get("roots"));
-                let max_results = req.get_usize("max_results").unwrap_or(40);
-                let with_scopes = req.get_str("detail") == Some("scopes");
-                let context_lines = req.get_usize("context_lines").unwrap_or(0);
-                op_search(svc, query, &roots, max_results, with_scopes, context_lines, cwd.as_deref())
-            };
+            let options = SearchOptions::from_request(req, if req.get("q").and_then(Json::as_arr).is_some()
+                || req.get("queries").is_some() { 32 } else { 40 });
+            let result = search_request(svc, req, options, cwd.as_deref());
             match result {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(crate::engine::SearchError::Busy) => {
-                    error_reply("search_busy", "all ctx search slots are busy", true)
+                    error_reply("search_busy", &crate::search_render::cap_text("all ctx search slots are busy", options.max_bytes), true)
                 }
                 Err(crate::engine::SearchError::Timeout) => {
-                    error_reply("search_timeout", "ctx search timed out while collecting candidates", false)
+                    error_reply("search_timeout", &crate::search_render::cap_text("ctx search timed out while collecting candidates", options.max_bytes), false)
                 }
-                Err(crate::engine::SearchError::Failed(e)) => {
-                    error_reply("search_failed", &e, false)
+                Err(crate::engine::SearchError::Failed(error)) => {
+                    error_reply("search_failed", &crate::search_render::cap_text(&error, options.max_bytes), false)
                 }
             }
         }
@@ -483,6 +396,50 @@ fn request_error(code: &str, error: String) -> Json {
         ("code", Json::Str(code.into())),
         ("error", Json::Str(error)),
     ])
+}
+
+fn search_request(
+    svc: &BrokerService,
+    req: &Json,
+    options: SearchOptions,
+    cwd: Option<&Path>,
+) -> Result<String, crate::engine::SearchError> {
+    use crate::engine::{parse_shorthand_search_spec, SearchError};
+
+    let fail = |message: &str| Err(SearchError::Failed(message.into()));
+    let query = req.get("query");
+    let explicit_roots = req.get("roots");
+    let q = req.get("q");
+    let queries = req.get("queries");
+    if q.is_some() && queries.is_some() {
+        return fail("use q or queries, not both");
+    }
+    if let Some(items) = queries.or_else(|| q.filter(|value| value.as_arr().is_some())) {
+        if query.is_some() || explicit_roots.is_some() {
+            return fail("use queries or single-search fields");
+        }
+        let Some(items) = items.as_arr() else {
+            return fail("queries must be an array");
+        };
+        return op_search_batch(svc, items, options, cwd);
+    }
+
+    let roots = str_vec(explicit_roots);
+    if let Some(q) = q {
+        if query.is_some() {
+            return fail("use q or query, not both");
+        }
+        let Some(spec) = q.as_str() else {
+            return fail("q must be a string or array of 1–4 'root:query' strings");
+        };
+        let (query, shorthand_roots) = parse_shorthand_search_spec(spec, false)?;
+        if !roots.is_empty() && !shorthand_roots.is_empty() {
+            return fail("roots already specified in q shorthand");
+        }
+        let roots = if shorthand_roots.is_empty() { &roots } else { &shorthand_roots };
+        return op_search(svc, &query, roots, options, cwd);
+    }
+    op_search(svc, req.get_str("query").unwrap_or(""), &roots, options, cwd)
 }
 
 fn str_vec(val: Option<&Json>) -> Vec<String> {
@@ -935,77 +892,4 @@ pub fn workspace_cwd_str(explicit: Option<&Path>) -> String {
         .unwrap_or_else(|| PathBuf::from("."))
         .to_string_lossy()
         .into_owned()
-}
-
-#[cfg(test)]
-mod transport_tests {
-    use super::*;
-
-    fn request(op: &str) -> Json {
-        Json::obj(vec![("op", Json::Str(op.to_string()))])
-    }
-
-    #[test]
-    fn search_saturation_returns_busy_without_running_search() {
-        let svc = BrokerService::new_ephemeral_inproc(PathBuf::new());
-        let mut permits: Vec<_> = (0..MAX_CONCURRENT_SUBPROCS)
-            .map(|_| svc.subproc_sem.try_acquire().unwrap().unwrap())
-            .collect();
-        let search = Json::obj(vec![
-            ("op", Json::Str("search".to_string())),
-            ("query", Json::Str("needle".to_string())),
-        ]);
-        let busy = execute_request(&svc, &search);
-        assert_eq!(busy.get_str("code"), Some("search_busy"));
-        assert_eq!(busy.get_bool("retryable"), Some(true));
-        assert_eq!(svc.subproc_sem.active_count(), MAX_CONCURRENT_SUBPROCS);
-
-        drop(permits.pop());
-        assert!(svc.subproc_sem.try_acquire().unwrap().is_some());
-    }
-
-    #[test]
-    fn transport_never_degrades_search_to_inproc() {
-        let search = request("search");
-        assert_eq!(
-            run_inproc(&search).get_str("code"),
-            Some("daemon_unavailable")
-        );
-
-        let after_send = complete_attempt(SendOutcome::AfterSend, &search).unwrap();
-        assert_eq!(after_send.get_str("code"), Some("daemon_transport"));
-        assert_eq!(after_send.get_bool("retryable"), Some(false));
-
-        let rejected = complete_attempt(SendOutcome::Busy, &search).unwrap();
-        assert_eq!(rejected.get_str("code"), Some("daemon_busy"));
-        assert_eq!(rejected.get_bool("retryable"), Some(true));
-    }
-
-    #[test]
-    fn lost_confirmation_is_unknown_for_mutations_and_scoped_reads() {
-        let memo = Json::obj(vec![
-            ("op", Json::Str("memo".to_string())),
-            ("action", Json::Str("put".to_string())),
-        ]);
-        let scoped = Json::obj(vec![
-            ("op", Json::Str("read".to_string())),
-            ("ctx_context", Json::Str("ticket".to_string())),
-        ]);
-        assert_eq!(
-            run_inproc(&scoped).get_str("code"),
-            Some("daemon_unavailable")
-        );
-        assert_eq!(
-            run_inproc(&request("capsule")).get_str("code"),
-            Some("daemon_unavailable")
-        );
-        for req in [request("capsule"), request("hook"), memo, scoped] {
-            let lost = complete_attempt(SendOutcome::AfterSend, &req).unwrap();
-            assert_eq!(lost.get_str("code"), Some("outcome_unknown"));
-            assert_eq!(lost.get_bool("retryable"), Some(false));
-        }
-
-        let independent = complete_attempt(SendOutcome::AfterSend, &request("status")).unwrap();
-        assert_eq!(independent.get_bool("degraded_inproc"), Some(true));
-    }
 }

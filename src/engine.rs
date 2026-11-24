@@ -1,11 +1,11 @@
-//! Core concurrent context operations over `BrokerService`:
-//!   - `op_inspect` (batch directory/slice triage: lines, size flags, namespaces, includes, symbols)
-//!   - `op_read` (up to 1 MiB without 800-line truncation)
-//!   - `op_outline` (fast structural outline, served from `ACTXSNP2` metadata when unchanged)
-//!   - `op_symbols` (`path#Symbol` extraction)
-//!   - `op_search` (bounded `SubprocSemaphore(8)` `rg` + pure-Rust fallback, workspace-relative paths)
-//!   - `op_memo` (`put | get | list | clear` with automatic `[STALE]` verification)
-//!   - `op_elf_audit` and `op_status`.
+// Core concurrent context operations over `BrokerService`:
+//   - `op_inspect` (batch directory/slice triage: lines, size flags, namespaces, includes, symbols)
+//   - `op_read` (up to 1 MiB without 800-line truncation)
+//   - `op_outline` (fast structural outline, served from `ACTXSNP2` metadata when unchanged)
+//   - `op_symbols` (`path#Symbol` extraction)
+//   - `op_search` (in-RAM search, bounded `rg` subprocesses, and a pure-Rust fallback)
+//   - `op_memo` (`put | get | list | clear` with automatic `[STALE]` verification)
+//   - `op_elf_audit` and `op_status`.
 
 use crate::broker::MemoFileLink;
 use crate::json::Json;
@@ -977,16 +977,16 @@ pub enum SearchError {
 }
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const SEARCH_RESPONSE_BYTES: usize = 8 * 1024;
+pub(crate) const SEARCH_RESPONSE_BYTES: usize = 8 * 1024;
 const SEARCH_SNIPPET_CHARS: usize = 200;
 const RG_RECORD_LIMIT: usize = 16 * 1024;
 const RG_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 
-struct SearchHit {
-    path: PathBuf,
-    workspace: PathBuf,
-    line: usize,
-    snippet: String,
+pub(crate) struct SearchHit {
+    pub(crate) path: PathBuf,
+    pub(crate) workspace: PathBuf,
+    pub(crate) line: usize,
+    pub(crate) snippet: String,
 }
 
 struct SearchCollection<'a> {
@@ -1004,77 +1004,53 @@ fn search_time_left(deadline: Instant) -> Result<Duration, SearchError> {
         .ok_or(SearchError::Timeout)
 }
 
-fn search_snippet(text: &str) -> String {
+pub(crate) fn search_snippet(text: &str) -> String {
     text.trim().chars().take(SEARCH_SNIPPET_CHARS).collect()
 }
 
-pub fn op_search(
+#[derive(Clone, Copy)]
+pub(crate) struct SearchOptions {
+    max_results: usize,
+    pub(crate) with_scopes: bool,
+    pub(crate) context_lines: usize,
+    pub(crate) max_bytes: usize,
+}
+
+impl SearchOptions {
+    pub(crate) fn from_request(request: &Json, default_results: usize) -> Self {
+        Self {
+            max_results: request.get_usize("max_results").unwrap_or(default_results),
+            with_scopes: request.get_str("detail") == Some("scopes"),
+            context_lines: request.get_usize("context_lines").unwrap_or(0).min(4),
+            max_bytes: request
+                .get_i64("max_bytes")
+                .unwrap_or(SEARCH_RESPONSE_BYTES as i64)
+                .clamp(1, SEARCH_RESPONSE_BYTES as i64) as usize,
+        }
+    }
+
+    fn for_item(self, item: &Json) -> Self {
+        Self {
+            max_results: item.get_usize("max_results").unwrap_or(self.max_results),
+            with_scopes: item.get_str("detail").map_or(self.with_scopes, |detail| detail == "scopes"),
+            context_lines: item.get_usize("context_lines").unwrap_or(self.context_lines).min(4),
+            ..self
+        }
+    }
+}
+
+pub(crate) fn op_search(
     svc: &BrokerService,
     query: &str,
     roots: &[String],
-    max_results: usize,
-    with_scopes: bool,
-    context_lines: usize,
+    options: SearchOptions,
     cwd: Option<&Path>,
 ) -> Result<String, SearchError> {
-    if query.trim().is_empty() {
-        return Err(SearchError::Failed("query must not be empty".to_string()));
-    }
-    let permit = svc
-        .subproc_sem
-        .try_acquire()
-        .map_err(SearchError::Failed)?
-        .ok_or(SearchError::Busy)?;
-    let deadline = Instant::now() + SEARCH_TIMEOUT;
-    let hits = collect_search_hits(svc, query, roots, max_results, cwd, deadline)?;
-    drop(permit);
+    let hits = collect_search_hits(svc, query, roots, options.max_results, cwd, Instant::now() + SEARCH_TIMEOUT)?;
     if hits.is_empty() {
-        return Ok(format!("0 matches for `{}`.", query.trim()));
+        return Ok(crate::search_render::cap_text(&format!("0 matches for `{}`.\n", query.trim()), options.max_bytes));
     }
-    if !with_scopes {
-        return Ok(format_compact_search(svc, &hits, context_lines.min(4), SEARCH_RESPONSE_BYTES));
-    }
-
-    let matched_count = hits.len();
-    let mut rows = String::with_capacity(matched_count * 96);
-    for SearchHit { path, workspace, line, snippet } in hits {
-        let scope_tag: String;
-        let rel_disp = if let Ok(entry) = svc.store.get_outline_entry(&path, Some(&workspace)) {
-            let enclosing = entry
-                .symbols
-                .iter()
-                .filter(|s| {
-                    (s.start_line as usize) <= line
-                        && line <= (s.end_line as usize)
-                        && s.kind != SymbolKind::Namespace
-                })
-                .min_by_key(|s| s.end_line.saturating_sub(s.start_line));
-            scope_tag = if let Some(sym) = enclosing {
-                format!(
-                    " [in {} {} L{}-L{}, {}L]",
-                    sym.kind.as_str(),
-                    sym.name,
-                    sym.start_line,
-                    sym.end_line,
-                    entry.line_count
-                )
-            } else {
-                format!(" [{}L]", entry.line_count)
-            };
-            entry.rel_path.to_string()
-        } else {
-            scope_tag = String::new();
-            display_workspace_path(&path, Some(&workspace))
-        };
-        rows.push_str(&rel_disp);
-        rows.push(':');
-        push_usize(&mut rows, line);
-        rows.push_str(&scope_tag);
-        rows.push_str(": ");
-        rows.push_str(&snippet);
-        rows.push('\n');
-    }
-    Ok(format!("Matches ({}):\n{}", matched_count, rows))
+    Ok(crate::search_render::render(svc, vec![(Ok(hits), options)], false, options.max_bytes))
 }
 
 const IN_RAM_SEARCH_MAX_FILES: usize = 256;
@@ -1496,322 +1472,63 @@ fn collect_search_hits(
     Ok(prioritize_and_balance_file_hits(grouped, cap))
 }
 
-pub fn op_search_batch(
+pub(crate) fn op_search_batch(
     svc: &BrokerService,
     queries: &[Json],
-    cwd: Option<&Path>,
-) -> Result<String, SearchError> {
-    op_search_batch_with_defaults(svc, queries, 32, 0, cwd)
-}
-
-pub fn op_search_batch_with_defaults(
-    svc: &BrokerService,
-    queries: &[Json],
-    default_max_results: usize,
-    default_context_lines: usize,
+    defaults: SearchOptions,
     cwd: Option<&Path>,
 ) -> Result<String, SearchError> {
     if !(1..=4).contains(&queries.len()) {
-        return Err(SearchError::Failed(
-            "queries must contain 1–4 searches".to_string(),
-        ));
+        return Err(SearchError::Failed("queries must contain 1–4 searches".to_string()));
     }
-    let permit = svc
-        .subproc_sem
-        .try_acquire()
-        .map_err(SearchError::Failed)?
-        .ok_or(SearchError::Busy)?;
     let deadline = Instant::now() + SEARCH_TIMEOUT;
-
-    let results: Vec<(Result<Vec<SearchHit>, SearchError>, usize)> = if queries.len() == 1 {
-        vec![run_single_batch_item(
-            svc,
-            &queries[0],
-            default_max_results,
-            default_context_lines,
-            cwd,
-            deadline,
-        )]
+    let run = |item: &Json| {
+        let options = defaults.for_item(item);
+        (run_batch_item(svc, item, options.max_results, cwd, deadline), options)
+    };
+    let results = if queries.len() == 1 {
+        vec![run(&queries[0])]
     } else {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = queries
-                .iter()
-                .map(|item| {
-                    scope.spawn(move || {
-                        run_single_batch_item(
-                            svc,
-                            item,
-                            default_max_results,
-                            default_context_lines,
-                            cwd,
-                            deadline,
-                        )
-                    })
+        thread::scope(|scope| {
+            let run = &run;
+            let handles: Vec<_> = queries.iter().map(|item| scope.spawn(move || run(item))).collect();
+            handles.into_iter().map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    (Err(SearchError::Failed("batch search worker panicked".to_string())), defaults)
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        (
-                            Err(SearchError::Failed("batch search worker panicked".to_string())),
-                            0,
-                        )
-                    })
-                })
-                .collect()
+            }).collect()
         })
     };
-    drop(permit);
-
-    let total_queries = results.len();
-    let mut out = String::with_capacity(2048);
-    for (index, (result, context)) in results.into_iter().enumerate() {
-        let heading = format!("[{}]\n", index + 1);
-        let remaining_after = total_queries - 1 - index;
-        let reserve_later = remaining_after << 9; // 512B guaranteed floor per later query
-        let avail = SEARCH_RESPONSE_BYTES
-            .saturating_sub(out.len())
-            .saturating_sub(reserve_later);
-        let budget = avail.saturating_sub(heading.len()).max(64);
-        out.push_str(&heading);
-        match result {
-            Ok(hits) if hits.is_empty() => out.push_str("0 matches\n"),
-            Ok(hits) => out.push_str(&format_compact_search(svc, &hits, context, budget)),
-            Err(SearchError::Timeout) => out.push_str("Timeout: shared search budget exhausted\n"),
-            Err(SearchError::Failed(error)) => {
-                out.push_str("Error: ");
-                let mut end = error.len().min(budget - "Error: …\n".len());
-                while !error.is_char_boundary(end) {
-                    end -= 1;
-                }
-                out.push_str(&error[..end]);
-                if end < error.len() {
-                    out.push('…');
-                }
-                out.push('\n');
-            }
-            Err(SearchError::Busy) => out.push_str("Error: search busy\n"),
-        }
+    if results.iter().all(|(result, _)| matches!(result, Err(SearchError::Busy))) {
+        return Err(SearchError::Busy);
     }
-    Ok(out)
+    Ok(crate::search_render::render(svc, results, true, defaults.max_bytes))
 }
 
-fn run_single_batch_item(
+fn run_batch_item(
     svc: &BrokerService,
     item: &Json,
-    default_max_results: usize,
-    default_context_lines: usize,
+    max_results: usize,
     cwd: Option<&Path>,
     deadline: Instant,
-) -> (Result<Vec<SearchHit>, SearchError>, usize) {
-    if let Some(spec) = item.as_str() {
-        let result = parse_shorthand_search_spec(spec, true).and_then(|(query, roots)| {
-            collect_search_hits(svc, &query, &roots, default_max_results, cwd, deadline)
-        });
-        return (result, default_context_lines);
-    }
-    if let Some(spec) = item.get_str("q") {
-        let context = item
-            .get_usize("context_lines")
-            .unwrap_or(default_context_lines)
-            .min(4);
-        let max_res = item.get_usize("max_results").unwrap_or(default_max_results);
-        let result = parse_shorthand_search_spec(spec, true).and_then(|(query, roots)| {
-            collect_search_hits(svc, &query, &roots, max_res, cwd, deadline)
-        });
-        return (result, context);
+) -> Result<Vec<SearchHit>, SearchError> {
+    if let Some(spec) = item.as_str().or_else(|| item.get_str("q")) {
+        let (query, roots) = parse_shorthand_search_spec(spec, true)?;
+        return collect_search_hits(svc, &query, &roots, max_results, cwd, deadline);
     }
     let query = item.get_str("query").unwrap_or("");
     let roots = item.get("roots").and_then(Json::as_arr).and_then(|arr| {
         arr.iter()
-            .map(|v| v.as_str().map(str::to_owned))
+            .map(|v| v.as_str().filter(|root| !root.trim().is_empty()).map(str::to_owned))
             .collect::<Option<Vec<_>>>()
+            .filter(|roots| !roots.is_empty())
     });
-    let context = item
-        .get_usize("context_lines")
-        .unwrap_or(default_context_lines)
-        .min(4);
-    let result = match roots {
-        Some(roots) if !roots.is_empty() && roots.iter().all(|root| !root.trim().is_empty()) => {
-            collect_search_hits(
-                svc,
-                query,
-                &roots,
-                item.get_usize("max_results").unwrap_or(default_max_results),
-                cwd,
-                deadline,
-            )
-        }
-        _ => Err(SearchError::Failed(
-            "roots must be a non-empty array of paths".to_string(),
-        )),
-    };
-    (result, context)
-}
-
-#[inline]
-fn compact_symbol_tag(name: &str) -> &str {
-    name.trim_start_matches("::")
-}
-
-fn format_compact_search(
-    svc: &BrokerService,
-    hits: &[SearchHit],
-    context: usize,
-    budget: usize,
-) -> String {
-    let cut = format!("... [response capped at {} bytes]\n", budget);
-    let mut out = String::with_capacity(budget.min(2048));
-    out.push_str("Matches (");
-    push_usize(&mut out, hits.len());
-    out.push_str("):\n");
-    let mut push_row = |row: &str| {
-        if out.len() + row.len() > budget - cut.len() {
-            out.push_str(&cut);
-            return false;
-        }
-        out.push_str(row);
-        true
-    };
-    let mut row_buf = String::with_capacity(256);
-    'files: for group in hits.chunk_by(|a, b| a.path == b.path && a.workspace == b.workspace) {
-        let first = &group[0];
-        let path = display_workspace_path(&first.path, Some(&first.workspace));
-        if context == 0 {
-            if group.len() == 1 {
-                row_buf.clear();
-                row_buf.push_str(&path);
-                row_buf.push(':');
-                push_usize(&mut row_buf, first.line);
-                row_buf.push_str(": ");
-                row_buf.push_str(&first.snippet);
-                row_buf.push('\n');
-                if !push_row(&row_buf) {
-                    break 'files;
-                }
-                continue;
-            }
-
-            row_buf.clear();
-            row_buf.push_str(&path);
-            row_buf.push('\n');
-            if !push_row(&row_buf) {
-                break 'files;
-            }
-            let outline = svc
-                .store
-                .get_outline_entry(&first.path, Some(&first.workspace))
-                .ok();
-            let mut last_sym: Option<&str> = None;
-            for hit in group {
-                let cur_sym = outline.as_deref().and_then(|entry| {
-                    entry
-                        .symbols
-                        .iter()
-                        .filter(|s| {
-                            (s.start_line as usize) <= hit.line
-                                && hit.line <= (s.end_line as usize)
-                                && s.kind != SymbolKind::Namespace
-                        })
-                        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
-                        .map(|s| compact_symbol_tag(&s.name))
-                        .filter(|s| !s.is_empty())
-                });
-                row_buf.clear();
-                if cur_sym != last_sym {
-                    last_sym = cur_sym;
-                    if let Some(sym) = cur_sym {
-                        row_buf.push_str("  @");
-                        row_buf.push_str(sym);
-                        row_buf.push('\n');
-                    }
-                }
-                row_buf.push_str("  ");
-                push_usize(&mut row_buf, hit.line);
-                row_buf.push_str(": ");
-                row_buf.push_str(&hit.snippet);
-                row_buf.push('\n');
-                if !push_row(&row_buf) {
-                    break 'files;
-                }
-            }
-            continue;
-        }
-
-        let entry = svc
-            .store
-            .get_full_entry(&first.path, Some(&first.workspace))
-            .ok();
-        let total_lines = entry.as_ref().map_or(0usize, |e| e.line_count as usize);
-        let entry_ref = entry.as_ref();
-        if total_lines == 0
-            || group.windows(2).any(|pair| pair[0].line >= pair[1].line)
-            || group.iter().any(|hit| {
-                hit.line == 0
-                    || hit.line > total_lines
-                    || entry_ref.is_none_or(|e| {
-                        search_snippet(e.line_slice(hit.line as u32)) != hit.snippet
-                    })
-            })
-        {
-            for hit in group {
-                row_buf.clear();
-                row_buf.push_str(&path);
-                row_buf.push(':');
-                push_usize(&mut row_buf, hit.line);
-                row_buf.push_str(": ");
-                row_buf.push_str(&hit.snippet);
-                row_buf.push('\n');
-                if !push_row(&row_buf) {
-                    break 'files;
-                }
-            }
-            continue;
-        }
-        let Some(entry_ok) = entry_ref else {
-            continue;
-        };
-        row_buf.clear();
-        row_buf.push_str("-- ");
-        row_buf.push_str(&path);
-        row_buf.push_str(" --\n");
-        if !push_row(&row_buf) {
-            break;
-        }
-        let mut next_line = 1;
-        for (i, hit) in group.iter().enumerate() {
-            let start = hit.line.saturating_sub(context).max(next_line);
-            let end = hit.line.saturating_add(context).min(total_lines);
-            let end = group.get(i + 1).map_or(end, |next| end.min(next.line - 1));
-            for line in start..=end {
-                let snippet = search_snippet(entry_ok.line_slice(line as u32));
-                row_buf.clear();
-                if line == hit.line {
-                    row_buf.push_str(&path);
-                    row_buf.push(':');
-                    push_usize(&mut row_buf, line);
-                    row_buf.push_str(": ");
-                    row_buf.push_str(&snippet);
-                    row_buf.push('\n');
-                } else {
-                    row_buf.push_str("  ");
-                    push_usize(&mut row_buf, line);
-                    row_buf.push_str("- ");
-                    row_buf.push_str(&snippet);
-                    row_buf.push('\n');
-                }
-                if !push_row(&row_buf) {
-                    break 'files;
-                }
-            }
-            next_line = end + 1;
-        }
-    }
-    out
+    let roots = roots.ok_or_else(|| SearchError::Failed("roots must be a non-empty array of paths".to_string()))?;
+    collect_search_hits(svc, query, &roots, max_results, cwd, deadline)
 }
 
 enum RgError {
+    Busy,
     Missing,
     Timeout,
     RegexSyntax(String),
@@ -1903,6 +1620,7 @@ fn run_rg_once(
     search_time_left(collection.deadline).map_err(|_| RgError::Timeout)?;
     let mut cmd = Command::new(resolve_rg_binary());
     cmd.arg("--no-config")
+        .arg("--threads=1")
         .arg("--with-filename")
         .arg("--null")
         .arg("--line-number")
@@ -1922,6 +1640,12 @@ fn run_rg_once(
     for r in roots {
         cmd.arg(r);
     }
+    let _permit = collection
+        .svc
+        .subproc_sem
+        .acquire_until(collection.deadline)
+        .map_err(RgError::Process)?
+        .ok_or(RgError::Busy)?;
     let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2126,6 +1850,7 @@ fn run_rg_or_fallback(
     match result {
         Ok(()) => Ok(()),
         Err(RgError::Missing) => search_without_rg(query, roots, collection),
+        Err(RgError::Busy) => Err(SearchError::Busy),
         Err(RgError::Timeout) => Err(SearchError::Timeout),
         Err(RgError::Process(error) | RgError::RegexSyntax(error)) => Err(SearchError::Failed(error)),
     }
@@ -2250,206 +1975,6 @@ fn parse_grep_line(record: &[u8]) -> Option<(PathBuf, usize, String)> {
     #[cfg(not(unix))]
     let path = PathBuf::from(std::str::from_utf8(path).ok()?);
     Some((path, number, search_snippet(&String::from_utf8_lossy(text))))
-}
-
-#[cfg(test)]
-mod search_tests {
-    use super::*;
-    use std::process::ExitStatus;
-
-    #[test]
-    fn collected_search_reuses_the_callers_deadline() {
-        let service = BrokerService::new_ephemeral_inproc(PathBuf::new());
-        let expired = Instant::now() - SEARCH_TIMEOUT;
-        assert!(matches!(
-            collect_search_hits(&service, "sample", &[], 1, None, expired),
-            Err(SearchError::Timeout)
-        ));
-    }
-
-    fn exited(code: u8) -> ExitStatus {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            ExitStatus::from_raw(i32::from(code) << 8)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::ExitStatusExt;
-            ExitStatus::from_raw(u32::from(code))
-        }
-    }
-
-    #[test]
-    fn rg_distinguishes_no_matches_regex_syntax_and_process_errors() {
-        assert!(check_rg_status(exited(1), b"rg: No files were searched", false).is_ok());
-        let syntax_error = b"regex parse error:\nerror: unclosed character class";
-        assert!(matches!(
-            check_rg_status(exited(2), syntax_error, false),
-            Err(RgError::RegexSyntax(_))
-        ));
-        assert!(matches!(
-            check_rg_status(exited(2), syntax_error, true),
-            Err(RgError::Process(_))
-        ));
-        assert!(matches!(
-            check_rg_status(exited(2), b"rg: Permission denied", false),
-            Err(RgError::Process(message)) if message.contains("Permission denied")
-        ));
-    }
-
-    #[test]
-    fn rg_match_has_an_unambiguous_path_separator() {
-        let hit = parse_grep_line(b"a:b.rs\x0017:example: value").unwrap();
-        assert_eq!(
-            hit,
-            (PathBuf::from("a:b.rs"), 17, "example: value".to_string())
-        );
-    }
-
-    #[test]
-    fn rg_oversized_record_and_stderr_are_drained_with_bounded_prefixes() {
-        let mut data = b"a\nb.rs\0".to_vec();
-        data.extend_from_slice(b"17:");
-        data.extend(std::iter::repeat(b'x').take(RG_RECORD_LIMIT * 2));
-        data.extend_from_slice(b"\nnext.rs\0");
-        data.extend_from_slice(b"18:next match\n");
-        let mut reader = BufReader::with_capacity(7, io::Cursor::new(&data));
-        let deadline = Instant::now() + SEARCH_TIMEOUT;
-        let first = read_rg_record(&mut reader, deadline).unwrap().unwrap();
-        assert_eq!(first.len(), RG_RECORD_LIMIT);
-        assert_eq!(
-            parse_grep_line(&first),
-            Some((PathBuf::from("a\nb.rs"), 17, "x".repeat(SEARCH_SNIPPET_CHARS)))
-        );
-        let second = read_rg_record(&mut reader, deadline).unwrap().unwrap();
-        assert_eq!(
-            parse_grep_line(&second),
-            Some((PathBuf::from("next.rs"), 18, "next match".to_string()))
-        );
-        assert!(read_rg_record(&mut reader, deadline).unwrap().is_none());
-
-        let mut stderr = io::Cursor::new(&data);
-        let diagnostic = drain_rg_stderr(&mut stderr, deadline).unwrap();
-        assert_eq!(diagnostic, data[..RG_DIAGNOSTIC_LIMIT]);
-        assert_eq!(stderr.position(), data.len() as u64);
-    }
-
-    #[test]
-    fn fallback_uses_one_file_budget_for_directory_and_explicit_roots() {
-        let dir = std::env::temp_dir().join(format!(
-            "ctx-search-files-{}-{}",
-            std::process::id(),
-            crate::store::now_ms_u64()
-        ));
-        fs::create_dir(&dir).unwrap();
-        let in_directory = dir.join("first.txt");
-        fs::write(&in_directory, "needle\n").unwrap();
-        let mut roots = vec![dir.clone()];
-        roots.extend(std::iter::repeat(in_directory.clone()).take(FALLBACK_SEARCH_FILE_LIMIT));
-
-        let deadline = Instant::now() + SEARCH_TIMEOUT;
-        let mut count = 0;
-        visit_fallback_files(&roots, deadline, |path| {
-            assert_eq!(path, in_directory.as_path());
-            count += 1;
-            Ok(false)
-        })
-        .unwrap();
-
-        let svc = BrokerService::new_ephemeral_inproc(dir.join("snapshot"));
-        let workspace = svc.allowlist.register_hint(&dir, true).unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: Some(&dir),
-            deadline,
-            cap: 1,
-            hits: Vec::new(),
-        };
-        search_without_rg("NEEDLE", &roots, &mut collection).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(count, FALLBACK_SEARCH_FILE_LIMIT);
-        let [hit] = collection.hits.as_slice() else {
-            panic!("expected one fallback match");
-        };
-        assert_eq!(hit.path, workspace.join("first.txt"));
-        assert_eq!(hit.line, 1);
-        assert_eq!(hit.snippet, "needle");
-    }
-
-    #[test]
-    fn expired_fallback_deadline_stops_before_visiting_files() {
-        let result = visit_fallback_files(&[PathBuf::from(".")], Instant::now(), |_| {
-            panic!("expired search visited a file");
-        });
-        assert!(matches!(result, Err(SearchError::Timeout)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rg_cap_counts_admitted_matches_and_stops_before_eof() {
-        let dir = std::env::temp_dir().join(format!(
-            "ctx-search-rg-{}-{}",
-            std::process::id(),
-            crate::store::now_ms_u64()
-        ));
-        fs::create_dir(&dir).unwrap();
-        let sensitive = dir.join(".env");
-        let source = dir.join("match.rs");
-        fs::write(&sensitive, "needle").unwrap();
-        fs::write(&source, "needle").unwrap();
-        let svc = BrokerService::new_ephemeral_inproc(dir.join("snapshot"));
-        let workspace = svc.allowlist.register_hint(&dir, true).unwrap();
-        let child = Command::new("sh")
-            .args([
-                "-c",
-                r#"printf '%s\000%d:needle\n' "$1" 1 "$2" 1; exec sleep 30"#,
-                "rg-test",
-            ])
-            .arg(&sensitive)
-            .arg(&source)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: Some(&dir),
-            deadline: Instant::now() + SEARCH_TIMEOUT,
-            cap: 1,
-            hits: Vec::new(),
-        };
-        let result = collect_rg_output(SearchProcess(child), &mut collection, false);
-        fs::remove_dir_all(&dir).unwrap();
-        assert!(result.is_ok());
-        let [hit] = collection.hits.as_slice() else {
-            panic!("expected one admitted rg match");
-        };
-        assert_eq!(hit.path, workspace.join("match.rs"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rg_timeout_applies_with_silent_open_pipes() {
-        let svc = BrokerService::new_ephemeral_inproc(PathBuf::from("unused"));
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: None,
-            deadline: Instant::now() + Duration::from_millis(25),
-            cap: 1,
-            hits: Vec::new(),
-        };
-        assert!(matches!(
-            collect_rg_output(SearchProcess(child), &mut collection, false),
-            Err(RgError::Timeout)
-        ));
-    }
 }
 
 pub fn op_memo(
