@@ -15,15 +15,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run Cargo unit tests
-        run: cargo test --release --locked || cargo test --release
+      - name: Build release binary & run Cargo unit tests
+        run: |
+          cargo build --release --locked || cargo build --release
+          cargo test --release --locked || cargo test --release
       - name: Verify MCP protocol & isolated setup/uninstall
         shell: bash
         run: |
           BIN="target/release/ctx"
-          [ -f "target/release/ctx.exe" ] && BIN="target/release/ctx.exe"
+          if [ -f "target/release/ctx.exe" ]; then
+            BIN="target/release/ctx.exe"
+          fi
           "$BIN" mcp --protocol-check
-          TMP_HOME="$(pwd)/tmp-ci-home"
+          ROOT_DIR="$(pwd -W 2>/dev/null || pwd)"
+          TMP_HOME="$ROOT_DIR/tmp-ci-home"
           mkdir -p "$TMP_HOME"
           export AGENT_CTX_HOME="$TMP_HOME"
           export AGENT_CTX_RUNTIME_DIR="$TMP_HOME/rt"
