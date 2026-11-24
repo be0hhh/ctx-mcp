@@ -1,0 +1,14 @@
+[package]
+name = "ctx"
+version = "2.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/be0hhh/ctx-mcp"
+description = "Zero-dependency Rust in-RAM Context Broker, MCP server, CLI, interactive installer, and hook router for AI coding agents"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Cargo unit tests
+        run: cargo test --release --locked || cargo test --release
+      - name: Verify MCP protocol & isolated setup/uninstall
+        shell: bash
+        run: |
+          BIN="target/release/ctx"
+          [ -f "target/release/ctx.exe" ] && BIN="target/release/ctx.exe"
+          "$BIN" mcp --protocol-check
+          TMP_HOME="$(mktemp -d)"
+          AGENT_CTX_HOME="$TMP_HOME" "$BIN" install --targets antigravity,claude
+          AGENT_CTX_HOME="$TMP_HOME" "$BIN" doctor
+          AGENT_CTX_HOME="$TMP_HOME" "$BIN" uninstall
+          rm -rf "$TMP_HOME"
