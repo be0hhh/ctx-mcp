@@ -183,10 +183,7 @@ impl Section {
         if new_file {
             self.standalone = false;
             let end = index + self.hits[index..].iter().take_while(|next| same_file(hit, next)).count();
-            let grouped = end > index + 1 && self.options.context_lines == 0;
-            let outline = (self.options.with_scopes || grouped)
-                .then(|| svc.store.get_outline_entry(&hit.path, Some(&hit.workspace)).ok())
-                .flatten();
+            let outline = svc.store.get_outline_entry(&hit.path, Some(&hit.workspace)).ok();
             self.file = Some(FileGroup {
                 end,
                 path: display_workspace_path(&hit.path, Some(&hit.workspace)),
@@ -210,7 +207,16 @@ impl Section {
             }
             let _ = writeln!(row, ": {}", hit.snippet);
         } else if self.standalone || self.options.context_lines != 0 || (new_file && group.end == index + 1) {
-            let _ = writeln!(row, "{}:{}: {}", group.path, hit.line, hit.snippet);
+            if let Some((_, sym)) = enclosing.filter(|(_, s)| hit.line > s.start_line as usize) {
+                let name = sym.name.trim_start_matches("::");
+                if !name.is_empty() {
+                    let _ = writeln!(row, "{}:{} [@{}]: {}", group.path, hit.line, name, hit.snippet);
+                } else {
+                    let _ = writeln!(row, "{}:{}: {}", group.path, hit.line, hit.snippet);
+                }
+            } else {
+                let _ = writeln!(row, "{}:{}: {}", group.path, hit.line, hit.snippet);
+            }
         } else {
             if new_file {
                 let _ = writeln!(row, "{}", group.path);

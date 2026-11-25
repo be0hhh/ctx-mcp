@@ -524,21 +524,6 @@ fn tool_schemas() -> Json {
                                 ("type", Json::Str("string".to_string())),
                                 ("enum", Json::Arr(vec![Json::Str("compact".to_string()), Json::Str("scopes".to_string())])),
                             ])),
-                            ("queries", Json::obj(vec![
-                                ("type", Json::Str("array".to_string())),
-                                ("minItems", Json::Int(1)),
-                                ("maxItems", Json::Int(4)),
-                                ("items", Json::obj(vec![
-                                    ("type", Json::Str("object".to_string())),
-                                    ("properties", Json::obj(vec![
-                                        ("query", Json::obj(vec![("type", Json::Str("string".to_string()))])),
-                                        ("roots", str_array.clone()),
-                                        ("max_results", Json::obj(vec![("type", Json::Str("integer".to_string()))])),
-                                        ("context_lines", Json::obj(vec![("type", Json::Str("integer".to_string()))])),
-                                    ])),
-                                    ("required", Json::Arr(vec![Json::Str("query".to_string()), Json::Str("roots".to_string())])),
-                                ])),
-                            ])),
                         ]),
                     ),
                 ]),

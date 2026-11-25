@@ -712,6 +712,54 @@ fn is_generic_basename(file_name: &str) -> bool {
     )
 }
 
+fn stem_has_token_ci(stem: &str, query: &str) -> bool {
+    let bytes = stem.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= bytes.len() {
+        let is_sep = i == bytes.len() || bytes[i] == b'_' || bytes[i] == b'-';
+        let is_camel = i > start
+            && i < bytes.len()
+            && bytes[i].is_ascii_uppercase()
+            && (bytes[i - 1].is_ascii_lowercase() || bytes[i - 1].is_ascii_digit());
+        if is_sep || is_camel {
+            if i > start && stem[start..i].eq_ignore_ascii_case(query) {
+                return true;
+            }
+            start = if is_sep { i + 1 } else { i };
+        }
+        i += 1;
+    }
+    false
+}
+
+fn parent_segments_compact_match(rel: &str, q_compact: &[u8]) -> bool {
+    let Some((parent, _)) = rel.rsplit_once('/') else {
+        return false;
+    };
+    let segs: Vec<&str> = parent.split('/').filter(|s| !s.is_empty()).collect();
+    for start in 0..segs.len() {
+        let mut matched = 0usize;
+        let mut ok = true;
+        for seg in &segs[start..] {
+            for b in seg.bytes().filter(u8::is_ascii_alphanumeric) {
+                if matched >= q_compact.len() || b.to_ascii_lowercase() != q_compact[matched] {
+                    ok = false;
+                    break;
+                }
+                matched += 1;
+            }
+            if !ok {
+                break;
+            }
+            if matched == q_compact.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_generic_stem(stem: &str) -> bool {
     matches!(
         stem.to_ascii_lowercase().as_str(),
@@ -1065,37 +1113,103 @@ impl RamStore {
             }
 
             if !norm_q.contains('.') {
-                let Some(stem_indices) = idx.by_stem_hash.get(&h) else {
-                    return Vec::new();
-                };
-                let mut exact_stem = Vec::new();
-                let mut ci_stem = Vec::new();
-                for &entry_i in stem_indices.iter() {
-                    let it = &idx.entries[entry_i as usize];
-                    let stem = idx.file_stem(it);
-                    if stem == norm_q {
-                        let abs = idx.abs_path(it);
-                        if abs.is_file() {
-                            exact_stem.push(abs);
-                            if exact_stem.len() >= max_matches {
-                                break;
+                if let Some(stem_indices) = idx.by_stem_hash.get(&h) {
+                    let mut exact_stem = Vec::new();
+                    let mut ci_stem = Vec::new();
+                    for &entry_i in stem_indices.iter() {
+                        let it = &idx.entries[entry_i as usize];
+                        let stem = idx.file_stem(it);
+                        if stem == norm_q {
+                            let abs = idx.abs_path(it);
+                            if abs.is_file() {
+                                exact_stem.push(abs);
+                                if exact_stem.len() >= max_matches {
+                                    break;
+                                }
+                            }
+                        } else if stem.eq_ignore_ascii_case(&norm_q) && ci_stem.len() < max_matches {
+                            let abs = idx.abs_path(it);
+                            if abs.is_file() {
+                                ci_stem.push(abs);
                             }
                         }
-                    } else if stem.eq_ignore_ascii_case(&norm_q) && ci_stem.len() < max_matches {
-                        let abs = idx.abs_path(it);
-                        if abs.is_file() {
-                            ci_stem.push(abs);
+                    }
+                    let pool = if !exact_stem.is_empty() { exact_stem } else { ci_stem };
+                    if !pool.is_empty() {
+                        if is_generic_stem(&norm_q) && pool.len() > 2 {
+                            let first_parent = pool.first().and_then(|p| p.parent());
+                            if !pool.iter().all(|p| p.parent() == first_parent) {
+                                return Vec::new();
+                            }
+                        }
+                        return pool;
+                    }
+                }
+
+                // Tier 3: nested directory segment match (e.g. `resolver` -> `graph/resolver/*`).
+                if norm_q.len() >= 3 {
+                    let mut dir_hits = Vec::new();
+                    for it in idx.entries.iter() {
+                        let rel = idx.rel_str(it);
+                        if let Some((parent, _)) = rel.rsplit_once('/') {
+                            if parent.split('/').any(|seg| seg.eq_ignore_ascii_case(&norm_q)) {
+                                let abs = idx.abs_path(it);
+                                if abs.is_file() {
+                                    dir_hits.push(abs);
+                                    if dir_hits.len() >= max_matches {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !dir_hits.is_empty() {
+                        if is_generic_stem(&norm_q) && dir_hits.len() > 2 {
+                            let first_parent = dir_hits.first().and_then(|p| p.parent());
+                            if !dir_hits.iter().all(|p| p.parent() == first_parent) {
+                                return Vec::new();
+                            }
+                        }
+                        return dir_hits;
+                    }
+                }
+
+                // Tier 4: stem word token or consecutive directory segments match
+                // (e.g. `manifest` -> `manifest_scanner.py`, `graphresolver` -> `graph/resolver/*`).
+                if norm_q.len() >= 4 {
+                    let q_compact: Vec<u8> = norm_q
+                        .bytes()
+                        .filter(u8::is_ascii_alphanumeric)
+                        .map(|b| b.to_ascii_lowercase())
+                        .collect();
+                    if q_compact.len() >= 4 {
+                        let mut token_hits = Vec::new();
+                        for it in idx.entries.iter() {
+                            let stem = idx.file_stem(it);
+                            let rel = idx.rel_str(it);
+                            let matched = stem_has_token_ci(stem, &norm_q)
+                                || parent_segments_compact_match(rel, &q_compact);
+                            if matched {
+                                let abs = idx.abs_path(it);
+                                if abs.is_file() {
+                                    token_hits.push(abs);
+                                    if token_hits.len() >= max_matches {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !token_hits.is_empty() {
+                            if is_generic_stem(&norm_q) && token_hits.len() > 2 {
+                                let first_parent = token_hits.first().and_then(|p| p.parent());
+                                if !token_hits.iter().all(|p| p.parent() == first_parent) {
+                                    return Vec::new();
+                                }
+                            }
+                            return token_hits;
                         }
                     }
                 }
-                let pool = if !exact_stem.is_empty() { exact_stem } else { ci_stem };
-                if is_generic_stem(&norm_q) && pool.len() > 2 {
-                    let first_parent = pool.first().and_then(|p| p.parent());
-                    if !pool.iter().all(|p| p.parent() == first_parent) {
-                        return Vec::new();
-                    }
-                }
-                return pool;
             }
             return Vec::new();
         }

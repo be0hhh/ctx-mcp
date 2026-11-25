@@ -46,3 +46,29 @@ fn a_changed_file_stamp_refuses_publication() {
     assert_eq!(store.get_outline_entry(&path, Some(&dir)).unwrap().content.as_deref(), Some("int after_first_write;\n"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn shorthand_root_resolves_nested_dirs_stem_tokens_and_compact_segments() {
+    let dir = std::env::temp_dir().join(format!("ctx-root-resolve-{}-{}", std::process::id(), now_ms()));
+    fs::create_dir_all(dir.join("graph/resolver")).unwrap();
+    let resolve = dir.join("graph/resolver/resolve_graph.py");
+    let scanner = dir.join("graph/resolver/manifest_scanner.py");
+    fs::write(&resolve, "def resolve_graph():\n    return scan_manifests()\n").unwrap();
+    fs::write(&scanner, "def scan_manifests():\n    return []\n").unwrap();
+
+    let store = RamStore::new(dir.join("snapshot"));
+    // Tier 3: nested directory segment `resolver`
+    let by_dir = store.find_workspace_paths("resolver", &dir, 16);
+    assert_eq!(by_dir.len(), 2);
+    // Tier 4a: stem token `manifest`
+    let by_token = store.find_workspace_paths("manifest", &dir, 16);
+    assert_eq!(by_token.len(), 1);
+    assert!(by_token[0].ends_with("manifest_scanner.py"));
+    // Tier 4b: compact consecutive directory segments `graphresolver`
+    let by_compact = store.find_workspace_paths("graphresolver", &dir, 16);
+    assert_eq!(by_compact.len(), 2);
+    // Generic stem still refused on fallback
+    assert!(store.find_workspace_paths("main", &dir, 16).is_empty());
+
+    fs::remove_dir_all(dir).unwrap();
+}
