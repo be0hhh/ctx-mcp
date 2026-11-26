@@ -6,7 +6,9 @@ use crate::base::json::Json;
 use crate::base::simd::line_hash3;
 use crate::edit::{atomic_write_file, check_delimiter_balance, hashline::hash3_str};
 use crate::rpc::BrokerService;
-use std::fs::{self, Permissions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::path::PathBuf;
 
 fn anc(ln: usize, line: &str) -> String {

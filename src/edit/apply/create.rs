@@ -70,7 +70,16 @@ fn opt_bool(item: &Json, key: &str, raw_path: &str) -> Result<bool, String> {
 
 pub(super) fn admit_new_file(svc: &BrokerService, spec: CreateSpec, cwd: Option<&Path>) -> Result<AdmittedCreate, String> {
     let rp = spec.raw_path.as_str();
-    if rp.ends_with('/') || rp.ends_with('\\') || rp == "." || rp == ".." || rp.ends_with("/.") || rp.ends_with("\\.") {
+    if rp.ends_with('/')
+        || rp.ends_with('\\')
+        || rp == "."
+        || rp == ".."
+        || rp.ends_with("/.")
+        || rp.ends_with("\\.")
+        || Path::new(rp)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
         return Err(format!("REFUSED: invalid create target path `{rp}`"));
     }
     let cand = resolve_input_path(rp, cwd);

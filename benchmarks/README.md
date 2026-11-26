@@ -1,8 +1,8 @@
 # CTX Benchmarks (`v2.5.0`)
 
-Headline positioning and full-session Native vs CTX totals are in the
-[main README](../README.md#verified-benchmarks-v250-native-vs-ctx).
-Every row below is from verified `v2.5.0` runs (`131/131` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv` across `449` Fat-LTO functions, `0` failed edits).
+Headline positioning, quota-drain summary, and full-session Native vs CTX totals are in the
+[main README](../README.md#savings-at-a-glance-native-vs-ctx-v250).
+Every row below is from verified `v2.5.0` runs (`131/131` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv` across `450` Fat-LTO functions, `0` failed edits).
 
 ## 1. Cold (Turn 1) vs Warm (Turn 2) Navigation (`30/30` exact `file:line`)
 
@@ -12,35 +12,35 @@ Two-turn real-session navigation on an isolated 850-file tracked snapshot:
 
 ### Antigravity (`agy --sandbox --mode plan`, 4 core eager tools)
 
-| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached (Δ vs Native) | CTX RAM hit | Tool calls | MCP ms | RSS |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| **Neon High** | Cold | Native | 55.1 s | 60,789 | 31,137 | — | 6 | — | — |
-| **Neon High** | Cold | **CTX** | **49.7 s (−9.9%)** | **31,262 (−48.6%)** | **16,685 (−46.4%)** | 71.4% (15/21) | **1** | **9.2** | 6.4 MiB |
-| **Neon High** | Warm | Native | 18.9 s | 112,704 | 8,758 | — | 3 | — | — |
-| **Neon High** | Warm | **CTX** | 25.2 s (+33.6%) | **71,120 (−36.9%)** | 10,798 (+23.3%) | 82.7% (105/127) | **2** | **11.5** | 6.9 MiB |
-| **Neon XHigh** | Cold | Native | 124.6 s | 114,986 | 48,491 | — | 8 | — | — |
-| **Neon XHigh** | Cold | **CTX** | **105.3 s (−15.5%)** | **54,460 (−52.6%)** | **14,848 (−69.4%)** | 84.6% (33/39) | **3** | **16.5** | 6.8 MiB |
-| **Neon XHigh** | Warm | Native | 24.3 s | 183,174 | 27,033 | — | 3 | — | — |
-| **Neon XHigh** | Warm | **CTX** | 48.5 s (+99.5%) | **104,884 (−42.7%)** | **15,963 (−40.9%)** | 87.1% (148/170) | 3 | **25.6** | 7.4 MiB |
-| **Carbon High** | Cold | Native | 188.7 s | 109,660 | 52,526 | — | 8 | — | — |
-| **Carbon High** | Cold | **CTX** | 326.8 s (+73.2%) | **55,035 (−49.8%)** | **22,347 (−57.5%)** | 78.6% (22/28) | **3** | **16.8** | 6.9 MiB |
-| **Carbon High** | Warm | Native | 27.5 s | 215,380 | 24,264 | — | 4 | — | — |
-| **Carbon High** | Warm | **CTX** | 102.5 s (+272.7%) | **140,657 (−34.7%)** | 50,969 (+110.1%) | 84.3% (118/140) | **2** | **17.9** | 7.7 MiB |
+| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached (Δ vs Native) | LLM cache hit | CTX RAM hit | Tool calls | MCP ms | RSS |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Neon High** | Cold | Native | 55.1 s | 60,789 | 31,137 | 48.8% | — | 6 | — | — |
+| **Neon High** | Cold | **CTX** | **49.7 s (−9.9%)** | **31,262 (−48.6%)** | **16,685 (−46.4%)** | 46.6% | **71.4% (15/21)** | **1** | **9.2** | 6.4 MiB |
+| **Neon High** | Warm | Native | 18.9 s | 112,704 | 8,758 | 92.2% | — | 3 | — | — |
+| **Neon High** | Warm | **CTX** | 25.2 s (+33.6%) | **71,120 (−36.9%)** | 10,798 (+23.3%) | 84.8% | **82.7% (105/127)** | **2** | **11.5** | 6.9 MiB |
+| **Neon XHigh** | Cold | Native | 124.6 s | 114,986 | 48,491 | 57.8% | — | 8 | — | — |
+| **Neon XHigh** | Cold | **CTX** | **105.3 s (−15.5%)** | **54,460 (−52.6%)** | **14,848 (−69.4%)** | **72.7%** | **84.6% (33/39)** | **3** | **16.5** | 6.8 MiB |
+| **Neon XHigh** | Warm | Native | 24.3 s | 183,174 | 27,033 | 85.2% | — | 3 | — | — |
+| **Neon XHigh** | Warm | **CTX** | 48.5 s (+99.5%) | **104,884 (−42.7%)** | **15,963 (−40.9%)** | 84.8% | **87.1% (148/170)** | 3 | **25.6** | 7.4 MiB |
+| **Carbon High** | Cold | Native | 188.7 s | 109,660 | 52,526 | 52.1% | — | 8 | — | — |
+| **Carbon High** | Cold | **CTX** | 326.8 s (+73.2%) | **55,035 (−49.8%)** | **22,347 (−57.5%)** | **59.4%** | **78.6% (22/28)** | **3** | **16.8** | 6.9 MiB |
+| **Carbon High** | Warm | Native | 27.5 s | 215,380 | 24,264 | 88.7% | — | 4 | — | — |
+| **Carbon High** | Warm | **CTX** | 102.5 s (+272.7%) | **140,657 (−34.7%)** | 50,969 (+110.1%) | 63.8% | **84.3% (118/140)** | **2** | **17.9** | 7.7 MiB |
 
 ### Codex (`codex-cli`, `exec` → `exec resume`, direct MCP)
 
-| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached | Output | Tool calls | Tool bytes | CTX RAM hit | MCP ms |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Astra XHigh** | Cold | Native | 13.2 s | 42,868 | 11,252 | 476 | 1 | 25,384 B | — | — |
-| **Astra XHigh** | Cold | **CTX** | 19.0 s (+44.1%) | 58,038 (+35.4%) | 11,574 | 540 | 2 | **2,976 B (−88.3%)** | 82.4% (28/34) | **14.5** |
-| **Astra XHigh** | Warm | Native | 14.8 s | 121,227 | 13,707 | 268 | 3 | 8,109 B | — | — |
-| **Astra XHigh** | Warm | **CTX** | 19.0 s (+28.8%) | **119,250 (−1.6%)** | **12,754** | 384 | **2** | **1,617 B (−80.1%)** | 77.5% (31/40) | **16.6** |
-| **Astra Max** | Cold | Native | 27.5 s | 61,196 | 15,116 | 1,197 | 4 | 38,849 B | — | — |
-| **Astra Max** | Cold | **CTX** | **24.7 s (−10.3%)** | 77,822 (+27.2%) | **11,646** | **1,054** | **3** | **3,299 B (−91.5%)** | 82.4% (28/34) | **11.1** |
-| **Astra Max** | Warm | Native | 29.4 s | 166,762 | 17,130 | 1,474 | 6 | 5,451 B | — | — |
-| **Astra Max** | Warm | **CTX** | **16.6 s (−43.4%)** | **140,371 (−15.8%)** | **13,139** | **798** | **2** | **1,825 B (−66.5%)** | 66.2% (43/65) | **16.1** |
+| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached | LLM cache hit | Output | Tool calls | Tool bytes | CTX RAM hit | MCP ms |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Astra XHigh** | Cold | Native | 13.2 s | 42,868 | 11,252 | 73.8% | 476 | 1 | 25,384 B | — | — |
+| **Astra XHigh** | Cold | **CTX** | 19.0 s (+44.1%) | 58,038 (+35.4%) | 11,574 | **80.1%** | 540 | 2 | **2,976 B (−88.3%)** | **82.4% (28/34)** | **14.5** |
+| **Astra XHigh** | Warm | Native | 14.8 s | 121,227 | 13,707 | 88.7% | 268 | 3 | 8,109 B | — | — |
+| **Astra XHigh** | Warm | **CTX** | 19.0 s (+28.8%) | **119,250 (−1.6%)** | **12,754** | **89.3%** | 384 | **2** | **1,617 B (−80.1%)** | **77.5% (31/40)** | **16.6** |
+| **Astra Max** | Cold | Native | 27.5 s | 61,196 | 15,116 | 75.3% | 1,197 | 4 | 38,849 B | — | — |
+| **Astra Max** | Cold | **CTX** | **24.7 s (−10.3%)** | 77,822 (+27.2%) | **11,646** | **85.0%** | **1,054** | **3** | **3,299 B (−91.5%)** | **82.4% (28/34)** | **11.1** |
+| **Astra Max** | Warm | Native | 29.4 s | 166,762 | 17,130 | 89.7% | 1,474 | 6 | 5,451 B | — | — |
+| **Astra Max** | Warm | **CTX** | **16.6 s (−43.4%)** | **140,371 (−15.8%)** | **13,139** | **90.6%** | **798** | **2** | **1,825 B (−66.5%)** | **66.2% (43/65)** | **16.1** |
 
-- **Aggregate (all 5 models, `30/30` exact `file:line`):** Tool calls **`46 → 23` (−50.0%)**, Full input **`−28.3%`** (**−42.6%** on AGY), Uncached **`−27.5%`** (**−50.2%** Cold), Codex tool payload **`77,793 B → 9,717 B` (−87.5%, 8.0×)**.
+- **Aggregate (all 5 models, `30/30` exact `file:line`):** Tool calls **`46 → 23` (−50.0%)**, Full input **`−28.3%`** (**−42.6%** AGY), Uncached **`−27.5%`** (**−51.4%** Cold), LLM cache hit **59.3% → 72.1%** Cold (**85.4% → 87.6%** Codex), CTX RAM hit **81.8%** (`571/698`), Codex tool payload **`77,793 B → 9,717 B` (−87.5%, 8.0×)**, Est. input quota drain **−28%** (**−35%…−38%** AGY; **−47%…−48%** Neon).
 
 ## 2. Universal `ctx diag` v2 Compression (Deterministic + Blind Live LLM)
 
@@ -58,12 +58,12 @@ Two-turn real-session navigation on an isolated 850-file tracked snapshot:
 
 ### Blind Live LLM diagnosis (`raw_bash` vs `ctx diag -- ./run_checks.sh`)
 
-| Client & Model | Route | Verified | Calls | Full input | Uncached input | Output | Wall time |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **AGY · Neon XHigh** | `raw_bash` | PASS | 7 | 110,128 | 29,277 | 2,340 | 33.6 s |
-| **AGY · Neon XHigh** | **`ctx diag`** | **PASS** | **1 (−85.7%)** | **27,134 (−75.4%)** | **16,009 (−45.3%)** | **1,473 (−37.1%)** | **18.5 s (−45.0%)** |
-| **Codex · Astra XHigh** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s |
-| **Codex · Astra XHigh** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%)** | **2,678 (−78.1%)** | **164 (−16.3%)** | **11.9 s (−16.2%)** |
+| Client & Model | Route | Verified | Calls | Full input | Uncached input | Output | Wall time | Est. quota drain |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **AGY · Neon XHigh** | `raw_bash` | PASS | 7 | 110,128 | 29,277 | 2,340 | 33.6 s | baseline |
+| **AGY · Neon XHigh** | **`ctx diag`** | **PASS** | **1 (−85.7%)** | **27,134 (−75.4%)** | **16,009 (−45.3%)** | **1,473 (−37.1%)** | **18.5 s (−45.0%)** | **−51%…−57%** |
+| **Codex · Astra XHigh** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s | baseline |
+| **Codex · Astra XHigh** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%)** | **2,678 (−78.1%)** | **164 (−16.3%)** | **11.9 s (−16.2%)** | **−60%…−66%** |
 
 ## 3. Atomic Multi-File Edit & Refactor (5 models, `20/20` verified, `0` failed edits)
 
@@ -115,7 +115,7 @@ Two multi-file tasks (`cpp_sig_edit` across C++ headers; `py_refactor` lexical r
 
 ## 5. Load & Hot-Kernel Results (`v2.5.0`)
 
-Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `rustc`, release Fat-LTO, `0` hardware `div`/`idiv` across `449` `ctx::` functions, `0` `.unwrap()`/`.expect()` in production).
+Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `rustc`, release Fat-LTO, `0` hardware `div`/`idiv` across `450` `ctx::` functions, `0` `.unwrap()`/`.expect()` in production).
 
 ### In-process hot kernels (`ctx-bench micro --iters 200`, 19 kernels)
 

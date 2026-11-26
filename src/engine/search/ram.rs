@@ -529,13 +529,41 @@ mod tests {
         assert!(!batch.contains("cpp line comment"));
         assert!(batch.contains("py comment") && batch.contains("val = target_sym(9)"));
 
-        // Regex search (exercises rg / post-filter path) drops pure comments & string-only literals
-        let rx_all = op_search(&svc, r"target_sym\s*\(", &[], opts_all, Some(&ws)).unwrap();
-        assert!(rx_all.contains("cpp line comment") && rx_all.contains("py string"));
-        let rx = op_search(&svc, r"target_sym\s*\(", &[], opts_code, Some(&ws)).unwrap();
-        assert!(rx.contains("calc.hpp:5:") && rx.contains("calc.rs:4:") && rx.contains("calc.py:4:"));
-        for noise in ["comment", "string", "raw", "nested", "docstring"] {
-            assert!(!rx.contains(noise), "regex leaked noise `{noise}` in:\n{rx}");
+        // Direct post-filter verification for Regex mode (runs deterministically on all OSes even without `rg`)
+        let canon_ws = fs::canonicalize(&ws).unwrap();
+        let mk_group = |name: &str, lines: usize| -> Vec<super::super::SearchHit> {
+            let p = canon_ws.join(name);
+            (1..=lines)
+                .map(|ln| super::super::SearchHit {
+                    path: p.clone(),
+                    workspace: canon_ws.clone(),
+                    line: ln,
+                    snippet: format!("{name}:{ln}"),
+                })
+                .collect()
+        };
+        let mut grouped = vec![mk_group("calc.hpp", 5), mk_group("calc.rs", 4), mk_group("calc.py", 4)];
+        super::filter_grouped_hits_code_only(&svc, r"target_sym\s*\(", super::super::RgMatchMode::Regex, &mut grouped);
+        let kept: Vec<(String, usize)> = grouped
+            .iter()
+            .flatten()
+            .map(|h| (h.path.file_name().unwrap().to_string_lossy().into_owned(), h.line))
+            .collect();
+        assert_eq!(kept, vec![("calc.hpp".into(), 5), ("calc.rs".into(), 4), ("calc.py".into(), 4)]);
+
+        // End-to-end regex search via external `rg` when available in the environment
+        let has_rg = crate::base::platform::hidden_command(crate::base::platform::resolve_tool("rg"))
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if has_rg {
+            let rx_all = op_search(&svc, r"target_sym\s*\(", &[], opts_all, Some(&ws)).unwrap();
+            assert!(rx_all.contains("cpp line comment") && rx_all.contains("py string"));
+            let rx = op_search(&svc, r"target_sym\s*\(", &[], opts_code, Some(&ws)).unwrap();
+            assert!(rx.contains("calc.hpp:5:") && rx.contains("calc.rs:4:") && rx.contains("calc.py:4:"));
+            for noise in ["comment", "string", "raw", "nested", "docstring"] {
+                assert!(!rx.contains(noise), "regex leaked noise `{noise}` in:\n{rx}");
+            }
         }
 
         let _ = fs::remove_dir_all(&ws);
