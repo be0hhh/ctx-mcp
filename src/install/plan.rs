@@ -270,7 +270,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp test dir");
-        dir
+        fs::canonicalize(&dir).unwrap_or(dir)
     }
 
     #[test]

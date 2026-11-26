@@ -650,6 +650,8 @@ mod tests {
             id
         ));
         let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create fake home dir");
+        let home = fs::canonicalize(&home).unwrap_or(home);
         let codex = home.join(".codex");
         fs::create_dir_all(&codex).expect("create fake codex dir");
         let codex_agents = codex.join("AGENTS.md");
