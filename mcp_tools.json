@@ -5,6 +5,9 @@
   "ctx_outline",
   "ctx_symbols",
   "ctx_search",
+  "ctx_impact",
+  "ctx_edit",
+  "ctx_git",
   "ctx_memo",
   "ctx_elf_audit"
 ]

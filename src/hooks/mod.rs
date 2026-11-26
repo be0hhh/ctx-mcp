@@ -339,8 +339,11 @@ fn mcp_context_rewrite(
     // host-aware budgets (`read`, `symbols`, `memo` mutations, `capsule`). Stateless read-only
     // ops (`search`, `inspect`, `outline`, `elf_audit`, `memo` list/get) skip argument rewrites.
     let needs_context = match op {
-        "capsule" | "read" | "symbols" => true,
-        "memo" => matches!(inner_args.get_str("action"), Some("put" | "clear")),
+        "capsule" | "read" | "symbols" | "impact" | "edit" | "git" => true,
+        "memo" => matches!(
+            inner_args.get_str("action"),
+            Some("put" | "clear" | "pack" | "pack_get")
+        ),
         _ => false,
     };
     if !needs_context {

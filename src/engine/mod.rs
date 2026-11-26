@@ -7,20 +7,24 @@
 //   - `op_memo` (`put | get | list | clear` with automatic `[STALE]` verification)
 //   - `op_elf_audit` (native Rust ELF64 + ASM static inspector) and `op_status`.
 
+pub mod compact;
 pub mod elf_audit;
 pub mod outline;
 pub mod read;
 pub mod search;
 pub mod symbols;
 
+#[allow(unused_imports)]
 pub use elf_audit::op_elf_audit;
+pub use elf_audit::op_elf_audit_with_baseline;
 pub use outline::{op_inspect, op_outline};
 pub use read::op_read_for_host;
 pub use search::{
     cap_text, op_search, op_search_batch, parse_shorthand_search_spec, SearchError, SearchOptions,
     SEARCH_RESPONSE_BYTES,
 };
-pub use symbols::op_symbols;
+#[allow(unused_imports)]
+pub use symbols::{op_symbols, op_symbols_with_options};
 
 use crate::base::json::Json;
 use crate::base::security::{admit_file_in_workspace, is_sensitive_path};
@@ -35,8 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 pub const DEFAULT_READ_MAX_BYTES: usize = 1_048_576; // 1 MiB
-pub const DEFAULT_INSPECT_MAX_BYTES: usize = 9_000; // Fits under Antigravity's ~10 KB MCP inline cap
-pub const AGY_MCP_DEFAULT_MAX_BYTES: usize = 9_000;
+pub const AGY_MCP_DEFAULT_MAX_BYTES: usize = 9_000; // Fits under Antigravity's ~10 KB MCP inline cap
 pub const AGY_MCP_INLINE_CAP: usize = 9_200;
 
 pub fn is_safe_shorthand_candidate(raw: &str) -> bool {
@@ -145,7 +148,9 @@ pub fn collect_target_files(
                 } else {
                     let found = svc.store.find_workspace_paths(cleaned, &ws_root, 8);
                     if found.len() == 1 {
-                        p = found.into_iter().next().unwrap();
+                        if let Some(first) = found.into_iter().next() {
+                            p = first;
+                        }
                     } else if found.len() > 1 {
                         for cand in found {
                             if out.len() >= max_files {
@@ -203,6 +208,7 @@ pub fn collect_target_files(
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub fn op_memo(
     svc: &BrokerService,
     action: &str,
@@ -211,6 +217,37 @@ pub fn op_memo(
     kind: Option<&str>,
     trusted_author: Option<&str>,
     paths: &[String],
+    cwd: Option<&Path>,
+) -> Result<Json, String> {
+    op_memo_full(
+        svc,
+        action,
+        topic,
+        summary,
+        kind,
+        trusted_author,
+        None,
+        paths,
+        false,
+        false,
+        AGY_MCP_DEFAULT_MAX_BYTES,
+        cwd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_memo_full(
+    svc: &BrokerService,
+    action: &str,
+    topic: &str,
+    summary: &str,
+    kind: Option<&str>,
+    trusted_author: Option<&str>,
+    session_key: Option<&str>,
+    paths: &[String],
+    force: bool,
+    raw: bool,
+    max_bytes: usize,
     cwd: Option<&Path>,
 ) -> Result<Json, String> {
     let base = cwd
@@ -233,7 +270,7 @@ pub fn op_memo(
                 let canon = admit_file_in_workspace(&resolved, &ws_root)?;
                 let rel = canon
                     .strip_prefix(&ws_root)
-                    .expect("admitted file must be inside its workspace")
+                    .map_err(|_| "memo linked file escaped workspace root".to_string())?
                     .to_str()
                     .ok_or_else(|| "memo linked path must be UTF-8".to_string())?;
                 if contains_known_secret(rel) {
@@ -270,19 +307,307 @@ pub fn op_memo(
             let text = svc
                 .broker
                 .clear_memos(&ws_norm, (!topic.is_empty()).then_some(topic))?;
+            let removed_packs = svc
+                .broker
+                .packs
+                .remove_pack(&ws_norm, (!topic.is_empty()).then_some(topic));
+            let msg = if removed_packs > 0 {
+                format!("{text} Cleared {removed_packs} pack(s).")
+            } else {
+                text
+            };
+            Ok(Json::obj(vec![("text", Json::Str(msg))]))
+        }
+        "changes" => {
+            let since_seq = topic.trim().parse::<u64>().unwrap_or(0);
+            let (head, events) = svc.broker.changes.changes_since(&ws_norm, since_seq, 64);
+            Ok(Json::obj(vec![(
+                "changes",
+                crate::broker::change_feed::ChangeFeed::to_json(head, &events),
+            )]))
+        }
+        "pack" => {
+            let name = topic.trim();
+            let pol = crate::base::ext::policy();
+            if pol.list_virtual_packs(&ws_root).iter().any(|&v| v == name)
+                || pol.resolve_virtual_pack(&ws_root, name).is_some()
+            {
+                return Err(format!(
+                    "REFUSED: pack name `{name}` is reserved by a built-in virtual pack"
+                ));
+            }
+            let opt_summary = (!summary.trim().is_empty()).then_some(summary);
+            let author = trusted_author.unwrap_or("unknown");
+            let text = svc
+                .broker
+                .packs
+                .put_pack(&ws_norm, name, paths.to_vec(), opt_summary, author)?;
             Ok(Json::obj(vec![("text", Json::Str(text))]))
         }
+        "pack_get" => {
+            let text = materialize_pack_for_workspace(
+                svc,
+                &ws_root,
+                topic.trim(),
+                session_key,
+                force,
+                raw,
+                max_bytes,
+            )?;
+            Ok(Json::obj(vec![("text", Json::Str(text))]))
+        }
+        "packs" => {
+            let mut out = String::from("Shared Context Packs:\n");
+            let pol = crate::base::ext::policy();
+            let mut count = 0usize;
+            for &vname in pol.list_virtual_packs(&ws_root) {
+                if let Some((_label, sels)) = pol.resolve_virtual_pack(&ws_root, vname) {
+                    out.push_str(&format!("- {vname} [virtual, {} selector(s)]: {}\n", sels.len(), sels.join(", ")));
+                    count += 1;
+                }
+            }
+            for p in svc.broker.packs.list_packs(&ws_norm) {
+                out.push_str(&format!("- {} [shared, {} selector(s), by {}]: {}\n", p.name, p.selectors.len(), p.author, p.selectors.join(", ")));
+                count += 1;
+            }
+            if count == 0 {
+                out.push_str("(none)\n");
+            }
+            Ok(Json::obj(vec![("text", Json::Str(out))]))
+        }
         other => Err(format!(
-            "unknown memo action `{}` (expected put | get | list | clear)",
+            "unknown memo action `{}` (expected put | get | list | clear | changes | pack | pack_get | packs)",
             other
         )),
     }
 }
 
+pub fn materialize_pack_for_workspace(
+    svc: &BrokerService,
+    ws_root: &Path,
+    pack_name: &str,
+    session_key: Option<&str>,
+    force: bool,
+    raw: bool,
+    max_bytes: usize,
+) -> Result<String, String> {
+    if pack_name.is_empty() {
+        return Err("pack_get requires a non-empty `topic` pack name".to_string());
+    }
+    let ws_norm = norm_key_from_canon(ws_root);
+    let budget = max_bytes.clamp(1024, DEFAULT_READ_MAX_BYTES);
+    let pol = crate::base::ext::policy();
+    let (is_virtual, summary, selectors): (bool, Option<String>, Vec<String>) =
+        if let Some((label, sels)) = pol.resolve_virtual_pack(ws_root, pack_name) {
+            (true, (!label.trim().is_empty()).then_some(label), sels)
+        } else if let Some(spec) = svc.broker.packs.get_pack(&ws_norm, pack_name) {
+            (false, spec.summary, spec.selectors)
+        } else {
+            return Err(format!("shared pack `{pack_name}` not found"));
+        };
+
+    let mut digest_seed = Vec::with_capacity(256);
+    digest_seed.extend_from_slice(pack_name.as_bytes());
+    digest_seed.push(if raw { 1 } else { 0 });
+    digest_seed.extend_from_slice(&(budget as u64).to_le_bytes());
+    if let Some(ref s) = summary {
+        if contains_known_secret(s) {
+            return Err("REFUSED: pack summary contains known secret material".to_string());
+        }
+        digest_seed.extend_from_slice(s.as_bytes());
+    }
+
+    let mut body = String::with_capacity(budget.min(8192));
+    if let Some(ref s) = summary {
+        if is_virtual {
+            body.push_str("[Pack Summary]: ");
+        } else {
+            body.push_str("[Memo Note (untrusted)]: ");
+        }
+        body.push_str(s.trim());
+        body.push('\n');
+    }
+
+    let mut resolved_ok = 0usize;
+    for (idx, sel) in selectors.iter().enumerate() {
+        if body.len() >= budget.saturating_sub(96) {
+            let rem_sels: Vec<&str> = selectors[idx..].iter().map(String::as_str).collect();
+            body.push_str(&format!(
+                "... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
+                rem_sels.join(", ")
+            ));
+            break;
+        }
+        let Some((file_part, anchor_kind)) = parse_pack_selector(sel) else {
+            continue;
+        };
+        let cand = resolve_input_path(file_part, Some(ws_root));
+        let canon = match admit_file_in_workspace(&cand, ws_root) {
+            Ok(c) => c,
+            Err(e) => {
+                body.push_str(&format!("=== {sel} [{e}] ===\n"));
+                continue;
+            }
+        };
+        if crate::base::security::is_sensitive_path_with_ws(&canon, Some(ws_root), false) {
+            body.push_str(&format!("=== {sel} [REFUSED: sensitive path] ===\n"));
+            continue;
+        }
+        let Ok(entry) = svc.store.get_full_entry(&canon, Some(ws_root)) else {
+            body.push_str(&format!("=== {sel} [ERROR: unreadable] ===\n"));
+            continue;
+        };
+        let Some(full_text) = entry.content.as_deref() else {
+            continue;
+        };
+        if contains_known_secret(full_text) {
+            body.push_str(&format!("=== {} [REFUSED: secret material] ===\n", entry.rel_path));
+            continue;
+        }
+        digest_seed.extend_from_slice(&entry.content_hash64.to_le_bytes());
+        digest_seed.extend_from_slice(sel.as_bytes());
+
+        let total_lines = (entry.line_count as usize).max(1);
+        let (s_ln, e_ln, label) = match anchor_kind {
+            PackAnchor::Symbol(q) => {
+                let Some(sym) = entry
+                    .symbols
+                    .iter()
+                    .find(|sym| symbols::symbol_matches_query(&sym.name, q))
+                else {
+                    body.push_str(&format!(
+                        "=== {}#{} [NOT FOUND] ===\n",
+                        entry.rel_path, q
+                    ));
+                    continue;
+                };
+                (
+                    (sym.start_line as usize).max(1),
+                    (sym.end_line as usize).min(total_lines),
+                    format!("{}#{}", entry.rel_path, sym.name),
+                )
+            }
+            PackAnchor::Lines(s, e) => (
+                s.clamp(1, total_lines),
+                e.clamp(s.clamp(1, total_lines), total_lines),
+                format!("{}:{}-{}", entry.rel_path, s, e),
+            ),
+            PackAnchor::Whole => (1, total_lines.min(200), entry.rel_path.to_string()),
+        };
+
+        let mut raw_slice = String::new();
+        for ln in s_ln..=e_ln {
+            raw_slice.push_str(entry.line_slice(ln as u32));
+            raw_slice.push('\n');
+        }
+        let ext = canon.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let rendered = if !raw && compact::is_doc_or_config_ext(ext) {
+            compact::compact_text_for_ext(ext, &raw_slice, true)
+        } else {
+            raw_slice
+        };
+        let header = format!("=== {label} [L{s_ln}-L{e_ln}] ===\n");
+        let avail = budget.saturating_sub(body.len() + 96);
+        if header.len() >= avail {
+            let rem_sels: Vec<&str> = selectors[idx..].iter().map(String::as_str).collect();
+            body.push_str(&format!(
+                "... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
+                rem_sels.join(", ")
+            ));
+            break;
+        }
+        body.push_str(&header);
+        let rem = avail.saturating_sub(header.len());
+        if rendered.len() <= rem {
+            body.push_str(&rendered);
+            if !rendered.ends_with('\n') {
+                body.push('\n');
+            }
+        } else {
+            let mut cut = rem;
+            while cut > 0 && !rendered.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.push_str(&rendered[..cut]);
+            let next_sels: Vec<&str> = selectors[idx + 1..].iter().map(String::as_str).collect();
+            if next_sels.is_empty() {
+                body.push_str("\n... [truncated at max_bytes]\n");
+            } else {
+                body.push_str(&format!(
+                    "\n... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
+                    next_sels.join(", ")
+                ));
+            }
+        }
+        resolved_ok += 1;
+    }
+
+    let digest = crate::base::simd::fast_hash64(&digest_seed);
+    if let Some(sk) = session_key.filter(|s| !s.is_empty()) {
+        if svc
+            .broker
+            .packs
+            .check_and_mark_delivered(sk, &ws_norm, pack_name, digest, force)
+        {
+            return Ok(format!(
+                "[UNCHANGED pack:{pack_name} @{digest:016x} ({}B)]\n",
+                body.len()
+            ));
+        }
+    }
+    let mut final_out = String::with_capacity(body.len() + 96);
+    final_out.push_str(&format!(
+        "[pack:{pack_name} @{digest:016x}, {resolved_ok}/{} section(s){}]\n",
+        selectors.len(),
+        if raw { ", raw" } else { ", compact" }
+    ));
+    final_out.push_str(&body);
+    Ok(final_out)
+}
+
+enum PackAnchor<'a> {
+    Symbol(&'a str),
+    Lines(usize, usize),
+    Whole,
+}
+
+fn parse_pack_selector(sel: &str) -> Option<(&str, PackAnchor<'_>)> {
+    let t = sel.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((p, sym)) = t.split_once('#') {
+        let sym = sym.trim();
+        if !p.trim().is_empty() && !sym.is_empty() {
+            return Some((p.trim(), PackAnchor::Symbol(sym)));
+        }
+    }
+    if let Some((p, range)) = t.rsplit_once(':') {
+        if let Some((s, e)) = range.split_once('-') {
+            if let (Ok(sn), Ok(en)) = (s.trim().parse::<usize>(), e.trim().parse::<usize>()) {
+                if sn >= 1 && en >= sn && !p.trim().is_empty() {
+                    return Some((p.trim(), PackAnchor::Lines(sn, en)));
+                }
+            }
+        }
+    }
+    Some((t, PackAnchor::Whole))
+}
+
 pub fn op_status(svc: &BrokerService) -> Json {
     let capsules = svc.broker.capsules.status();
     let used = svc.store.used_ram_bytes.load(Ordering::Relaxed);
+    let wmode = crate::base::mode::current_write_mode(None);
     Json::obj(vec![
+        (
+            "build_flavor",
+            Json::Str(crate::base::ext::policy().build_flavor().to_string()),
+        ),
+        ("write_enabled", Json::Bool(wmode.enabled)),
+        (
+            "write_mode_source",
+            Json::Str(wmode.source.as_str().to_string()),
+        ),
         ("cached_files", Json::Int(svc.store.cached_file_count() as i64)),
         ("used_ram_bytes", Json::Int(used as i64)),
         ("used_ram_mb", Json::Int((used >> 20) as i64)),

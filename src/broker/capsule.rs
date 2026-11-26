@@ -66,6 +66,7 @@ struct Entry {
     parent: HostContext,
     mode: WorkspaceMode,
     brief: String,
+    pack_refs: Vec<String>,
     call_id: Option<String>,
     index: usize,
     recipient: Option<Recipient>,
@@ -125,12 +126,32 @@ impl CapsuleRegistry {
         call_id: Option<&str>,
         index: usize,
     ) -> Result<String, String> {
+        self.prepare_with_packs(parent, mode, brief, Vec::new(), call_id, index)
+    }
+
+    pub fn prepare_with_packs(
+        &self,
+        parent: &HostContext,
+        mode: WorkspaceMode,
+        brief: &str,
+        pack_refs: Vec<String>,
+        call_id: Option<&str>,
+        index: usize,
+    ) -> Result<String, String> {
         if brief.trim().is_empty()
             || brief.len() > MAX_BRIEF_BYTES
             || key_in_assignment(brief).is_some()
         {
             return Err("invalid capsule assignment".into());
         }
+        if pack_refs.len() > 4
+            || pack_refs
+                .iter()
+                .any(|p| p.trim().is_empty() || p.len() > 96 || p.chars().any(char::is_control))
+        {
+            return Err("invalid capsule pack_refs (max 4, non-empty <= 96B)".into());
+        }
+        let pack_refs: Vec<String> = pack_refs.into_iter().map(|s| s.trim().to_owned()).collect();
         let now = Instant::now();
         let mut state = self
             .state
@@ -143,7 +164,7 @@ impl CapsuleRegistry {
                     && entry.index == index
                     && entry.parent.same_launch_parent(parent)
             }) {
-                if entry.brief != brief || entry.mode != mode {
+                if entry.brief != brief || entry.mode != mode || entry.pack_refs != pack_refs {
                     return Err("conflicting capsule launch receipt".into());
                 }
                 return Ok(assignment(brief, key));
@@ -163,6 +184,7 @@ impl CapsuleRegistry {
                 parent: parent.clone(),
                 mode,
                 brief: brief.into(),
+                pack_refs,
                 call_id: call_id.map(str::to_owned),
                 index,
                 recipient: None,
@@ -231,7 +253,16 @@ impl CapsuleRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn claim(&self, child: &HostContext, key: &str) -> Result<String, ClaimError> {
+        self.claim_with_packs(child, key).map(|(brief, _)| brief)
+    }
+
+    pub fn claim_with_packs(
+        &self,
+        child: &HostContext,
+        key: &str,
+    ) -> Result<(String, Vec<String>), ClaimError> {
         let mut state = self.state.lock().map_err(|_| ClaimError::Unavailable)?;
         state.prune(Instant::now());
         let candidate = state.entries.get(key).filter(|entry| {
@@ -248,12 +279,12 @@ impl CapsuleRegistry {
                 return Err(ClaimError::Unavailable);
             }
         }
-        let entry = state
-            .entries
-            .remove(key)
-            .expect("matched entry under registry lock");
+        let Some(entry) = state.entries.remove(key) else {
+            state.refused += 1;
+            return Err(ClaimError::Unavailable);
+        };
         state.issued += 1;
-        Ok(entry.brief)
+        Ok((entry.brief, entry.pack_refs))
     }
 
     pub fn issue_mcp_ticket(&self, context: HostContext, name: &str) -> Result<String, String> {
@@ -289,11 +320,11 @@ impl CapsuleRegistry {
         if ticket.is_none() {
             return Err("ctx host context expired or invalid".into());
         }
-        Ok(state
+        state
             .tickets
             .remove(token)
-            .expect("matched context under registry lock")
-            .1)
+            .map(|(_, ctx, _)| ctx)
+            .ok_or_else(|| "ctx host context expired or invalid".into())
     }
 
     pub fn clear(&self) {

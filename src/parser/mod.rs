@@ -1,12 +1,15 @@
 //! Fast zero-dependency structural outline extractor for C/C++26 (`.c/.h/.cpp/.hpp/.ipp/...`),
 //! Rust, Python, Java, C#, Go, TypeScript/JS, Kotlin, Swift, Zig, Shell, Proto, SQL,
-//! CMake, Markdown, JSON/JSONC, YAML, and TOML using compact `SymbolKind` tokens
-//! and precomputed `line_offsets` (`0` per-line `String` allocations).
+//! CMake, Makefile, Dockerfile, Markdown, JSON/JSONC, YAML, and TOML using compact `SymbolKind`
+//! tokens and precomputed `line_offsets` (`0` per-line `String` allocations).
 
-mod clean;
+pub mod clean;
 mod cpp;
+mod infra;
 mod langs;
 mod structured;
+
+pub use clean::build_cleaned_code_buffer_for_ext;
 
 use std::path::Path;
 
@@ -40,6 +43,7 @@ pub enum SymbolKind {
     Key = 25,
     Record = 26,
     Mod = 27,
+    H4 = 28,
 }
 
 impl SymbolKind {
@@ -73,6 +77,7 @@ impl SymbolKind {
             Self::Key => "key",
             Self::Record => "record",
             Self::Mod => "mod",
+            Self::H4 => "h4",
         }
     }
 
@@ -106,6 +111,7 @@ impl SymbolKind {
             25 => Some(Self::Key),
             26 => Some(Self::Record),
             27 => Some(Self::Mod),
+            28 => Some(Self::H4),
             _ => None,
         }
     }
@@ -133,6 +139,14 @@ pub fn extract_symbols(path: &Path, text: &str, line_offsets: &[u32]) -> Box<[Sy
 
     let vec = if fname == "CMakeLists.txt" || ext == "cmake" {
         structured::parse_cmake(text, line_offsets)
+    } else if matches!(fname, "Makefile" | "GNUmakefile" | "makefile") || ext == "mk" {
+        infra::parse_makefile(text, line_offsets)
+    } else if matches!(fname, "Dockerfile" | "Containerfile")
+        || fname.starts_with("Dockerfile.")
+        || fname.starts_with("Containerfile.")
+        || ext == "dockerfile"
+    {
+        infra::parse_dockerfile(text, line_offsets)
     } else {
         match ext {
             "h" | "hpp" | "ipp" | "hh" | "hxx" | "c" | "cc" | "cpp" | "cxx" | "inl" | "tpp"
@@ -163,8 +177,7 @@ fn lower_ext<'a>(path: &Path, buf: &'a mut [u8; 16]) -> &'a str {
     for (i, b) in raw.bytes().enumerate() {
         buf[i] = b.to_ascii_lowercase();
     }
-    // SAFETY: `raw` was checked ASCII.
-    unsafe { std::str::from_utf8_unchecked(&buf[..raw.len()]) }
+    std::str::from_utf8(&buf[..raw.len()]).unwrap_or("")
 }
 
 fn compact_ws(s: &str, max_len: usize) -> Box<str> {
@@ -190,7 +203,7 @@ fn compact_ws(s: &str, max_len: usize) -> Box<str> {
 }
 
 #[inline]
-fn is_ident_char(b: u8) -> bool {
+pub fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -232,5 +245,17 @@ mod tests {
         let yms = scan_source_bytes(yaml_doc.as_bytes().to_vec()).unwrap();
         let ymsyms = extract_symbols(Path::new("ci.yml"), &yms.text, &yms.line_offsets);
         assert!(ymsyms.iter().any(|s| s.kind == SymbolKind::Key && &*s.name == "jobs" && s.start_line == 4 && s.end_line == 6));
+
+        assert_eq!(SymbolKind::from_tag(28), Some(SymbolKind::H4));
+        assert_eq!(SymbolKind::H4.as_str(), "h4");
+
+        let mk = scan_source_bytes(b"build:\n\t@echo ok\n".to_vec()).unwrap();
+        assert!(extract_symbols(Path::new("Makefile"), &mk.text, &mk.line_offsets)
+            .iter()
+            .any(|s| s.kind == SymbolKind::Sym && &*s.name == "build"));
+        let df = scan_source_bytes(b"FROM rust:1.80 AS builder\nRUN true\n".to_vec()).unwrap();
+        assert!(extract_symbols(Path::new("Dockerfile.prod"), &df.text, &df.line_offsets)
+            .iter()
+            .any(|s| s.kind == SymbolKind::Mod && &*s.name == "builder"));
     }
 }

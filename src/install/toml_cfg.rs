@@ -6,6 +6,12 @@ use crate::base::json::{self, Json};
 use std::fs;
 use std::path::Path;
 
+const WRITE_TOOL_NAMES: &[&str] = &["ctx_edit"];
+
+fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&name)
+}
+
 // Locate single-line assignments and tables without treating data inside
 // multiline arrays or strings as a configuration header.
 fn toml_records(text: &str) -> Result<Vec<&str>, String> {
@@ -195,15 +201,69 @@ fn codex_tool_config(raw: &str, expected: &[String]) -> Result<usize, String> {
     Ok(expected.len())
 }
 
-pub(super) fn check_codex_tool_config(path: &Path, expected: &[String]) -> (bool, String) {
+fn codex_tool_config_for_mode(
+    raw: &str,
+    expected: &[String],
+    write_enabled: bool,
+) -> Result<(usize, bool), String> {
+    match codex_tool_config(raw, expected) {
+        Ok(count) => Ok((count, false)),
+        Err(full_err) if !write_enabled => {
+            let ro_expected: Vec<String> = expected
+                .iter()
+                .filter(|name| !is_write_tool(name))
+                .cloned()
+                .collect();
+            if ro_expected.len() == expected.len() {
+                return Err(full_err);
+            }
+            codex_tool_config(raw, &ro_expected).map(|count| (count, true))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(super) fn check_codex_tool_config(
+    path: &Path,
+    expected: &[String],
+    write_enabled: bool,
+) -> (bool, String) {
     let result = fs::read_to_string(path)
         .map_err(|error| error.to_string())
-        .and_then(|raw| codex_tool_config(&raw, expected));
+        .and_then(|raw| codex_tool_config_for_mode(&raw, expected, write_enabled));
     let (ok, detail) = match result {
-        Ok(count) => (true, format!("config permits {count} catalog tools")),
+        Ok((count, false)) => (true, format!("config permits {count} catalog tools")),
+        Ok((count, true)) => (
+            true,
+            format!("config permits {count} read-only catalog tools (write disabled)"),
+        ),
         Err(error) => (false, error),
     };
     (ok, format!("{}: {detail}; host exposure unverified", path.display()))
+}
+
+fn table_end(records: &[&str], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < records.len() && !toml_value(records[end]).starts_with('[') {
+        end += 1;
+    }
+    end
+}
+
+fn parse_toml_string(val: &str) -> Option<String> {
+    json::parse(val)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .or_else(|| val.strip_prefix('\'')?.strip_suffix('\'').map(str::to_owned))
+}
+
+fn push_section_sep(out: &mut String, nl: &str) {
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(nl);
+    }
 }
 
 pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<String, String> {
@@ -246,6 +306,7 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
         }
         let table = toml_table_name(header)?;
         preamble = false;
+
         let Some(idx) = sections.iter().position(|&s| s == table) else {
             out.push_str(records[i]);
             i += 1;
@@ -255,19 +316,9 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
             return Err(format!("duplicate TOML table {table}"));
         }
         found[idx] = true;
-        let mut end = i + 1;
-        while end < records.len() && !toml_value(records[end]).starts_with('[') {
-            end += 1;
-        }
-        let keys: &[(&str, &str)] = if idx == 0 {
-            &[("hooks", "true")]
-        } else {
-            &managed
-        };
-        let mut present = vec![];
-        let mut old_command = None;
-        let mut old_args = None;
-        let mut body = String::new();
+        let end = table_end(&records, i);
+        let keys: &[(&str, &str)] = if idx == 0 { &[("hooks", "true")] } else { &managed };
+        let (mut present, mut old_command, mut old_args, mut body) = (vec![], None, None, String::new());
         for line in &records[i + 1..end] {
             let value = toml_value(line);
             if value.is_empty() {
@@ -275,17 +326,10 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
                 continue;
             }
             let (key, val) = value.split_once('=').ok_or("invalid TOML assignment")?;
-            let key = key.trim().trim_matches(['"', '\'']);
-            let val = val.trim();
-            if key == "command" {
-                old_command = Some(val);
-            }
-            if key == "args" {
-                old_args = Some(val);
-            }
-            if idx == 1 && key == "cwd" {
-                continue;
-            }
+            let (key, val) = (key.trim().trim_matches(['"', '\'']), val.trim());
+            if key == "command" { old_command = Some(val); }
+            if key == "args" { old_args = Some(val); }
+            if idx == 1 && key == "cwd" { continue; }
             if let Some((key, desired)) = keys.iter().find(|(k, _)| *k == key) {
                 if present.contains(key) {
                     return Err(format!("duplicate TOML key {key}"));
@@ -293,17 +337,11 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
                 present.push(*key);
                 if val == *desired || (idx == 1 && !matches!(*key, "command" | "args")) {
                     body.push_str(line);
+                } else if line.trim_end().contains('\n') {
+                    body.push_str(&format!("{key} = {desired}{nl}"));
                 } else {
-                    if line.trim_end().contains('\n') {
-                        body.push_str(&format!("{key} = {desired}{nl}"));
-                        continue;
-                    }
-                    let pos = line.find('=').unwrap() + 1;
-                    let trailing = line[pos..]
-                        .find(val)
-                        .ok_or("ambiguous TOML value")?
-                        + pos
-                        + val.len();
+                    let pos = line.find('=').ok_or("malformed TOML assignment")? + 1;
+                    let trailing = line[pos..].find(val).ok_or("ambiguous TOML value")? + pos + val.len();
                     body.push_str(&line[..pos]);
                     body.push(' ');
                     body.push_str(desired);
@@ -314,33 +352,18 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
             }
         }
         if idx == 1 {
-            let exe = old_command
-                .and_then(|s| json::parse(s).ok())
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .or_else(|| {
-                    old_command
-                        .and_then(|s| s.strip_prefix('\'')?.strip_suffix('\''))
-                        .map(str::to_owned)
-                })
-                .ok_or("MCP server has no recognized command")?;
-            let exe = executable_name(&exe);
+            let exe = old_command.and_then(parse_toml_string).ok_or("MCP server has no recognized command")?;
             let args = old_args.unwrap_or("");
-            let owned = matches!(exe, "ctx" | "ctx.exe")
-                && (args.contains("\"mcp\"") || args.contains("'mcp'"));
-            if !owned {
+            if !(matches!(executable_name(&exe), "ctx" | "ctx.exe") && (args.contains("\"mcp\"") || args.contains("'mcp'"))) {
                 return Err(format!("unmanaged MCP server in {table}"));
             }
         }
         out.push_str(records[i]);
-        if !out.ends_with('\n') {
-            out.push_str(nl);
-        }
+        if !out.ends_with('\n') { out.push_str(nl); }
         out.push_str(&body);
         for &(key, value) in keys {
             if !present.contains(&key) {
-                if !out.ends_with('\n') {
-                    out.push_str(nl);
-                }
+                if !out.ends_with('\n') { out.push_str(nl); }
                 out.push_str(&format!("{key} = {value}{nl}"));
             }
         }
@@ -348,12 +371,7 @@ pub(super) fn upsert_codex_toml_mcp_and_hooks(raw: &str, bin: &Path) -> Result<S
     }
     for (idx, keys) in [(0usize, &[("hooks", "true")][..]), (1, &managed[..])] {
         if !found[idx] {
-            if !out.is_empty() {
-                if !out.ends_with('\n') {
-                    out.push_str(nl);
-                }
-                out.push_str(nl);
-            }
+            push_section_sep(&mut out, nl);
             out.push_str(&format!("[{}]{nl}", sections[idx]));
             for &(key, val) in keys {
                 out.push_str(&format!("{key} = {val}{nl}"));
@@ -368,43 +386,32 @@ pub(super) fn plan_remove_codex_toml(plan: &mut InstallPlan, path: &Path) -> Res
         return Ok(());
     };
     let records = toml_records(&raw)?;
-    let mut out = String::new();
-    let mut changed = false;
-    let mut i = 0;
+    let mut owned = false;
+    for (idx, rec) in records.iter().enumerate() {
+        let header = toml_value(rec);
+        if header.starts_with('[') && toml_table_name(header)? == "mcp_servers.agent_ctx" {
+            for line in &records[idx + 1..table_end(&records, idx)] {
+                if let Some((k, v)) = toml_value(line).split_once('=') {
+                    if k.trim().trim_matches(['"', '\'']) == "command" {
+                        owned = parse_toml_string(v.trim()).is_some_and(|c| matches!(executable_name(&c), "ctx" | "ctx.exe"));
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if !owned {
+        return Ok(());
+    }
+    let (mut out, mut changed, mut i) = (String::new(), false, 0);
     while i < records.len() {
         let header = toml_value(records[i]);
         if header.starts_with('[') {
             let table = toml_table_name(header)?;
-            if table == "mcp_servers.agent_ctx" {
-                let mut end = i + 1;
-                while end < records.len() && !toml_value(records[end]).starts_with('[') {
-                    end += 1;
-                }
-                let mut owned = false;
-                for rec in &records[i + 1..end] {
-                    let line = toml_value(rec);
-                    if let Some((k, v)) = line.split_once('=') {
-                        if k.trim().trim_matches(['"', '\'']) == "command" {
-                            let val = v.trim();
-                            let cmd = json::parse(val)
-                                .ok()
-                                .and_then(|j| j.as_str().map(str::to_owned))
-                                .or_else(|| {
-                                    val.strip_prefix('\'')
-                                        .and_then(|s| s.strip_suffix('\''))
-                                        .map(str::to_owned)
-                                });
-                            if let Some(cmd) = cmd {
-                                owned = matches!(executable_name(&cmd), "ctx" | "ctx.exe");
-                            }
-                        }
-                    }
-                }
-                if owned {
-                    changed = true;
-                    i = end;
-                    continue;
-                }
+            if table == "mcp_servers.agent_ctx" || table.starts_with("mcp_servers.agent_ctx.") {
+                changed = true;
+                i = table_end(&records, i);
+                continue;
             }
         }
         out.push_str(records[i]);
@@ -433,5 +440,42 @@ mod tests {
         let err = upsert_codex_toml_mcp_and_hooks(foreign, Path::new("/opt/bin/ctx"))
             .expect_err("must reject unmanaged agent_ctx");
         assert!(err.contains("unmanaged MCP server"));
+    }
+
+    #[test]
+    fn codex_toml_auto_approval_preserves_manual_tool_tables_and_mode_check() {
+        let initial = upsert_codex_toml_mcp_and_hooks("", Path::new("/opt/bin/ctx"))
+            .expect("fresh upsert");
+        assert!(initial.contains("default_tools_approval_mode = \"auto\""));
+        assert!(!initial.contains("approval_mode = \"approve\""));
+        assert!(!initial.contains("[mcp_servers.agent_ctx.tools."));
+
+        // Idempotent second upsert produces byte-identical output.
+        let second = upsert_codex_toml_mcp_and_hooks(&initial, Path::new("/opt/bin/ctx"))
+            .expect("idempotent upsert");
+        assert_eq!(initial, second);
+
+        // Manual `[mcp_servers.agent_ctx.tools.ctx_edit]` overrides are preserved verbatim.
+        for mode in ["prompt", "approve"] {
+            let manual_block = format!(
+                "\n[mcp_servers.agent_ctx.tools.ctx_edit]\napproval_mode = \"{mode}\"\n"
+            );
+            let custom = format!("{initial}{manual_block}");
+            let kept = upsert_codex_toml_mcp_and_hooks(&custom, Path::new("/opt/bin/ctx"))
+                .expect("preserve manual tool table");
+            assert_eq!(kept, custom);
+        }
+
+        // Mode-aware check accepts full catalog in both modes, and read-only subset when write=false.
+        let full = vec!["ctx_search".to_string(), "ctx_read".to_string(), "ctx_edit".to_string()];
+        assert_eq!(codex_tool_config_for_mode(&initial, &full, true), Ok((3, false)));
+        assert_eq!(codex_tool_config_for_mode(&initial, &full, false), Ok((3, false)));
+
+        let ro_only = "[mcp_servers.agent_ctx]\ncommand = \"ctx\"\nargs = [\"mcp\"]\ndisabled_tools = [\"ctx_edit\"]\n";
+        assert!(codex_tool_config_for_mode(ro_only, &full, true).is_err());
+        assert_eq!(codex_tool_config_for_mode(ro_only, &full, false), Ok((2, true)));
+
+        let missing_ro = "[mcp_servers.agent_ctx]\ncommand = \"ctx\"\nargs = [\"mcp\"]\ndisabled_tools = [\"ctx_read\"]\n";
+        assert!(codex_tool_config_for_mode(missing_ro, &full, false).is_err());
     }
 }

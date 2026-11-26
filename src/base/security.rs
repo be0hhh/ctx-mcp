@@ -210,7 +210,6 @@ pub fn is_sensitive_path_lexical(p: &Path) -> bool {
         }
     }
 
-    let mut prev_was_cfg = false;
     let mut saw_docs = false;
     let mut in_docs = false;
     let mut last_seg: &[u8] = b"";
@@ -220,14 +219,10 @@ pub fn is_sensitive_path_lexical(p: &Path) -> bool {
             continue;
         }
         if seg == b".." || (seg.len() == 2 && seg[1] == b':' && seg[0].is_ascii_alphabetic()) {
-            prev_was_cfg = false;
             continue;
         }
         if saw_docs {
             in_docs = true;
-        }
-        if prev_was_cfg && seg.eq_ignore_ascii_case(b"private") {
-            return true;
         }
         if (4..=11).contains(&seg.len()) && matches_any_ascii_ci(seg, SENSITIVE_COMPONENTS) {
             return true;
@@ -249,7 +244,6 @@ pub fn is_sensitive_path_lexical(p: &Path) -> bool {
         {
             return true;
         }
-        prev_was_cfg = seg.len() == 3 && seg.eq_ignore_ascii_case(b"cfg");
         if seg.len() == 4 && seg.eq_ignore_ascii_case(b"docs") {
             saw_docs = true;
         }
@@ -352,24 +346,46 @@ pub fn is_sensitive_path_lexical(p: &Path) -> bool {
     false
 }
 
-pub fn is_sensitive_path(raw_path: &Path) -> bool {
-    if is_sensitive_path_lexical(raw_path) {
+pub fn has_git_component(path: &Path) -> bool {
+    let raw = path.as_os_str().as_encoded_bytes();
+    raw.split(|&b| b == b'/' || b == b'\\')
+        .any(|seg| seg.len() == 4 && seg.eq_ignore_ascii_case(b".git"))
+}
+
+pub fn is_sensitive_path_with_ws(raw_path: &Path, ws_root: Option<&Path>, for_write: bool) -> bool {
+    if for_write && has_git_component(raw_path) {
+        return true;
+    }
+    if is_sensitive_path_lexical(raw_path)
+        || crate::base::ext::policy().is_extra_sensitive_path(raw_path, ws_root, for_write)
+    {
         return true;
     }
     if let Ok(canon) = fs::canonicalize(raw_path) {
-        if is_sensitive_path_lexical(&canon) {
+        if (for_write && has_git_component(&canon))
+            || is_sensitive_path_lexical(&canon)
+            || crate::base::ext::policy().is_extra_sensitive_path(&canon, ws_root, for_write)
+        {
             return true;
         }
     }
     false
 }
 
+pub fn is_sensitive_path(raw_path: &Path) -> bool {
+    is_sensitive_path_with_ws(raw_path, None, false)
+}
+
 fn canonical_file_path(raw_path: &Path) -> Result<PathBuf, String> {
-    if is_sensitive_path_lexical(raw_path) {
+    if is_sensitive_path_lexical(raw_path)
+        || crate::base::ext::policy().is_extra_sensitive_path(raw_path, None, false)
+    {
         return Err("REFUSED: sensitive path".to_string());
     }
     let canon = fs::canonicalize(raw_path).map_err(|e| e.to_string())?;
-    if is_sensitive_path_lexical(&canon) {
+    if is_sensitive_path_lexical(&canon)
+        || crate::base::ext::policy().is_extra_sensitive_path(&canon, None, false)
+    {
         return Err("REFUSED: sensitive target path".to_string());
     }
     Ok(canon)
@@ -378,6 +394,9 @@ fn canonical_file_path(raw_path: &Path) -> Result<PathBuf, String> {
 pub fn admit_file_in_workspace(raw_path: &Path, ws_root: &Path) -> Result<PathBuf, String> {
     let canon = canonical_file_path(raw_path)?;
     require_file_in_workspace(&canon, ws_root)?;
+    if crate::base::ext::policy().is_extra_sensitive_path(&canon, Some(ws_root), false) {
+        return Err("REFUSED: sensitive workspace path".to_string());
+    }
     Ok(canon)
 }
 
@@ -541,12 +560,100 @@ impl WorkspaceAllowlist {
         if let Some(c) = cwd {
             let active_ws = self.resolve_request_workspace(c)?;
             require_file_in_workspace(&canon, &active_ws)?;
+            if crate::base::ext::policy().is_extra_sensitive_path(&canon, Some(&active_ws), false) {
+                return Err("REFUSED: sensitive workspace path".to_string());
+            }
             return Ok((canon, active_ws));
         }
         if let Some(ws_root) = self.longest_matching_root(&canon)? {
+            if crate::base::ext::policy().is_extra_sensitive_path(&canon, Some(&ws_root), false) {
+                return Err("REFUSED: sensitive workspace path".to_string());
+            }
             return Ok((canon, ws_root));
         }
         Err("REFUSED: path escapes workspace allowlist".to_string())
+    }
+
+    /// Strict pre-canonicalize write guard: rejects symlinks (on target or any ancestor inside
+    /// `ws_root`), non-regular files, `.git/**` components, universal sensitive paths, and
+    /// compile-time `ProjectPolicy` write-sensitive paths before canonicalizing.
+    pub fn admit_writable_file(
+        &self,
+        raw_path: &Path,
+        cwd: Option<&Path>,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        if has_git_component(raw_path) {
+            return Err("REFUSED: writing inside .git is forbidden".to_string());
+        }
+        if is_sensitive_path_lexical(raw_path) {
+            return Err("REFUSED: sensitive path".to_string());
+        }
+        let target_meta = fs::symlink_metadata(raw_path)
+            .map_err(|e| format!("cannot stat writable target {}: {}", raw_path.display(), e))?;
+        if target_meta.file_type().is_symlink() {
+            return Err(format!(
+                "REFUSED: target is a symlink: {}",
+                raw_path.display()
+            ));
+        }
+        if !target_meta.file_type().is_file() {
+            return Err(format!(
+                "REFUSED: target is not a regular file: {}",
+                raw_path.display()
+            ));
+        }
+        if target_meta.len() > 1_048_576 {
+            return Err(format!(
+                "REFUSED: target exceeds 1 MiB write limit ({} bytes): {}",
+                target_meta.len(),
+                raw_path.display()
+            ));
+        }
+
+        let active_ws = if let Some(c) = cwd {
+            self.resolve_request_workspace(c)?
+        } else {
+            let parent = raw_path
+                .parent()
+                .ok_or_else(|| "REFUSED: target has no parent directory".to_string())?;
+            let canon_parent = fs::canonicalize(parent).map_err(|e| e.to_string())?;
+            self.longest_matching_root(&canon_parent)?
+                .ok_or_else(|| "REFUSED: path escapes workspace allowlist".to_string())?
+        };
+
+        // Walk ancestors between `raw_path` and `active_ws` BEFORE canonicalizing to catch symlinked dirs.
+        let mut cursor = raw_path.parent();
+        while let Some(dir) = cursor {
+            if let Ok(canon_dir) = fs::canonicalize(dir) {
+                if canon_dir == active_ws {
+                    break;
+                }
+                if !canon_dir.starts_with(&active_ws) {
+                    break;
+                }
+            }
+            if let Ok(meta) = fs::symlink_metadata(dir) {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "REFUSED: symlink ancestor in write path: {}",
+                        dir.display()
+                    ));
+                }
+            }
+            cursor = dir.parent();
+        }
+
+        let canon = fs::canonicalize(raw_path).map_err(|e| e.to_string())?;
+        require_file_in_workspace(&canon, &active_ws)?;
+        if has_git_component(&canon) {
+            return Err("REFUSED: writing inside .git is forbidden".to_string());
+        }
+        if is_sensitive_path_lexical(&canon)
+            || crate::base::ext::policy().is_extra_sensitive_path(&canon, Some(&active_ws), true)
+        {
+            return Err("REFUSED: sensitive write path".to_string());
+        }
+        Ok((canon, active_ws))
     }
 
     pub fn admit_dir(&self, raw_dir: &Path, cwd: Option<&Path>) -> Result<(PathBuf, PathBuf), String> {
@@ -581,8 +688,10 @@ mod tests {
         assert!(is_sensitive_path_lexical(Path::new("/proc/self/environ")));
         assert!(is_sensitive_path_lexical(Path::new("/SYS/devices")));
         assert!(is_sensitive_path_lexical(Path::new("/dev")));
-        assert!(is_sensitive_path_lexical(Path::new("/repo/cfg/private/keys.toml")));
-        assert!(is_sensitive_path_lexical(Path::new("repo\\CFG\\Private\\keys.toml")));
+        assert!(has_git_component(Path::new("/repo/.git/hooks/pre-commit")));
+        assert!(has_git_component(Path::new("repo\\.GIT\\config")));
+        // Project-specific cfg/private is no longer hardcoded in universal ctx.
+        assert!(!is_sensitive_path_lexical(Path::new("/repo/cfg/private/keys.toml")));
 
         // Blocked components and extensions.
         assert!(is_sensitive_path_lexical(Path::new("/home/u/.ssh/config")));

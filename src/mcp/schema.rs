@@ -1,11 +1,11 @@
 //! MCP tool and resource JSON schemas advertised by `tools/list` and `resources/list`.
 
-use super::MEMO_ACTIONS;
+use super::{is_write_tool, MEMO_ACTIONS};
 use crate::base::json::Json;
 use crate::engine::SEARCH_RESPONSE_BYTES;
 use std::borrow::Cow;
 
-pub(super) fn tool_schemas() -> Json {
+pub(super) fn tool_schemas(write_enabled: bool) -> Json {
     let str_array = Json::obj(vec![
         ("type", Json::Str("array".to_string())),
         (
@@ -13,8 +13,10 @@ pub(super) fn tool_schemas() -> Json {
             Json::obj(vec![("type", Json::Str("string".to_string()))]),
         ),
     ]);
-
     let string = || Json::obj(vec![("type", Json::Str("string".into()))]);
+    let int_t = || Json::obj(vec![("type", Json::Str("integer".into()))]);
+    let bool_t = || Json::obj(vec![("type", Json::Str("boolean".into()))]);
+
     let mut tools = vec![
         Json::obj(vec![
             ("name", Json::Str("ctx_capsule".into())),
@@ -33,6 +35,7 @@ pub(super) fn tool_schemas() -> Json {
                             ("assignment", string()),
                             ("workspace", string()),
                             ("key", string()),
+                            ("pack_refs", str_array.clone()),
                         ]),
                     ),
                     ("required", Json::Arr(vec![Json::Str("action".into())])),
@@ -40,195 +43,142 @@ pub(super) fn tool_schemas() -> Json {
             ),
         ]),
         Json::obj(vec![
-            ("name", Json::Str("ctx_read".to_string())),
+            ("name", Json::Str("ctx_read".into())),
             (
                 "description",
                 Json::Str(
-                    "Batch-read full files (<=1 MiB, no 800L cap) or `path:start-end` slices from RAM."
-                        .to_string(),
+                    "Read files/slices (`path:s-e`) from RAM (auto-delta on small session edits). `hashes=true` adds `ln:h3|` anchors."
+                        .into(),
                 ),
             ),
             (
                 "inputSchema",
                 Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
+                    ("type", Json::Str("object".into())),
                     (
                         "properties",
                         Json::obj(vec![
                             ("paths", str_array.clone()),
-                            (
-                                "max_bytes",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                            (
-                                "force",
-                                Json::obj(vec![("type", Json::Str("boolean".to_string()))]),
-                            ),
+                            ("max_bytes", int_t()),
+                            ("force", bool_t()),
+                            ("hashes", bool_t()),
                         ]),
                     ),
-                    ("required", Json::Arr(vec![Json::Str("paths".to_string())])),
+                    ("required", Json::Arr(vec![Json::Str("paths".into())])),
                 ]),
             ),
         ]),
         Json::obj(vec![
-            ("name", Json::Str("ctx_inspect".to_string())),
+            ("name", Json::Str("ctx_inspect".into())),
+            (
+                "description",
+                Json::Str("Triage dirs/files (<=80): lines, flags, includes, symbols.".into()),
+            ),
+            (
+                "inputSchema",
+                Json::obj(vec![
+                    ("type", Json::Str("object".into())),
+                    (
+                        "properties",
+                        Json::obj(vec![
+                            ("paths", str_array.clone()),
+                            ("max_files", int_t()),
+                            ("max_bytes", int_t()),
+                            ("warn_lines", int_t()),
+                        ]),
+                    ),
+                    ("required", Json::Arr(vec![Json::Str("paths".into())])),
+                ]),
+            ),
+        ]),
+        Json::obj(vec![
+            ("name", Json::Str("ctx_outline".into())),
+            (
+                "description",
+                Json::Str("Return structural [L_start-L_end] symbol outlines from RAM.".into()),
+            ),
+            (
+                "inputSchema",
+                Json::obj(vec![
+                    ("type", Json::Str("object".into())),
+                    (
+                        "properties",
+                        Json::obj(vec![
+                            ("paths", str_array.clone()),
+                            ("max_files", int_t()),
+                            ("max_bytes", int_t()),
+                        ]),
+                    ),
+                    ("required", Json::Arr(vec![Json::Str("paths".into())])),
+                ]),
+            ),
+        ]),
+        Json::obj(vec![
+            ("name", Json::Str("ctx_symbols".into())),
             (
                 "description",
                 Json::Str(
-                    "Batch-inspect directories/files (<=80 default): lines, >=600L/>800L flags, ns, #include, [L_start-L_end] symbols."
-                        .to_string(),
+                    "Symbol/section bodies (`Mod#Sym`, `doc.md#Heading`, `cfg.json#a.b`). `compact=true` <=24L, `hashes=true` for anchors, `raw=true` disables doc compaction."
+                        .into(),
                 ),
             ),
             (
                 "inputSchema",
                 Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
-                    (
-                        "properties",
-                        Json::obj(vec![
-                            ("paths", str_array.clone()),
-                            (
-                                "max_files",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                            (
-                                "max_bytes",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                            (
-                                "warn_lines",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                        ]),
-                    ),
-                    ("required", Json::Arr(vec![Json::Str("paths".to_string())])),
-                ]),
-            ),
-        ]),
-        Json::obj(vec![
-            ("name", Json::Str("ctx_outline".to_string())),
-            (
-                "description",
-                Json::Str("Return structural [L_start-L_end] symbol outlines from RAM.".to_string()),
-            ),
-            (
-                "inputSchema",
-                Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
-                    (
-                        "properties",
-                        Json::obj(vec![
-                            ("paths", str_array.clone()),
-                            (
-                                "max_files",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                            (
-                                "max_bytes",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
-                        ]),
-                    ),
-                    ("required", Json::Arr(vec![Json::Str("paths".to_string())])),
-                ]),
-            ),
-        ]),
-        Json::obj(vec![
-            ("name", Json::Str("ctx_symbols".to_string())),
-            (
-                "description",
-                Json::Str(
-                    "Batch symbol bodies (`path#Symbol`; shorthand filenames supported). Set compact=true for <=24L + continuation."
-                        .to_string(),
-                ),
-            ),
-            (
-                "inputSchema",
-                Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
+                    ("type", Json::Str("object".into())),
                     (
                         "properties",
                         Json::obj(vec![
                             ("requests", str_array.clone()),
-                            (
-                                "compact",
-                                Json::obj(vec![("type", Json::Str("boolean".to_string()))]),
-                            ),
-                            (
-                                "max_bytes",
-                                Json::obj(vec![("type", Json::Str("integer".to_string()))]),
-                            ),
+                            ("compact", bool_t()),
+                            ("hashes", bool_t()),
+                            ("raw", bool_t()),
+                            ("max_bytes", int_t()),
                         ]),
                     ),
-                    (
-                        "required",
-                        Json::Arr(vec![Json::Str("requests".to_string())]),
-                    ),
+                    ("required", Json::Arr(vec![Json::Str("requests".into())])),
                 ]),
             ),
         ]),
         Json::obj(vec![
-            ("name", Json::Str("ctx_search".to_string())),
+            ("name", Json::Str("ctx_search".into())),
             (
                 "description",
                 Json::Str(
-                    "Search source. Batch 1-4 `root:pattern` strings in q, e.g. `graph:scan_manifests`. \
-                     Use a known file, directory, or module stem as each root. Use lowercase patterns for smart-case. \
-                     Use `query` for an unscoped lookup. Answer from sufficient hits."
-                        .to_string(),
+                    "Ranked search: 1-6 `Mod:pat` in `q` (smart-case, auto +-1 context on <=6 hits, `code_only=true` skips comments/strings)."
+                        .into(),
                 ),
             ),
             (
                 "inputSchema",
                 Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
+                    ("type", Json::Str("object".into())),
                     (
                         "properties",
                         Json::obj(vec![
                             ("q", str_array.clone()),
-                            (
-                                "query",
-                                Json::obj(vec![("type", Json::Str("string".to_string()))]),
-                            ),
+                            ("query", string()),
                             ("roots", str_array.clone()),
-                            (
-                                "max_results",
-                                Json::obj(vec![
-                                    ("type", Json::Str("integer".to_string())),
-                                    ("description", Json::Str("Per-query hit limit.".to_string())),
-                                ]),
-                            ),
-                            (
-                                "context_lines",
-                                Json::obj(vec![
-                                    ("type", Json::Str("integer".to_string())),
-                                    (
-                                        "description",
-                                        Json::Str("Adjacent lines when needed. Default 0.".to_string()),
-                                    ),
-                                ]),
-                            ),
+                            ("max_results", int_t()),
+                            ("context_lines", int_t()),
+                            ("code_only", bool_t()),
                             (
                                 "max_bytes",
                                 Json::obj(vec![
-                                    ("type", Json::Str("integer".to_string())),
+                                    ("type", Json::Str("integer".into())),
                                     ("minimum", Json::Int(1)),
                                     ("maximum", Json::Int(SEARCH_RESPONSE_BYTES as i64)),
-                                    (
-                                        "description",
-                                        Json::Str("Total UTF-8 text budget. Default 8192.".to_string()),
-                                    ),
                                 ]),
                             ),
                             (
                                 "detail",
                                 Json::obj(vec![
-                                    ("type", Json::Str("string".to_string())),
+                                    ("type", Json::Str("string".into())),
                                     (
                                         "enum",
                                         Json::Arr(vec![
-                                            Json::Str("compact".to_string()),
-                                            Json::Str("scopes".to_string()),
+                                            Json::Str("compact".into()),
+                                            Json::Str("scopes".into()),
                                         ]),
                                     ),
                                 ]),
@@ -239,18 +189,231 @@ pub(super) fn tool_schemas() -> Json {
             ),
         ]),
         Json::obj(vec![
-            ("name", Json::Str("ctx_memo".to_string())),
+            ("name", Json::Str("ctx_impact".into())),
             (
                 "description",
                 Json::Str(
-                    "Shared in-RAM workspace memo board (`put` | `get` | `list`) for frozen path maps, invariant notes, and cross-agent findings, automatically tagged `[STALE]` if linked files change."
-                        .to_string(),
+                    "First call before editing: 1-6 `Mod#Sym`, `path:line`, or small `path` targets -> hash-anchored bodies, git status, callers & tests in 1 call."
+                        .into(),
                 ),
             ),
             (
                 "inputSchema",
                 Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
+                    ("type", Json::Str("object".into())),
+                    (
+                        "properties",
+                        Json::obj(vec![
+                            ("targets", str_array.clone()),
+                            ("target", string()),
+                            ("max_callers", int_t()),
+                            ("include_tests", bool_t()),
+                            ("include_git_status", bool_t()),
+                            ("max_bytes", int_t()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
+        Json::obj(vec![
+            ("name", Json::Str("ctx_edit".into())),
+            (
+                "description",
+                Json::Str(
+                    "Atomic multi-file `edits`, `creates` (new files/scripts with `executable`), and/or scoped `renames` + optional `verify_absent`. Returns diff & fresh hashes."
+                        .into(),
+                ),
+            ),
+            (
+                "inputSchema",
+                Json::obj(vec![
+                    ("type", Json::Str("object".into())),
+                    (
+                        "properties",
+                        Json::obj(vec![
+                            (
+                                "edits",
+                                Json::obj(vec![
+                                    ("type", Json::Str("array".into())),
+                                    (
+                                        "items",
+                                        Json::obj(vec![
+                                            ("type", Json::Str("object".into())),
+                                            (
+                                                "properties",
+                                                Json::obj(vec![
+                                                    ("path", string()),
+                                                    (
+                                                        "ops",
+                                                        Json::obj(vec![
+                                                            ("type", Json::Str("array".into())),
+                                                            (
+                                                                "items",
+                                                                Json::obj(vec![
+                                                                    ("type", Json::Str("object".into())),
+                                                                    (
+                                                                        "properties",
+                                                                        Json::obj(vec![
+                                                                            (
+                                                                                "op",
+                                                                                Json::obj(vec![
+                                                                                    ("type", Json::Str("string".into())),
+                                                                                    (
+                                                                                        "enum",
+                                                                                        Json::Arr(vec![
+                                                                                            Json::Str("replace_lines".into()),
+                                                                                            Json::Str("insert_after".into()),
+                                                                                        ]),
+                                                                                    ),
+                                                                                ]),
+                                                                            ),
+                                                                            ("start", string()),
+                                                                            ("end", string()),
+                                                                            ("anchor", string()),
+                                                                            ("content", string()),
+                                                                        ]),
+                                                                    ),
+                                                                    (
+                                                                        "required",
+                                                                        Json::Arr(vec![Json::Str("op".into())]),
+                                                                    ),
+                                                                ]),
+                                                            ),
+                                                        ]),
+                                                    ),
+                                                ]),
+                                            ),
+                                            (
+                                                "required",
+                                                Json::Arr(vec![
+                                                    Json::Str("path".into()),
+                                                    Json::Str("ops".into()),
+                                                ]),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "renames",
+                                Json::obj(vec![
+                                    ("type", Json::Str("array".into())),
+                                    (
+                                        "items",
+                                        Json::obj(vec![
+                                            ("type", Json::Str("object".into())),
+                                            (
+                                                "properties",
+                                                Json::obj(vec![
+                                                    ("old_name", string()),
+                                                    ("new_name", string()),
+                                                    ("paths", str_array.clone()),
+                                                    ("roots", str_array.clone()),
+                                                ]),
+                                            ),
+                                            (
+                                                "required",
+                                                Json::Arr(vec![
+                                                    Json::Str("old_name".into()),
+                                                    Json::Str("new_name".into()),
+                                                ]),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                            (
+                                "creates",
+                                Json::obj(vec![
+                                    ("type", Json::Str("array".into())),
+                                    (
+                                        "items",
+                                        Json::obj(vec![
+                                            ("type", Json::Str("object".into())),
+                                            (
+                                                "properties",
+                                                Json::obj(vec![
+                                                    ("path", string()),
+                                                    ("content", string()),
+                                                    ("executable", bool_t()),
+                                                    ("overwrite", bool_t()),
+                                                ]),
+                                            ),
+                                            (
+                                                "required",
+                                                Json::Arr(vec![
+                                                    Json::Str("path".into()),
+                                                    Json::Str("content".into()),
+                                                ]),
+                                            ),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                            ("verify_absent", str_array.clone()),
+                            ("dry_run", bool_t()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
+        Json::obj(vec![
+            ("name", Json::Str("ctx_git".into())),
+            (
+                "description",
+                Json::Str(
+                    "Read-only compact Git inspector (`diff` symbol-aware with hash anchors, `status`, `log`, `show`). Never mutates Git state."
+                        .into(),
+                ),
+            ),
+            (
+                "inputSchema",
+                Json::obj(vec![
+                    ("type", Json::Str("object".into())),
+                    (
+                        "properties",
+                        Json::obj(vec![
+                            (
+                                "action",
+                                Json::obj(vec![
+                                    ("type", Json::Str("string".into())),
+                                    (
+                                        "enum",
+                                        Json::Arr(vec![
+                                            Json::Str("diff".into()),
+                                            Json::Str("status".into()),
+                                            Json::Str("log".into()),
+                                            Json::Str("show".into()),
+                                        ]),
+                                    ),
+                                ]),
+                            ),
+                            ("rev", string()),
+                            ("staged", bool_t()),
+                            ("stat", bool_t()),
+                            ("paths", str_array.clone()),
+                            ("symbol", string()),
+                            ("limit", int_t()),
+                            ("hashes", bool_t()),
+                            ("max_bytes", int_t()),
+                        ]),
+                    ),
+                ]),
+            ),
+        ]),
+        Json::obj(vec![
+            ("name", Json::Str("ctx_memo".into())),
+            (
+                "description",
+                Json::Str(
+                    "Shared in-RAM memo, change-feed & Shared Context Packs (`put`|`get`|`list`|`changes`|`pack`|`pack_get`|`packs`), auto-deduped per session."
+                        .into(),
+                ),
+            ),
+            (
+                "inputSchema",
+                Json::obj(vec![
+                    ("type", Json::Str("object".into())),
                     (
                         "properties",
                         Json::obj(vec![
@@ -269,77 +432,87 @@ pub(super) fn tool_schemas() -> Json {
                                     ),
                                 ]),
                             ),
-                            (
-                                "topic",
-                                Json::obj(vec![("type", Json::Str("string".to_string()))]),
-                            ),
-                            (
-                                "summary",
-                                Json::obj(vec![("type", Json::Str("string".to_string()))]),
-                            ),
+                            ("topic", string()),
+                            ("summary", string()),
                             ("kind", string()),
+                            ("since_seq", int_t()),
+                            ("force", bool_t()),
+                            ("raw", bool_t()),
+                            ("max_bytes", int_t()),
                             ("paths", str_array),
                         ]),
                     ),
-                    ("required", Json::Arr(vec![Json::Str("action".to_string())])),
+                    ("required", Json::Arr(vec![Json::Str("action".into())])),
                 ]),
             ),
         ]),
         Json::obj(vec![
-            ("name", Json::Str("ctx_elf_audit".to_string())),
+            ("name", Json::Str("ctx_elf_audit".into())),
             (
                 "description",
                 Json::Str(
-                    "Read-only static ELF64 section/symbol and optional ASM audit for a compiled binary artifact."
-                        .to_string(),
+                    "Read-only static ELF64 section/symbol, optional ASM audit, and optional baseline before/after diff."
+                        .into(),
                 ),
             ),
             (
                 "inputSchema",
                 Json::obj(vec![
-                    ("type", Json::Str("object".to_string())),
+                    ("type", Json::Str("object".into())),
                     (
                         "properties",
                         Json::obj(vec![
-                            (
-                                "elf_path",
-                                Json::obj(vec![("type", Json::Str("string".to_string()))]),
-                            ),
-                            (
-                                "asm_path",
-                                Json::obj(vec![("type", Json::Str("string".to_string()))]),
-                            ),
+                            ("elf_path", string()),
+                            ("asm_path", string()),
+                            ("baseline_elf_path", string()),
+                            ("baseline_asm_path", string()),
                         ]),
                     ),
-                    (
-                        "required",
-                        Json::Arr(vec![Json::Str("elf_path".to_string())]),
-                    ),
+                    ("required", Json::Arr(vec![Json::Str("elf_path".into())])),
                 ]),
             ),
         ]),
     ];
+
+    if !write_enabled {
+        tools.retain(|tool| {
+            tool.get_str("name")
+                .map_or(true, |name| !is_write_tool(name))
+        });
+    }
+
     for tool in &mut tools {
         if let Json::Obj(fields) = tool {
-            let read_only = fields.iter().any(|(key, value)| {
-                key.as_ref() == "name"
-                    && matches!(
-                        value.as_str(),
-                        Some(
-                            "ctx_inspect"
-                                | "ctx_read"
-                                | "ctx_outline"
-                                | "ctx_symbols"
-                                | "ctx_search"
-                        )
-                    )
-            });
-            if read_only {
+            let name = fields
+                .iter()
+                .find(|(k, _)| k.as_ref() == "name")
+                .and_then(|(_, v)| v.as_str())
+                .unwrap_or("");
+            if matches!(
+                name,
+                "ctx_inspect"
+                    | "ctx_read"
+                    | "ctx_outline"
+                    | "ctx_symbols"
+                    | "ctx_search"
+                    | "ctx_impact"
+                    | "ctx_git"
+                    | "ctx_elf_audit"
+            ) {
                 fields.push((
                     Cow::Borrowed("annotations"),
                     Json::obj(vec![
                         ("readOnlyHint", Json::Bool(true)),
                         ("destructiveHint", Json::Bool(false)),
+                        ("openWorldHint", Json::Bool(false)),
+                    ]),
+                ));
+            } else if is_write_tool(name) {
+                fields.push((
+                    Cow::Borrowed("annotations"),
+                    Json::obj(vec![
+                        ("readOnlyHint", Json::Bool(false)),
+                        ("destructiveHint", Json::Bool(true)),
                         ("openWorldHint", Json::Bool(false)),
                     ]),
                 ));
@@ -363,28 +536,28 @@ pub(super) fn tool_schemas() -> Json {
 pub(super) fn resource_schemas() -> Json {
     Json::Arr(vec![
         Json::obj(vec![
-            ("uri", Json::Str("ctx://status".to_string())),
-            ("name", Json::Str("RAM Context Broker Status".to_string())),
+            ("uri", Json::Str("ctx://status".into())),
+            ("name", Json::Str("RAM Context Broker Status".into())),
             (
                 "description",
                 Json::Str(
-                    "Live in-RAM cache, shard, session, and snapshot telemetry for agent_ctx."
-                        .to_string(),
+                    "Live in-RAM cache, write mode, build flavor, and update status for agent_ctx."
+                        .into(),
                 ),
             ),
-            ("mimeType", Json::Str("application/json".to_string())),
+            ("mimeType", Json::Str("application/json".into())),
         ]),
         Json::obj(vec![
-            ("uri", Json::Str("ctx://memos".to_string())),
-            ("name", Json::Str("Workspace Findings Board".to_string())),
+            ("uri", Json::Str("ctx://memos".into())),
+            ("name", Json::Str("Workspace Findings Board".into())),
             (
                 "description",
                 Json::Str(
                     "Shared workspace invariants and findings with automatic [STALE] content-hash tracking."
-                        .to_string(),
+                        .into(),
                 ),
             ),
-            ("mimeType", Json::Str("text/markdown".to_string())),
+            ("mimeType", Json::Str("text/markdown".into())),
         ]),
     ])
 }

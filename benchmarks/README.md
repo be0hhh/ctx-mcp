@@ -1,9 +1,10 @@
-# CTX Benchmarks
+# CTX Benchmarks (`v2.5.0`)
 
-Headline savings and full-session Native vs CTX totals are in the
-[main README](../README.md#savings-at-a-glance-native-vs-ctx-v240).
+Headline positioning and full-session Native vs CTX totals are in the
+[main README](../README.md#verified-benchmarks-v250-native-vs-ctx).
+Every row below is from verified `v2.5.0` runs (`131/131` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv` across `449` Fat-LTO functions, `0` failed edits).
 
-## Cold (Turn 1) vs Warm (Turn 2) Breakdown (`v2.4.0`)
+## 1. Cold (Turn 1) vs Warm (Turn 2) Navigation (`30/30` exact `file:line`)
 
 Two-turn real-session navigation on an isolated 850-file tracked snapshot:
 - **Cold (Turn 1):** 4-anchor cross-module task on a fresh conversation and fresh cold `ctx daemon` (0 cached files).
@@ -11,109 +12,161 @@ Two-turn real-session navigation on an isolated 850-file tracked snapshot:
 
 ### Antigravity (`agy --sandbox --mode plan`, 4 core eager tools)
 
-| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached (Δ vs Native) | LLM cache hit | CTX RAM cache hit | Tool calls | MCP ms |
+| Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached (Δ vs Native) | CTX RAM hit | Tool calls | MCP ms | RSS |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| **Neon High** | Cold | Native | 39.9 s | 98,444 | 39,081 | 60.3% | — | 7 | — |
-| **Neon High** | Cold | **CTX** | 51.3 s (+28.6%) | **84,236 (−14.4%)** | **25,076 (−35.8%)** | **70.2%** | 78.6% (22/28) | **5** | 33.5 |
-| **Neon High** | Warm | Native | 41.7 s | 149,529 | 27,222 | 81.8% | — | 3 | — |
-| **Neon High** | Warm | **CTX** | **13.4 s (−67.9%)** | **46,413 (−69.0%)** | **6,525 (−76.0%)** | **85.9%** | 62.7% (37/59) | **1** | **8.5** |
-| **Neon XHigh** | Cold | Native | 132.6 s | 154,780 | 46,879 | 69.7% | — | 9 | — |
-| **Neon XHigh** | Cold | **CTX** | **103.2 s (−22.2%)** | **75,673 (−51.1%)** | **23,498 (−49.9%)** | 68.9% | 72.7% (16/22) | **3** | **21.3** |
-| **Neon XHigh** | Warm | Native | 31.1 s | 259,089 | 31,048 | 88.0% | — | 5 | — |
-| **Neon XHigh** | Warm | **CTX** | 57.4 s (+84.9%) | **56,480 (−78.2%)** | **7,072 (−77.2%)** | 87.5% | 74.1% (63/85) | **1** | **8.5** |
-| **Carbon High** | Cold | Native | 158.5 s | 111,026 | 43,095 | 61.2% | — | 8 | — |
-| **Carbon High** | Cold | **CTX** | 225.5 s (+42.2%) | 127,969 (+15.3%) | **33,827 (−21.5%)** | **73.6%** | 84.2% (32/38) | **5** | **31.3** |
-| **Carbon High** | Warm | Native | 107.6 s | 244,993 | 74,807 | 69.5% | — | 5 | — |
-| **Carbon High** | Warm | **CTX** | **26.9 s (−75.0%)** | **80,349 (−67.2%)** | **10,388 (−86.1%)** | **87.1%** | 62.7% (37/59) | **1** | **8.3** |
+| **Neon High** | Cold | Native | 55.1 s | 60,789 | 31,137 | — | 6 | — | — |
+| **Neon High** | Cold | **CTX** | **49.7 s (−9.9%)** | **31,262 (−48.6%)** | **16,685 (−46.4%)** | 71.4% (15/21) | **1** | **9.2** | 6.4 MiB |
+| **Neon High** | Warm | Native | 18.9 s | 112,704 | 8,758 | — | 3 | — | — |
+| **Neon High** | Warm | **CTX** | 25.2 s (+33.6%) | **71,120 (−36.9%)** | 10,798 (+23.3%) | 82.7% (105/127) | **2** | **11.5** | 6.9 MiB |
+| **Neon XHigh** | Cold | Native | 124.6 s | 114,986 | 48,491 | — | 8 | — | — |
+| **Neon XHigh** | Cold | **CTX** | **105.3 s (−15.5%)** | **54,460 (−52.6%)** | **14,848 (−69.4%)** | 84.6% (33/39) | **3** | **16.5** | 6.8 MiB |
+| **Neon XHigh** | Warm | Native | 24.3 s | 183,174 | 27,033 | — | 3 | — | — |
+| **Neon XHigh** | Warm | **CTX** | 48.5 s (+99.5%) | **104,884 (−42.7%)** | **15,963 (−40.9%)** | 87.1% (148/170) | 3 | **25.6** | 7.4 MiB |
+| **Carbon High** | Cold | Native | 188.7 s | 109,660 | 52,526 | — | 8 | — | — |
+| **Carbon High** | Cold | **CTX** | 326.8 s (+73.2%) | **55,035 (−49.8%)** | **22,347 (−57.5%)** | 78.6% (22/28) | **3** | **16.8** | 6.9 MiB |
+| **Carbon High** | Warm | Native | 27.5 s | 215,380 | 24,264 | — | 4 | — | — |
+| **Carbon High** | Warm | **CTX** | 102.5 s (+272.7%) | **140,657 (−34.7%)** | 50,969 (+110.1%) | 84.3% (118/140) | **2** | **17.9** | 7.7 MiB |
 
-### Codex (`codex-cli 0.172.0`, `exec` → `exec resume`, direct MCP)
+### Codex (`codex-cli`, `exec` → `exec resume`, direct MCP)
 
 | Model | Phase | Route | Wall time | Input (Δ vs Native) | Uncached | Output | Tool calls | Tool bytes | CTX RAM hit | MCP ms |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Astra XHigh** | Cold | Native | 27.6 s | 81,451 | 8,747 | 477 | 5 | 20,723 B | — | — |
-| **Astra XHigh** | Cold | **CTX** | **18.7 s (−32.2%)** | **76,332 (−6.3%)** | 11,180 | **321** | **3** | **2,833 B** | 77.8% (21/27) | **18.8** |
-| **Astra XHigh** | Warm | Native | 18.0 s | 151,710 | 10,142 | 782 | 4 | 3,259 B | — | — |
-| **Astra XHigh** | Warm | **CTX** | **13.4 s (−25.3%)** | **136,489 (−10.0%)** | 11,945 | **495** | **2** | **1,396 B** | 65.1% (41/63) | **15.5** |
-| **Astra Max** | Cold | Native | 36.4 s | 65,088 | 14,400 | 1,377 | 4 | 44,643 B | — | — |
-| **Astra Max** | Cold | **CTX** | **31.8 s (−12.7%)** | 76,798 (+18.0%) | **12,286** | **1,090** | **3** | **2,307 B** | 70.0% (14/20) | **17.8** |
-| **Astra Max** | Warm | Native | 25.9 s | 155,723 | 16,075 | 2,012 | 4 | 4,150 B | — | — |
-| **Astra Max** | Warm | **CTX** | **22.1 s (−14.5%)** | **138,827 (−10.9%)** | **12,875** | **1,660** | **2** | **1,001 B** | 40.5% (15/37) | **22.3** |
+| **Astra XHigh** | Cold | Native | 13.2 s | 42,868 | 11,252 | 476 | 1 | 25,384 B | — | — |
+| **Astra XHigh** | Cold | **CTX** | 19.0 s (+44.1%) | 58,038 (+35.4%) | 11,574 | 540 | 2 | **2,976 B (−88.3%)** | 82.4% (28/34) | **14.5** |
+| **Astra XHigh** | Warm | Native | 14.8 s | 121,227 | 13,707 | 268 | 3 | 8,109 B | — | — |
+| **Astra XHigh** | Warm | **CTX** | 19.0 s (+28.8%) | **119,250 (−1.6%)** | **12,754** | 384 | **2** | **1,617 B (−80.1%)** | 77.5% (31/40) | **16.6** |
+| **Astra Max** | Cold | Native | 27.5 s | 61,196 | 15,116 | 1,197 | 4 | 38,849 B | — | — |
+| **Astra Max** | Cold | **CTX** | **24.7 s (−10.3%)** | 77,822 (+27.2%) | **11,646** | **1,054** | **3** | **3,299 B (−91.5%)** | 82.4% (28/34) | **11.1** |
+| **Astra Max** | Warm | Native | 29.4 s | 166,762 | 17,130 | 1,474 | 6 | 5,451 B | — | — |
+| **Astra Max** | Warm | **CTX** | **16.6 s (−43.4%)** | **140,371 (−15.8%)** | **13,139** | **798** | **2** | **1,825 B (−66.5%)** | 66.2% (43/65) | **16.1** |
 
-## Load & Hot-Kernel Results (`v2.4.0`)
+- **Aggregate (all 5 models, `30/30` exact `file:line`):** Tool calls **`46 → 23` (−50.0%)**, Full input **`−28.3%`** (**−42.6%** on AGY), Uncached **`−27.5%`** (**−50.2%** Cold), Codex tool payload **`77,793 B → 9,717 B` (−87.5%, 8.0×)**.
 
-Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `rustc 1.100.0`, release full LTO, `0` hardware `div`/`idiv` in `ctx::`).
+## 2. Universal `ctx diag` v2 Compression (Deterministic + Blind Live LLM)
 
-### 1. In-process hot kernels (`ctx-bench micro --iters 200`)
+### Deterministic 6-payload benchmark (`ctx_diag_bench.py --deterministic`)
+
+| Payload | Raw bytes | Compressed bytes | Saved | Est. tokens saved | Time | Result |
+|---|---:|---:|---:|---:|---:|---:|
+| `clang_template_cascade` | 40,996 | 464 | **98.9%** | 10,133 | 1.27 ms | PASS |
+| `cargo_test_failure` | 26,460 | 496 | **98.1%** | 6,491 | 6.72 ms | PASS |
+| `pytest_deep_frames` | 20,623 | 410 | **98.0%** | 5,053 | 6.21 ms | PASS |
+| `journalctl_syslog_burst` | 182,947 | 850 | **99.5%** | 45,524 | 8.46 ms | PASS |
+| `json_api_buried_error` | 64,488 | 465 | **99.3%** | 16,006 | 6.93 ms | PASS |
+| `cmake_ninja_ok_build` | 40,120 | 252 | **99.4%** | 9,967 | 5.86 ms | PASS |
+| **TOTAL (6/6)** | **375,634** | **2,937** | **99.2% (128×)** | **~93,174** | **35.45 ms** | **PASS** |
+
+### Blind Live LLM diagnosis (`raw_bash` vs `ctx diag -- ./run_checks.sh`)
+
+| Client & Model | Route | Verified | Calls | Full input | Uncached input | Output | Wall time |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **AGY · Neon XHigh** | `raw_bash` | PASS | 7 | 110,128 | 29,277 | 2,340 | 33.6 s |
+| **AGY · Neon XHigh** | **`ctx diag`** | **PASS** | **1 (−85.7%)** | **27,134 (−75.4%)** | **16,009 (−45.3%)** | **1,473 (−37.1%)** | **18.5 s (−45.0%)** |
+| **Codex · Astra XHigh** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s |
+| **Codex · Astra XHigh** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%)** | **2,678 (−78.1%)** | **164 (−16.3%)** | **11.9 s (−16.2%)** |
+
+## 3. Atomic Multi-File Edit & Refactor (5 models, `20/20` verified, `0` failed edits)
+
+Two multi-file tasks (`cpp_sig_edit` across C++ headers; `py_refactor` lexical rename + strict check + `__all__` re-export across Python modules):
+
+| Client & Model | Task | Route | Verified | Calls | Full input | Uncached | Output | Wall time | Payload B | MCP ms |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Codex · Astra XHigh** | `cpp_sig_edit` | Native | PASS | 10 | 108,042 | 22,410 | 1,075 | 35.3 s | 28,811 | — |
+| **Codex · Astra XHigh** | `cpp_sig_edit` | **CTX** | **PASS** | **3 (−70.0%)** | **82,221 (−23.9%)** | **22,317** | **978** | **31.5 s** | **12,759 (−55.7%)** | **80.0** |
+| **Codex · Astra XHigh** | `py_refactor` | Native | PASS | 10 | 113,815 | 26,135 | 1,031 | 34.8 s | 35,547 | — |
+| **Codex · Astra XHigh** | `py_refactor` | **CTX** | **PASS** | **6 (−40.0%)** | 136,273 | **13,009 (−50.2%)** | **936** | 39.8 s | **11,864 (−66.6%)** | **92.8** |
+| **Codex · Astra Max** | `cpp_sig_edit` | Native | PASS | 11 | 119,474 | 12,594 | 2,281 | 60.0 s | 29,135 | — |
+| **Codex · Astra Max** | `cpp_sig_edit` | **CTX** | **PASS** | **4 (−63.6%)** | **118,454** | 26,678 | 3,047 | 70.4 s | **26,984** | **79.8** |
+| **Codex · Astra Max** | `py_refactor` | Native | PASS | 12 | 123,346 | 15,314 | 3,478 | 77.4 s | 44,666 | — |
+| **Codex · Astra Max** | `py_refactor` | **CTX** | **PASS** | **5 (−58.3%)** | 135,827 | 16,403 | **3,450** | 80.1 s | **23,808 (−46.7%)** | **88.4** |
+| **AGY · Neon High** | `cpp_sig_edit` | Native | PASS | 7 | 127,289 | 36,060 | 8,688 | 71.3 s | — | — |
+| **AGY · Neon High** | `cpp_sig_edit` | **CTX** | **PASS** | 7 | 179,008 | 42,606 | 9,135 | 83.7 s | 37,520 | **88.5** |
+| **AGY · Neon High** | `py_refactor` | Native | PASS | 12 | 194,654 | 31,389 | 9,848 | 98.7 s | — | — |
+| **AGY · Neon High** | `py_refactor` | **CTX** | **PASS** | **8 (−33.3%)** | **112,927 (−42.0%)** | **30,192** | **7,320** | **67.2 s (−31.9%)** | 15,543 | **89.9** |
+| **AGY · Neon XHigh** | `cpp_sig_edit` | Native | PASS | 8 | 140,440 | 30,849 | 14,582 | 121.3 s | — | — |
+| **AGY · Neon XHigh** | `cpp_sig_edit` | **CTX** | **PASS** | 9 | 197,110 | 34,756 | 15,541 | 129.0 s | 35,739 | **122.8** |
+| **AGY · Neon XHigh** | `py_refactor` | Native | PASS | 13 | 209,285 | 49,116 | 15,275 | 135.0 s | — | — |
+| **AGY · Neon XHigh** | `py_refactor` | **CTX** | **PASS** | **10 (−23.1%)** | 213,758 | **33,905 (−31.0%)** | 18,041 | 167.7 s | 31,139 | **138.4** |
+| **AGY · Carbon High** | `cpp_sig_edit` | Native | PASS | 10 | 195,715 | 42,161 | 17,187 | 180.4 s | — | — |
+| **AGY · Carbon High** | `cpp_sig_edit` | **CTX** | **PASS** | **9 (−10.0%)** | 280,539 | 78,637 | **16,440** | 186.5 s | 52,969 | **116.9** |
+| **AGY · Carbon High** | `py_refactor` | Native | PASS | 20 | 496,214 | 70,619 | 29,050 | 347.3 s | — | — |
+| **AGY · Carbon High** | `py_refactor` | **CTX** | **PASS** | **17 (−15.0%)** | **431,589 (−13.0%)** | 78,224 | 38,358 | 524.6 s | 39,076 | **208.5** |
+
+- **Totals (`20/20` verified, `0` failed edits):** Tool calls **`113 → 78` (−31.0%)** (`43 → 18` = **−58.1%** on Codex; `70 → 60` = **−14.3%** on AGY); Codex payload **`138.2 KB → 75.4 KB` (−45.4%)**; average MCP latency **`14.2 ms/call`**.
+
+## 4. Polyglot 6-Task Suite (`24/24` verified, `0` failed edits)
+
+| Model | Task | Route | Calls | Full input | Uncached | Output | Wall time | MCP ms |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| **Codex · Astra XHigh** | `rust_edit` | Native → **CTX** | 12 → **6 (−50%)** | 138.0k → 193.8k | 27.4k → 32.9k | 1,527 → **888 (−41.8%)** | 44.0 → 45.1 s | 15.6 |
+| **Codex · Astra XHigh** | `go_edit` | Native → **CTX** | 9 → **8** | 140.8k → 292.5k | 26.9k → 33.1k | 1,632 → 2,465 | 50.1 → 66.7 s | 14.4 |
+| **Codex · Astra XHigh** | `docs_json_nav` | Native → **CTX** | 5 → **3 (−40%)** | 43.0k → 90.8k | 8.1k → 15.9k | 518 → **494** | 18.0 → 20.2 s | 9.0 |
+| **Codex · Astra XHigh** | `config_docs_edit` | Native → **CTX** | 6 → **4 (−33%)** | 98.8k → 127.7k | 12.4k → 20.3k | 755 → **616 (−18.4%)** | 25.2 → **24.5 s** | 7.8 |
+| **Codex · Astra XHigh** | `script_create_edit` | Native → **CTX** | 12 → **4 (−67%)** | 184.6k → **120.2k (−34.9%)** | 15.0k → 18.3k | 623 → **417 (−33.1%)** | 29.9 → **20.5 s (−31.5%)** | 11.2 |
+| **Codex · Astra XHigh** | `shared_pack_rules` | Native → **CTX** | 10 → **3 (−70%)** | 68.9k → 97.4k | 11.5k → 19.9k | 747 → **640 (−14.3%)** | 23.2 → 23.6 s | 8.2 |
+| **AGY · Neon XHigh** | `rust_edit` | Native → **CTX** | 11 → **8 (−27%)** | 322.6k → **167.2k (−48.2%)** | 49.2k → **44.4k** | 12,129 → **12,124** | 115.8 → **109.9 s** | 19.0 |
+| **AGY · Neon XHigh** | `go_edit` | Native → **CTX** | 10 → 12 | 130.7k → 244.8k | 33.0k → 57.5k | 12,513 → 16,543 | 94.2 → 131.1 s | 21.1 |
+| **AGY · Neon XHigh** | `docs_json_nav` | Native → **CTX** | 5 → **1 (−80%)** | 48.0k → **42.7k (−11.0%)** | 19.1k → 22.4k | 3,000 → 3,262 | 32.6 → **29.5 s** | **1.1** |
+| **AGY · Neon XHigh** | `config_docs_edit` | Native → **CTX** | 7 → **5 (−29%)** | 105.3k → 141.0k | 22.3k → 35.1k | 7,785 → **5,261 (−32.4%)** | 67.8 → **50.4 s (−25.6%)** | 10.3 |
+| **AGY · Neon XHigh** | `script_create_edit` | Native → **CTX** | 5 → **2 (−60%)** | 84.4k → **69.9k (−17.2%)** | 16.6k → 25.9k | 3,182 → 3,846 | 38.3 → **35.0 s** | **2.4** |
+| **AGY · Neon XHigh** | `shared_pack_rules` | Native → **CTX** | 4 → 4 | 60.5k → 96.9k | 31.6k → **30.4k** | 3,155 → 4,756 | 26.9 → 46.9 s | 3.8 |
+
+- **Totals (`24/24` verified, `0` failed edits):** Codex tool calls **`54 → 28` (−48.1%)** (`2.36 ms/call` MCP); AGY tool calls **`42 → 32` (−23.8%)** (`1.80 ms/call` MCP).
+
+## 5. Load & Hot-Kernel Results (`v2.5.0`)
+
+Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `rustc`, release Fat-LTO, `0` hardware `div`/`idiv` across `449` `ctx::` functions, `0` `.unwrap()`/`.expect()` in production).
+
+### In-process hot kernels (`ctx-bench micro --iters 200`, 19 kernels)
 
 | Kernel | Iterations | ns/op | Throughput |
 |---|---:|---:|---:|
-| `search_exact_256k` (AVX2+BMI1 zero-spill) | 200 | 7,012 | **37,391 MB/s** |
-| `search_ascii_ci_256k` (AVX2+BMI1 inline fold) | 200 | 6,599 | **39,729 MB/s** |
-| `scan_source_256k` (2-phase AVX2+BMI1) | 200 | 23,532 | **11,142 MB/s** |
-| `fast_hash64_256k` (2-way ILP 32B fold) | 800 | 15,888 | **16,503 MB/s** |
-| `json_encode_64k` (single-pass AVX2 stream) | 200 | 14,879 | **4,629 MB/s** |
-| `json_parse_64k` (SIMD escape-free slice) | 200 | 23,748 | **2,900 MB/s** |
-| `trigram_bloom_6paths` (256B LUT) | 12,800 | 262 | **1,009 MB/s** |
-| `cpp_parse_64k` (symbol extractor) | 200 | 190,045 | 344 MB/s |
-| `push_u64_x1000` (2-digit LUT + branchless len) | 1,600 | 6,526 | 6.5 ns/int |
-| `store_cache_hit` (64-shard `FastHashMap` + stat) | 12,800 | 1,320 | 1.32 µs/hit |
-| `allowlist_admit_file` (lexical + canonicalize) | 1,600 | 7,601 | 7.60 µs/admit |
+| `search_exact_256k` (AVX2+BMI1 zero-spill) | 200 | 6,132 | **42,759 MB/s** |
+| `search_ascii_ci_256k` (AVX2+BMI1 inline fold) | 200 | 6,167 | **42,513 MB/s** |
+| `fast_hash64_256k` (2-way ILP 32B fold) | 800 | 15,979 | **16,408 MB/s** |
+| `scan_source_256k` (2-phase AVX2+BMI1) | 200 | 22,018 | **11,908 MB/s** |
+| `line_hash3_4k_lines` (3-hex content anchors) | 200 | 32,307 | **8,528 MB/s** |
+| `json_encode_64k` (single-pass AVX2 stream) | 200 | 14,881 | **4,629 MB/s** |
+| `json_parse_64k` (SIMD escape-free slice) | 200 | 22,204 | **3,102 MB/s** |
+| `clean_code_buf_256k` (AVX2+SSE2 delimiter scrubber, **3.14×** vs v2.4) | 200 | 180,316 | **1,455 MB/s** |
+| `trigram_bloom_6paths` (256B LUT) | 12,800 | 274 | **963 MB/s** |
+| `content_bloom128_256k` (in-RAM 128-bit ASCII-lower bloom) | 400 | 429,664 | **610 MB/s** |
+| `cpp_parse_64k` (symbol extractor) | 200 | 146,393 | **447 MB/s** |
+| `sha256_hex_256k` (pure-Rust SHA-256) | 200 | 727,186 | 360 MB/s |
+| `diag_json_compact_256k` (large JSON/NDJSON schema + error compactor) | 100 | 1,110,739 | 235 MB/s |
+| `search_rank_spread` (multi-file scoring & selection) | 200 | 71,663 | 235 MB/s |
+| `compact_md_json_64k` (lossless Markdown/JSON/YAML compactor) | 200 | 281,956 | 231 MB/s |
+| `diag_log_compress_256k` (SIMD ANSI/CR + template dedup) | 100 | 2,118,735 | 123 MB/s |
+| `push_u64_x1000` (2-digit LUT + branchless len) | 1,600 | 6,477 | 6.5 ns/int |
+| `store_cache_hit` (64-shard `FastHashMap` + stat) | 12,800 | 3,593 | 3.59 µs/hit |
+| `allowlist_admit_file` (lexical + canonicalize) | 1,600 | 7,491 | 7.49 µs/admit |
 
-### 2. Concurrent TCP daemon waves (`ctx-bench waves --agents 1,10,50,100,200 --ops 25`)
+### Concurrent TCP daemon waves (`ctx-bench waves --agents 1,10,50,100,200 --ops 20`)
 
 32 worker threads, 64 cache shards, keep-alive RPC, competing same-role capsules:
 
 | Agents | Total ops | ops/sec | p50 (µs) | p95 (µs) | p99 (µs) | Cache hit | Iso errs | Capsules OK | Misdelivery / Miss / Busy |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 25 | 1,948 | 449 | 500 | 677 | 72.8% | 0 | 1 | 0 / 0 / 0 |
-| 10 | 250 | 8,697 | 888 | 2,416 | 4,014 | 96.7% | 0 | 10 | 0 / 0 / 0 |
-| 50 | 1,250 | **11,649** | 2,690 | 10,550 | 14,222 | 99.3% | 0 | 50 | 0 / 0 / 0 |
-| 100 | 2,500 | **11,207** | 4,889 | 22,602 | 30,947 | 99.7% | 0 | 100 | 0 / 0 / 0 |
-| 200 | 5,000 | 7,416 | 7,589 | 77,683 | 292,159 | 99.8% | 0 | 200 | 0 / 0 / 0 |
-
-### 3. 100-client concurrent 4-query search stress (400-file fixture)
-
-| Scenario | Requests | Queries/req | OK | p50 (ms) | p95 (ms) | max (ms) | Peak subprocs |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `single-literal` | 30 | 4 | 30/30 | **0.620** | 0.733 | 0.778 | 0 |
-| `single-regex` | 30 | 4 | 30/30 | 2.805 | 4.576 | 6.642 | 4 |
-| `single-broad-regex` | 20 | 1 | 20/20 | 3.163 | 3.358 | 3.478 | 4 |
-| `100-literal` | 100 | 4 | **100/100** | **17.648** | 30.351 | 33.309 | 4 |
-| `100-regex` | 100 | 4 | **100/100** | 157.381 | 231.100 | 237.065 | 16 |
+| 1 | 20 | 1,750 | 472 | 978 | 978 | 78.6% | 0 | 1 | 0 / 0 / 0 |
+| 10 | 200 | 7,290 | 907 | 3,629 | 5,229 | 97.5% | 0 | 10 | 0 / 0 / 0 |
+| 50 | 1,000 | 9,886 | 2,597 | 13,727 | 22,610 | 99.5% | 0 | 50 | 0 / 0 / 0 |
+| 100 | 2,000 | **11,182** | 3,816 | 23,166 | 38,222 | 99.8% | 0 | 100 | 0 / 0 / 0 |
+| 200 | 4,000 | 7,338 | **4,709** | 82,904 | 283,932 | **99.9%** | **0** | **200** | **0 / 0 / 0** |
 
 ## Reproduce
 
 From the CTX root, run the separated `ctx-bench` binary directly or through the Python runner (zero model calls):
 
 ```bash
-# Build both `ctx` and `ctx-bench`
+# Build both `ctx` and `ctx-bench` (or compile bare `rustc --edition 2021 -D warnings -O src/main.rs`)
 cargo build --release --bins
 
 # 1–200 concurrent agent TCP daemon waves
-./target/release/ctx-bench waves --ctx-bin ./target/release/ctx --agents 1,10,50,100,200 --ops 25
+./target/release/ctx-bench waves --ctx-bin ./target/release/ctx --agents 1,10,50,100,200 --ops 20
 
-# In-process hot-kernel microbenchmarks (AVX2 search/scan, hashing, JSON, C++ parser, RAM store)
+# In-process hot-kernel microbenchmarks (19 kernels)
 ./target/release/ctx-bench micro --iters 200
 
 # Unified runner (auto-falls back to 2-step bare `rustc` when Cargo is unavailable)
 python3 -B benchmarks/run_benchmark.py --synthetic-only --micro
-```
-
-The same runner accepts a list of live Antigravity tasks through
-`--tasks-json`. Each entry specifies a question and the expected source
-anchors:
-
-```json
-[
-  {
-    "id": "method_definition",
-    "question": "Find the exact file and line that defines targetMethod.",
-    "anchors": [["MyModule.cpp", ["MyModule::targetMethod("]]]
-  }
-]
-```
-
-```bash
-python3 -B benchmarks/run_benchmark.py --workspace /path/to/repo \
-  --tasks-json tasks.json --agy-model gemini-4-neon-xhigh
 ```

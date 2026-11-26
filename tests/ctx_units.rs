@@ -132,9 +132,9 @@ fn parser_extracts_symbols_across_supported_languages_and_configs() {
     );
     check(
         "quote.hpp",
-        "#pragma once\nnamespace cxet {\nusing Px = long;\nstruct Quote {\n  int bid() const { return 1; }\n};\n}\n",
+        "#pragma once\nnamespace engine {\nusing Px = long;\nstruct Quote {\n  int bid() const { return 1; }\n};\n}\n",
         &[
-            (SymbolKind::Namespace, "cxet"),
+            (SymbolKind::Namespace, "engine"),
             (SymbolKind::Using, "Px"),
             (SymbolKind::Struct, "Quote"),
             (SymbolKind::Fn, "bid"),

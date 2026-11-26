@@ -4,8 +4,7 @@
 
 use super::client::{try_send_fresh, SendOutcome};
 use super::{
-    daemon_info_path, error_reply, execute_request, read_daemon_info, write_daemon_info,
-    BrokerService,
+    daemon_info_path, error_reply, read_daemon_info, write_daemon_info, BrokerService,
 };
 use crate::base::json::{self, Json};
 use crate::base::security::generate_csprng_token;
@@ -287,7 +286,7 @@ pub fn run_daemon_forever() -> Result<(), String> {
 
 fn handle_client(
     mut stream: TcpStream,
-    svc: &BrokerService,
+    svc: &Arc<BrokerService>,
     expected_token: &str,
     queue: &AcceptQueue,
     keepalive_waiters: &AtomicUsize,
@@ -369,7 +368,7 @@ fn handle_client(
             return;
         }
 
-        let reply = execute_request(svc, &req);
+        let reply = super::execute_request_arc(svc, &req);
         let mut out = reply.to_json_string();
         out.push('\n');
         if stream.write_all(out.as_bytes()).is_err() || stream.flush().is_err() {
@@ -382,7 +381,7 @@ fn handle_client(
 #[cfg(test)]
 pub(super) fn handle_client_for_test(
     stream: TcpStream,
-    svc: &BrokerService,
+    svc: &Arc<BrokerService>,
     expected_token: &str,
     queue: &AcceptQueue,
     keepalive_waiters: &AtomicUsize,

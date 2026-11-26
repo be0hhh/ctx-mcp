@@ -1,9 +1,26 @@
 # CTX
 
-Local zero-dependency Rust MCP server & in-RAM code index for **Antigravity**,
-**Codex**, and **Claude Code**. Cuts token burn, subscription quota drain, and
-navigation latency across C/C++, Rust, Python, Java, C#, Go, TS/JS, Markdown,
-JSON, TOML, and YAML.
+Local zero-dependency Rust MCP server, CLI & in-RAM code index for **Antigravity**,
+**Codex**, and **Claude Code**. Cuts token burn, tool calls, noisy command/log
+output, and navigation latency across C/C++, Rust, Python, Java, C#, Go, TS/JS,
+Markdown, JSON, TOML, YAML, Makefile, and Dockerfile.
+
+## Why CTX Is Different (Data Protocol, Not Output Skin)
+
+CTX is **not** a prompt-style text compressor (like *Caveman*) and **not** just a
+terminal stdout wrapper (like *RTK* and similar CLI filters). Instead of changing
+how the model talks or only trimming shell output after the fact, **CTX changes
+how the AI agent interacts with workspace data itself**:
+
+| Layer | Examples | What it optimizes | What stays untouched |
+|---|---|---|---|
+| **Output-style compression** | *Caveman* & terse prompts | Shortens the assistant's reply prose | Full-file reads, noisy searches, failed edits, raw logs |
+| **CLI stdout wrappers** | *RTK* & terminal filters | Trims stdout of shell commands after execution | Code navigation, multi-file edits, cross-agent re-reads |
+| **Data-access & edit protocol** | **CTX** | **Persistent in-RAM symbol/structure index, batched scoped search without full-file dumps, `ctx_impact` + content-hashed atomic `ctx_edit`, Shared Context Packs & per-session dedup across agents, plus built-in `ctx diag` for build/test/log/JSON streams** | Orthogonal to reply style (pairs cleanly with any prompt style) |
+
+- **Zero external crates** (`std`-only; compiles with bare `rustc --edition 2021 -D warnings -O` or Cargo Fat-LTO)
+- **Zero-panic production core** (`0` `.unwrap()`, `0` `.expect()`, `0` hardware `div`/`idiv` across `449` Fat-LTO functions)
+- **11 write / 10 read-only MCP tools**, cross-platform (Linux, macOS, WSL, Windows), verified self-update (`ctx update`)
 
 ## Install
 
@@ -19,50 +36,64 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/be0hhh/ctx-mcp/main/setup/install.ps1 | iex
 ```
 
+Already installed? Upgrade in-place with SHA-256 verification and zero agent restarts:
+
+```bash
+ctx update
+```
+
 The installer configures Antigravity, Codex, and Claude Code automatically.
 For manual configs, flags, and CLI usage, see [setup/README.md](setup/README.md).
 
-## Savings at a Glance (Native vs CTX v2.4.0)
+## Verified Benchmarks (`v2.5.0`, Native vs CTX)
 
-Measured across 5 models in two-turn **Cold → Warm** sessions (`30/30` exact `file:line`):
+All suites below passed **100%** (`0` errors, `0` failed edits, `131/131` Rust tests).
 
-| Metric | Antigravity (`Neon High/XHigh`, `Carbon High`) | Codex (`GPT-6.2 Astra XHigh/Max`) | All 5 models |
-|---|---:|---:|---:|
-| **Full input tokens** | **−53.7%** (**2.16×** less) | **−5.6%** (`−10.4%` Warm) | **−38.9%** (**1.64×** less) |
-| **Uncached input tokens** | **−59.4%** (**2.46×** less) | **−2.2%** (`−17.4%` on Max) | **−50.3%** (**2.01×** less) |
-| **Warm turn input / uncached** | **−72.0%** (**3.57×**) / **−82.0%** (**5.55×**) | **−10.4%** / **−5.3%** | **−52.3%** / **−69.4%** (**3.26×**) |
-| **Tool output pushed to context** | Compact `@scope` hits (no full-file dumps) | **−89.6%** (**9.7×** less; **14.8×** on Max) | **~10×** cleaner context |
-| **Tool calls** | **−56.8%** (**2.31×** fewer; **1** call Warm) | **−41.2%** (**1.70×** fewer) | **−51.9%** (**2.08×** fewer) |
-| **Wall time** | **−6.6%** (**−45.8% / 1.84×** faster Warm) | **−20.2%** (**1.25×**; up to **1.42×** XHigh) | **−9.0%** (**1.68×** faster Warm) |
-| **Output / reasoning tokens** | +24.9% (model-driven thinking) | **−23.3%** less output | — |
-| **Est. subscription quota drain*** | **−30%…−38%** (2 turns) · **−64%…−67%** Warm | **−8%…−13%** (2 turns) · compounds over 10+ turns | **−26%** (2 turns) · **−51%** Warm |
-| **CTX MCP overhead** | **29.8–41.9 ms** total (`6.5–7.5 MiB` RAM) | **34.3–40.1 ms** total (`6.0–6.5 MiB` RAM) | **< 42 ms** / session |
+### 1. Summary at a Glance
 
-<sub>*Weighted token-cost estimate (`1.0× uncached + 0.1–0.25× cached + 4–5× output`). In multi-turn chats, avoiding full-file dumps compounds savings on every follow-up turn and delays context compaction.</sub>
+| Benchmark Suite | Scope & Verification | Native → CTX (`v2.5.0`) | Key Win |
+|---|---|---|---|
+| **Cold → Warm Navigation** | 5 models (AGY + Codex), **30/30** exact `file:line` | **−50.0%** tool calls · **−28.3%** input (**−42.6%** AGY) · **−50.2%** Cold uncached | **8.0×** cleaner Codex payload (`−87.5%`), **`< 43 ms`** MCP / session |
+| **`ctx diag -- <cmd>` (Deterministic)** | 6 payloads (Clang, cargo, pytest, syslog, JSON, CMake), **6/6** | **`375,634 B → 2,937 B`** (**−99.2%**, **128×**) | **~93,174** tokens saved in **`35.45 ms`** |
+| **`ctx diag -- <cmd>` (Blind Live LLM)** | AGY `Neon XHigh` + Codex `Astra XHigh`, **4/4** | AGY: **−75.4%** input, **−45.0%** wall, `7 → 1` calls · Codex: **−52.0%** input, **−78.1%** uncached | **2.1×–4.1×** fewer input tokens, **1.82×** faster on AGY |
+| **Atomic Edit & Refactor** | 5 models (`cpp_sig_edit` + `py_refactor`), **20/20**, **0** failed edits | **−31.0%** tool calls (**−58.1%** Codex: `43 → 18`) · **−45.4%** Codex payload | Up to **−42.0%** input & **−31.9%** wall (`Neon High` `py_refactor`) |
+| **Polyglot 6-Task** | Rust, Go, JSON/TOML/MD, Config+Docs, Script `creates`+`edits`, Shared Pack (**24/24**, **0** failed edits) | Codex: **−48.1%** calls (`54 → 28`) · AGY: **−23.8%** calls (`42 → 32`) | `script_create_edit`: **−67%** calls / **−35%** input / **−32%** wall; `docs_json_nav`: `5 → 1` (`1.1 ms`) |
+| **In-RAM Engine & Load** | 19 AVX2 kernels + `1–200` concurrent agents (`ctx-bench`) | **42.8 GB/s** search · **1,455 MB/s** SIMD clean (**3.14×**) · **11,182 ops/s** @ 100 agents | **99.9%** RAM hit rate, **`4.71 ms`** p50, **`0`** iso errs @ 200 agents |
 
-**Where & why it wins:**
-- **Antigravity:** Biggest token & quota saver — replaces multi-file `read_file` chains with 1 batched `ctx_search` (`8.3–8.5 ms` Warm), cutting warmed-turn quota burn by **~2.7–3×**.
-- **Codex (`Astra 6.2`):** Biggest speed & context-hygiene win — **1.25×–1.42× faster**, **−41%** tool calls, **−23%** output, and **10–15×** smaller tool payloads (`48.8 KB → 3.3 KB` on Max).
-- **Zero-copy AVX2+BMI1 RAM engine:** Searches at **37–40 GB/s** (`0.62 ms` p50 for 4 batched queries), returns inline `@scope` hits under an 8 KiB budget, and resolves shorthand roots (`Module:pattern`, `Dir/Sub:pattern`) without directory crawls.
-- **Shared daemon & dedup:** One 64-shard RAM cache (`~7 MiB` RSS, `11.6k ops/s`) shared across sessions and subagents with per-agent read dedup and stale-checked workspace memos.
+### 2. Cold → Warm Navigation — Full 5-Model Totals (`30/30` exact `file:line`)
 
-## Native vs CTX — Full Session Totals (Cold + Warm)
-
-Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor task (Turn 1) + **Warm** 2-anchor follow-up (Turn 2 via `--resume` / `codex exec resume`), comparing built-in search/reads (**Native**, zero MCP) against **CTX v2.4.0** (Antigravity 4 core eager tools / Codex direct MCP).
+Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor task (Turn 1) + **Warm** 2-anchor follow-up (Turn 2 via `--resume` / `codex exec resume`), comparing built-in search/reads (**Native**, zero MCP) against **CTX v2.5.0**.
 
 | Client & Model | Route | Exact `file:line` | Wall time | Full input | Uncached input | Output (thinking) | Tool calls | CTX MCP time |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **AGY · Gemini 4 Neon (High)** | Native | 6/6 | 81.6 s | 247,973 | 66,303 | 4,622 (3,334) | 10 | — |
-| **AGY · Gemini 4 Neon (High)** | **CTX** | **6/6** | **64.7 s (−20.7%)** | **130,649 (−47.3%)** | **31,601 (−52.3%)** | 5,127 (4,361) | **6 (−40.0%)** | **41.9 ms** |
-| **AGY · Gemini 4 Neon (XHigh)** | Native | 6/6 | 163.7 s | 413,869 | 77,927 | 14,655 (13,373) | 14 | — |
-| **AGY · Gemini 4 Neon (XHigh)** | **CTX** | **6/6** | **160.6 s (−1.9%)** | **132,153 (−68.1%)** | **30,570 (−60.8%)** | **13,788** (13,279) | **4 (−71.4%)** | **29.8 ms** |
-| **AGY · Gemini 4 Carbon (High)** | Native | 6/6 | 266.1 s | 356,019 | 117,902 | 14,037 (12,744) | 13 | — |
-| **AGY · Gemini 4 Carbon (High)** | **CTX** | **6/6** | **252.4 s (−5.2%)** | **208,318 (−41.5%)** | **44,215 (−62.5%)** | 22,703 (21,863) | **6 (−53.8%)** | **39.6 ms** |
-| **Codex · GPT-6.2 Astra (XHigh)** | Native | 6/6 | 45.6 s | 233,161 | 18,889 | 1,259 (12) | 9 | — |
-| **Codex · GPT-6.2 Astra (XHigh)** | **CTX** | **6/6** | **32.1 s (−29.5%)** | **212,821 (−8.7%)** | 23,125 (+22.4%) | **816 (−35.2%)** (30) | **5 (−44.4%)** | **34.3 ms** |
-| **Codex · GPT-6.2 Astra (Max)** | Native | 6/6 | 62.3 s | 220,811 | 30,475 | 3,389 (1,878) | 8 | — |
-| **Codex · GPT-6.2 Astra (Max)** | **CTX** | **6/6** | **53.9 s (−13.4%)** | **215,625 (−2.3%)** | **25,161 (−17.4%)** | **2,750 (−18.9%)** (1,935) | **5 (−37.5%)** | **40.1 ms** |
+| **AGY · Gemini 4 Neon (High)** | Native | 6/6 | 74.0 s | 173,493 | 39,895 | 5,922 (4,723) | 9 | — |
+| **AGY · Gemini 4 Neon (High)** | **CTX** | **6/6** | 74.9 s (+1.2%) | **102,382 (−41.0%)** | **27,483 (−31.1%)** | 7,166 (6,685) | **3 (−66.7%)** | **20.7 ms** |
+| **AGY · Gemini 4 Neon (XHigh)** | Native | 6/6 | 148.9 s | 298,160 | 75,524 | 17,742 (16,515) | 11 | — |
+| **AGY · Gemini 4 Neon (XHigh)** | **CTX** | **6/6** | 153.8 s (+3.3%) | **159,344 (−46.6%)** | **30,811 (−59.2%)** | 18,408 (17,695) | **6 (−45.5%)** | **42.1 ms** |
+| **AGY · Gemini 4 Carbon (High)** | Native | 6/6 | 216.2 s | 325,040 | 76,790 | 17,733 (16,595) | 12 | — |
+| **AGY · Gemini 4 Carbon (High)** | **CTX** | **6/6** | 429.4 s (+98.6%) | **195,692 (−39.8%)** | **73,316 (−4.5%)** | 29,792 (29,098) | **5 (−58.3%)** | **34.7 ms** |
+| **Codex · GPT-6.2 Astra (XHigh)** | Native | 6/6 | 27.9 s | 164,095 | 24,959 | 744 (0) | 4 | — |
+| **Codex · GPT-6.2 Astra (XHigh)** | **CTX** | **6/6** | 38.0 s (+36.0%) | 177,288 (+8.0%) | **24,328 (−2.5%)** | 924 (198) | 4 (0.0%) | **31.0 ms** |
+| **Codex · GPT-6.2 Astra (Max)** | Native | 6/6 | 56.9 s | 227,958 | 32,246 | 2,671 (1,232) | 10 | — |
+| **Codex · GPT-6.2 Astra (Max)** | **CTX** | **6/6** | **41.3 s (−27.4%)** | **218,193 (−4.3%)** | **24,785 (−23.1%)** | **1,852 (−30.7%)** (1,066) | **5 (−50.0%)** | **27.3 ms** |
 
-[Cold vs Warm & Load Benchmarks](benchmarks/README.md) ·
+### 3. Blind Live `ctx diag` v2 (`raw_bash` vs `ctx diag -- ./run_checks.sh`)
+
+| Client & Model | Route | Verified | Tool calls | Full input | Uncached input | Output | Wall time |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **AGY · Gemini 4 Neon (XHigh)** | `raw_bash` | PASS | 7 | 110,128 | 29,277 | 2,340 | 33.6 s |
+| **AGY · Gemini 4 Neon (XHigh)** | **`ctx diag`** | **PASS** | **1 (−85.7%)** | **27,134 (−75.4%, 4.1×)** | **16,009 (−45.3%)** | **1,473 (−37.1%)** | **18.5 s (−45.0%)** |
+| **Codex · GPT-6.2 Astra (XHigh)** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s |
+| **Codex · GPT-6.2 Astra (XHigh)** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%, 2.1×)** | **2,678 (−78.1%, 4.6×)** | **164 (−16.3%)** | **11.9 s (−16.2%)** |
+
+## What's New in `v2.5.0`
+
+- **Universal `ctx diag` v2:** Clang/GCC/Rust/Python/TS/Go/MSVC/CMake/ld/lld/test runners + AVX2/SSE2 ANSI/CR scrubbing + template deduplication for Linux/server logs + large JSON/NDJSON schema & error compactor.
+- **Atomic `ctx_edit` upgrades & `ctx_git`:** atomic `creates` (with `executable: true`, full `overwrite` rollback, TOCTOU path admission), `verify_absent`, `ctx_git` `stat: true` + automatic conflict-marker scan (`<<<<<<< ` / `>>>>>>> `).
+- **Deep Docs/Config/Infra indexing & Shared Context Packs:** hierarchical Markdown `H1..H4`, deep JSON/YAML dotted paths & array-object indexing (`name|id|tool|title`), `Makefile`/`Dockerfile` outlines, lossless compaction, and Shared Context Packs in `ctx_memo` (`pack`/`pack_get`/`packs`) + `ctx_capsule` (`pack_refs`) with per-session `[UNCHANGED]` dedup.
+- **SIMD & In-RAM durability:** AVX2+SSE2 code scrubber (`3.14×` faster, `1,455 MB/s`), 128-bit in-RAM trigram bloom prefilter (`610 MB/s`), daemon git-recency background pre-warm, strict memory bounds across all caches/tables, host-aware AGY `<= 9 KB` hard-clamp, and `0` `.unwrap()`/`.expect()`/`div`/`idiv` in production.
+- **Verified self-update & cross-platform helpers:** `ctx update [--check|--rebuild|--force]` with pure-Rust FIPS 180-4 SHA-256 verification and custom-flavor protection, plus native OS RAM budget detection and hidden Windows subprocess spawning.
+
+[Full Benchmarks, Edit/Polyglot & Load Results](benchmarks/README.md) ·
 [Manual Setup & CLI](setup/README.md) ·
 [Releases](https://github.com/be0hhh/ctx-mcp/releases)

@@ -1,13 +1,16 @@
 //! Top-level CLI command dispatcher for `ctx`.
 
+pub mod diag;
 pub mod search_args;
 
-use crate::base::json::Json;
+use crate::base::json::{self, Json};
+use crate::base::mode::{current_write_mode, set_persisted_write_mode};
 use crate::engine::DEFAULT_READ_MAX_BYTES;
 use crate::hooks::{passthrough_raw, should_skip_global_duplicate};
 use crate::install;
 use crate::mcp;
 use crate::rpc::{call_daemon_or_inproc, run_daemon_forever, workspace_cwd_str};
+use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
@@ -22,13 +25,24 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_usage();
             0
         }
-        "daemon" => match run_daemon_forever() {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("ctx daemon error: {}", e);
-                1
+        "-V" | "--version" | "version" => {
+            println!(
+                "ctx {} ({})",
+                install::update::CURRENT_VERSION,
+                crate::base::ext::policy().build_flavor()
+            );
+            0
+        }
+        "daemon" => {
+            install::update::maybe_spawn_background_update_check();
+            match run_daemon_forever() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("ctx daemon error: {}", e);
+                    1
+                }
             }
-        },
+        }
         "install" => install::run_install_cli(&args[1..]),
         "setup" => {
             let mut forwarded = vec!["--interactive".to_string()];
@@ -37,10 +51,52 @@ pub fn dispatch(args: &[String]) -> i32 {
         }
         "uninstall" => install::run_uninstall_cli(&args[1..]),
         "doctor" => install::run_doctor_cli(&args[1..]),
+        "update" => install::update::run_update_cli(&args[1..]),
+        "diag" => diag::run_diag_cli(&args[1..]),
+        "mode" => {
+            let Some(arg) = args.get(1).map(|s| s.as_str()) else {
+                let st = current_write_mode(None);
+                println!(
+                    "write_mode: {} (source: {}, flavor: {})",
+                    if st.enabled { "write" } else { "read-only" },
+                    st.source.as_str(),
+                    crate::base::ext::policy().build_flavor(),
+                );
+                return 0;
+            };
+            let target = match arg.trim().to_ascii_lowercase().as_str() {
+                "write" | "rw" | "on" | "enable" => true,
+                "read-only" | "readonly" | "ro" | "off" | "disable" => false,
+                other => {
+                    eprintln!("ctx mode: unknown mode `{other}` (expected `write` or `read-only`)");
+                    return 2;
+                }
+            };
+            match set_persisted_write_mode(target) {
+                Ok(path) => {
+                    println!(
+                        "ctx mode: {} (saved to {}; applies live on next call)",
+                        if target { "write" } else { "read-only" },
+                        path.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("ctx mode error: {e}");
+                    1
+                }
+            }
+        }
         "status" => {
             let reply =
                 call_daemon_or_inproc(Json::obj(vec![("op", Json::Str("status".to_string()))]));
-            if let Some(st) = reply.get("status") {
+            if let Some(mut st) = reply.get("status").cloned() {
+                if let Json::Obj(ref mut fields) = st {
+                    fields.push((
+                        Cow::Borrowed("update"),
+                        install::update::update_status_json(),
+                    ));
+                }
                 println!("{}", st.to_json_string());
             } else {
                 println!("{}", reply.to_json_string());
@@ -78,12 +134,14 @@ pub fn dispatch(args: &[String]) -> i32 {
         "read" => {
             let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
             let mut force = false;
+            let mut hashes = false;
             let mut session = std::env::var("AGENT_CTX_SESSION").ok().unwrap_or_default();
             let mut paths = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--force" | "-f" => force = true,
+                    "--hashes" => hashes = true,
                     "--max-bytes" if i + 1 < args.len() => {
                         i += 1;
                         if let Ok(v) = args[i].parse::<i64>() {
@@ -103,6 +161,7 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("session", Json::Str(session)),
                 ("force", Json::Bool(force)),
+                ("hashes", Json::Bool(hashes)),
                 ("max_bytes", Json::Int(max_bytes)),
                 ("paths", Json::Arr(paths)),
             ]));
@@ -248,6 +307,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         "sym" | "symbols" => {
             let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
             let mut compact = false;
+            let mut hashes = false;
+            let mut raw = false;
             let mut reqs = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -258,6 +319,10 @@ pub fn dispatch(args: &[String]) -> i32 {
                     }
                 } else if args[i] == "--compact" {
                     compact = true;
+                } else if args[i] == "--hashes" {
+                    hashes = true;
+                } else if args[i] == "--raw" {
+                    raw = true;
                 } else {
                     reqs.push(Json::Str(args[i].clone()));
                 }
@@ -268,8 +333,204 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("max_bytes", Json::Int(max_bytes)),
                 ("compact", Json::Bool(compact)),
+                ("hashes", Json::Bool(hashes)),
+                ("raw", Json::Bool(raw)),
                 ("requests", Json::Arr(reqs)),
             ]));
+            print_reply(&reply)
+        }
+        "impact" => {
+            let mut max_callers: i64 = 20;
+            let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
+            let mut include_tests = true;
+            let mut include_git_status = true;
+            let mut targets = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--max-callers" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            max_callers = v;
+                        }
+                    }
+                    "--max-bytes" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            max_bytes = v;
+                        }
+                    }
+                    "--no-tests" => include_tests = false,
+                    "--no-git" => include_git_status = false,
+                    other => targets.push(Json::Str(other.to_string())),
+                }
+                i += 1;
+            }
+            let reply = call_daemon_or_inproc(Json::obj(vec![
+                ("op", Json::Str("impact".to_string())),
+                ("cwd", Json::Str(workspace_cwd_str(None))),
+                ("targets", Json::Arr(targets)),
+                ("max_callers", Json::Int(max_callers)),
+                ("include_tests", Json::Bool(include_tests)),
+                ("include_git_status", Json::Bool(include_git_status)),
+                ("max_bytes", Json::Int(max_bytes)),
+            ]));
+            print_reply(&reply)
+        }
+        "edit" => {
+            let mut raw_json: Option<String> = None;
+            let mut dry_run_flag = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--dry-run" => dry_run_flag = true,
+                    "--json" if i + 1 < args.len() => {
+                        i += 1;
+                        raw_json = Some(args[i].clone());
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let payload_str = match raw_json {
+                Some(s) => s,
+                None => {
+                    let mut buf = Vec::new();
+                    let _ = io::stdin().take(2 * 1024 * 1024).read_to_end(&mut buf);
+                    String::from_utf8_lossy(&buf).into_owned()
+                }
+            };
+            let parsed = match json::parse(&payload_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ctx edit: invalid JSON payload: {e}");
+                    return 2;
+                }
+            };
+            let mut fields = vec![
+                ("op", Json::Str("edit".to_string())),
+                ("cwd", Json::Str(workspace_cwd_str(None))),
+            ];
+            if let Some(edits) = parsed.get("edits") {
+                fields.push(("edits", edits.clone()));
+            }
+            if let Some(renames) = parsed.get("renames") {
+                fields.push(("renames", renames.clone()));
+            }
+            if let Some(creates) = parsed.get("creates") {
+                fields.push(("creates", creates.clone()));
+            }
+            if let Some(verify_absent) = parsed.get("verify_absent") {
+                fields.push(("verify_absent", verify_absent.clone()));
+            }
+            if dry_run_flag {
+                fields.push(("dry_run", Json::Bool(true)));
+            } else if let Some(dr) = parsed.get_bool("dry_run") {
+                fields.push(("dry_run", Json::Bool(dr)));
+            }
+            let reply = call_daemon_or_inproc(Json::obj(fields));
+            print_reply(&reply)
+        }
+        "refactor" => {
+            let mut old_name = String::new();
+            let mut new_name = String::new();
+            let mut dry_run = true;
+            let mut paths = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--apply" => dry_run = false,
+                    "--dry-run" => dry_run = true,
+                    other if old_name.is_empty() => old_name = other.to_string(),
+                    other if new_name.is_empty() => new_name = other.to_string(),
+                    other => paths.push(Json::Str(other.to_string())),
+                }
+                i += 1;
+            }
+            let rename_spec = Json::obj(vec![
+                ("old_name", Json::Str(old_name)),
+                ("new_name", Json::Str(new_name)),
+                ("paths", Json::Arr(paths)),
+            ]);
+            let reply = call_daemon_or_inproc(Json::obj(vec![
+                ("op", Json::Str("edit".to_string())),
+                ("cwd", Json::Str(workspace_cwd_str(None))),
+                ("renames", Json::Arr(vec![rename_spec])),
+                ("dry_run", Json::Bool(dry_run)),
+            ]));
+            print_reply(&reply)
+        }
+        "git" => {
+            let mut action = "diff".to_string();
+            let mut rev: Option<String> = None;
+            let mut staged = false;
+            let mut stat = false;
+            let mut hashes = true;
+            let mut limit: i64 = 10;
+            let mut max_bytes: i64 = 8192;
+            let mut symbol: Option<String> = None;
+            let mut paths = Vec::new();
+            let mut i = 1;
+            if let Some(first) = args.get(1) {
+                if matches!(first.as_str(), "diff" | "status" | "log" | "show") {
+                    action = first.clone();
+                    i = 2;
+                }
+            }
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--staged" | "--cached" => staged = true,
+                    "--stat" => stat = true,
+                    "--no-hashes" => hashes = false,
+                    "--hashes" => hashes = true,
+                    "--rev" if i + 1 < args.len() => {
+                        i += 1;
+                        rev = Some(args[i].clone());
+                    }
+                    "--symbol" | "-S" if i + 1 < args.len() => {
+                        i += 1;
+                        symbol = Some(args[i].clone());
+                    }
+                    "--limit" | "-n" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            limit = v;
+                        }
+                    }
+                    "--max-bytes" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            max_bytes = v;
+                        }
+                    }
+                    other => {
+                        if action == "show" && rev.is_none() {
+                            rev = Some(other.to_string());
+                        } else {
+                            paths.push(Json::Str(other.to_string()));
+                        }
+                    }
+                }
+                i += 1;
+            }
+            let mut fields = vec![
+                ("op", Json::Str("git".to_string())),
+                ("cwd", Json::Str(workspace_cwd_str(None))),
+                ("action", Json::Str(action)),
+                ("staged", Json::Bool(staged)),
+                ("stat", Json::Bool(stat)),
+                ("hashes", Json::Bool(hashes)),
+                ("limit", Json::Int(limit)),
+                ("max_bytes", Json::Int(max_bytes)),
+                ("paths", Json::Arr(paths)),
+            ];
+            if let Some(r) = rev {
+                fields.push(("rev", Json::Str(r)));
+            }
+            if let Some(s) = symbol {
+                fields.push(("symbol", Json::Str(s)));
+            }
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "search" => match search_args::parse_search_cli(&args[1..]) {
@@ -288,10 +549,19 @@ pub fn dispatch(args: &[String]) -> i32 {
             }
         },
         "memo" => {
-            let action = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+            let raw_action = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+            let action = if raw_action == "pack-get" {
+                "pack_get"
+            } else {
+                raw_action
+            };
             let mut topic = String::new();
             let mut summary = String::new();
             let mut kind = None;
+            let mut since_seq: Option<i64> = None;
+            let mut force = false;
+            let mut raw = false;
+            let mut max_bytes: Option<i64> = None;
             let mut paths = Vec::new();
             let mut i = 2;
             while i < args.len() {
@@ -308,15 +578,35 @@ pub fn dispatch(args: &[String]) -> i32 {
                         i += 1;
                         kind = Some(args[i].clone());
                     }
+                    "--since-seq" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            since_seq = Some(v);
+                        }
+                    }
+                    "--max-bytes" if i + 1 < args.len() => {
+                        i += 1;
+                        if let Ok(v) = args[i].parse::<i64>() {
+                            max_bytes = Some(v);
+                        }
+                    }
+                    "--force" => force = true,
+                    "--raw" => raw = true,
                     "--author" | "-a" if i + 1 < args.len() => {
                         // Legacy callers may still supply a label; it is not provenance.
                         i += 1;
                     }
-                    other => paths.push(Json::Str(other.to_string())),
+                    other => {
+                        if matches!(action, "pack" | "pack_get") && topic.is_empty() {
+                            topic = other.to_string();
+                        } else {
+                            paths.push(Json::Str(other.to_string()));
+                        }
+                    }
                 }
                 i += 1;
             }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("memo".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("action", Json::Str(action.to_string())),
@@ -324,12 +614,23 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("summary", Json::Str(summary)),
                 ("kind", kind.map(Json::Str).unwrap_or(Json::Null)),
                 ("paths", Json::Arr(paths)),
-            ]));
+                ("force", Json::Bool(force)),
+                ("raw", Json::Bool(raw)),
+            ];
+            if let Some(seq) = since_seq {
+                fields.push(("since_seq", Json::Int(seq)));
+            }
+            if let Some(mb) = max_bytes {
+                fields.push(("max_bytes", Json::Int(mb)));
+            }
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "elf" | "elf-audit" => {
             let mut elf_path = String::new();
             let mut asm_path: Option<String> = None;
+            let mut baseline_elf_path: Option<String> = None;
+            let mut baseline_asm_path: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -341,6 +642,14 @@ pub fn dispatch(args: &[String]) -> i32 {
                         i += 1;
                         asm_path = Some(args[i].clone());
                     }
+                    "--baseline-elf" if i + 1 < args.len() => {
+                        i += 1;
+                        baseline_elf_path = Some(args[i].clone());
+                    }
+                    "--baseline-asm" if i + 1 < args.len() => {
+                        i += 1;
+                        baseline_asm_path = Some(args[i].clone());
+                    }
                     other if elf_path.is_empty() => elf_path = other.to_string(),
                     _ => {}
                 }
@@ -351,12 +660,21 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("elf_path", Json::Str(elf_path)),
                 ("asm_path", asm_path.map(Json::Str).unwrap_or(Json::Null)),
+                (
+                    "baseline_elf_path",
+                    baseline_elf_path.map(Json::Str).unwrap_or(Json::Null),
+                ),
+                (
+                    "baseline_asm_path",
+                    baseline_asm_path.map(Json::Str).unwrap_or(Json::Null),
+                ),
             ]));
             print_reply(&reply)
         }
         "mcp" => {
             let mut repo_root: Option<PathBuf> = None;
             let mut check_only = false;
+            let mut cli_write: Option<bool> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -365,14 +683,16 @@ pub fn dispatch(args: &[String]) -> i32 {
                         repo_root = Some(PathBuf::from(&args[i]));
                     }
                     "--protocol-check" => check_only = true,
+                    "--read-only" => cli_write = Some(false),
+                    "--write" => cli_write = Some(true),
                     _ => {}
                 }
                 i += 1;
             }
             if check_only {
-                mcp::run_protocol_self_check(repo_root.as_deref())
+                mcp::run_protocol_self_check_with_mode(repo_root.as_deref(), cli_write)
             } else {
-                mcp::run_mcp_stdio(repo_root.as_deref())
+                mcp::run_mcp_stdio_with_mode(repo_root.as_deref(), cli_write)
             }
         }
         "hook" => {
@@ -420,7 +740,11 @@ fn print_reply(reply: &Json) -> i32 {
             if !txt.ends_with('\n') {
                 println!();
             }
-        } else if let Some(items) = reply.get("memo").or_else(|| reply.get("memos")) {
+        } else if let Some(items) = reply
+            .get("memo")
+            .or_else(|| reply.get("memos"))
+            .or_else(|| reply.get("changes"))
+        {
             println!("{}", items.to_json_string());
         }
         0
@@ -443,18 +767,25 @@ fn print_usage() {
          \x20 ctx install [--targets agy,claude,codex] [--all] [--eager core|search|all|none] [--no-wsl-bridge] [--no-codex-rules] [--check]\n\
          \x20 ctx uninstall [--targets agy,claude,codex] [--all] [--keep-binary] [--no-wsl-bridge]\n\
          \x20 ctx doctor [--json]\n\
+         \x20 ctx mode [write|read-only]\n\
+         \x20 ctx update [--check] [--rebuild] [--force] [--json]\n\
          \x20 ctx inspect <file_or_dir...> [--max-files 80] [--max-bytes 1048576] [--warn-lines 600]\n\
-         \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--force]\n\
+         \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--force] [--hashes]\n\
          \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-bytes N]\n\
-         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--max-bytes 1048576]\n\
-         \x20 ctx search -q <ModOrDir:query> [-q ...] [--max-bytes 8192]\n\
-         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--max-bytes 8192]\n\
-         \x20 ctx search --batch-json '<array>' [--max-bytes 8192]\n\
-         \x20 ctx memo <put|get|list|clear> [--topic K] [--summary S] [--kind finding|observation] [paths...]\n\
+         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--max-bytes 1048576]\n\
+         \x20 ctx search -q <ModOrDir:query> [-q ...] [--code-only] [--max-bytes 8192]\n\
+         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--code-only] [--max-bytes 8192]\n\
+         \x20 ctx search --batch-json '<array>' [--code-only] [--max-bytes 8192]\n\
+         \x20 ctx impact <Mod#Symbol...> [--max-callers 20] [--no-tests] [--no-git] [--max-bytes N]\n\
+         \x20 ctx edit [--dry-run] --json '<payload>'\n\
+         \x20 ctx refactor <old_name> <new_name> <paths...> [--apply]\n\
+         \x20 ctx git [diff|status|log|show] [--staged] [--rev R] [--symbol S] [--no-hashes] [paths...]\n\
+         \x20 ctx diag [--file PATH] [--hashes] [--max-errors 15] [--context 2] [-- <cmd> [args...]]\n\
+         \x20 ctx memo <put|get|list|clear|changes|pack|pack-get|packs> [--topic K] [--summary S] [--since-seq N] [paths...]\n\
          \x20 ctx capsule <claim|prepare> [key] [--assignment TEXT] [--workspace inherit|branch|share]\n\
-         \x20 ctx elf <--elf path> [--asm path]\n\
-         \x20 ctx status | clear | save-snapshot | shutdown\n\
-         \x20 ctx mcp [--repo-root DIR] [--protocol-check]\n\
+         \x20 ctx elf <--elf path> [--asm path] [--baseline-elf path] [--baseline-asm path]\n\
+         \x20 ctx status | clear | save-snapshot | shutdown | --version\n\
+         \x20 ctx mcp [--repo-root DIR] [--read-only|--write] [--protocol-check]\n\
          \x20 ctx hook <agy|codex|claude> [--global]"
     );
 }

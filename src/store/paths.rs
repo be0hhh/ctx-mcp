@@ -1,6 +1,7 @@
 //! Canonical workspace path normalization, directory skip list, runtime/snapshot paths,
 //! and WSL/Windows path style translation.
 
+pub use crate::base::mode::runtime_dir;
 use crate::base::security::find_superproject_root;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,44 +22,6 @@ pub fn should_skip_dir(name: &str) -> bool {
             | "dist"
             | ".next"
     ) || name.starts_with("build")
-}
-
-pub fn runtime_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("AGENT_CTX_RUNTIME_DIR") {
-        if !custom.trim().is_empty() {
-            return PathBuf::from(custom);
-        }
-    }
-    #[cfg(unix)]
-    {
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            if !xdg.trim().is_empty() && Path::new(&xdg).is_dir() {
-                return PathBuf::from(xdg).join("agent-ctx");
-            }
-        }
-        let uid = unix_uid_string();
-        #[cfg(target_os = "linux")]
-        if !uid.is_empty() && uid.bytes().all(|c| c.is_ascii_digit()) {
-            let user_run = Path::new("/run/user").join(uid);
-            if user_run.is_dir() {
-                return user_run.join("agent-ctx");
-            }
-        }
-        let shm = Path::new("/dev/shm");
-        if shm.is_dir() {
-            return shm.join(format!("agent-ctx-{}", uid));
-        }
-        std::env::temp_dir().join(format!("agent-ctx-{}", uid))
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            if !local.trim().is_empty() {
-                return PathBuf::from(local).join("agent-ctx");
-            }
-        }
-        std::env::temp_dir().join("agent-ctx")
-    }
 }
 
 pub fn default_snapshot_path() -> PathBuf {
@@ -93,20 +56,6 @@ pub fn default_snapshot_path() -> PathBuf {
         }
         std::env::temp_dir().join("agent-ctx-snapshot.bin")
     }
-}
-
-#[cfg(unix)]
-fn unix_uid_string() -> &'static str {
-    use std::sync::OnceLock;
-    static UID: OnceLock<String> = OnceLock::new();
-    UID.get_or_init(|| {
-        if let Ok(meta) = fs::metadata("/proc/self") {
-            use std::os::unix::fs::MetadataExt;
-            return meta.uid().to_string();
-        }
-        std::env::var("USER").unwrap_or_else(|_| "user".to_string())
-    })
-    .as_str()
 }
 
 pub fn norm_path(path: &Path) -> String {
@@ -301,8 +250,7 @@ pub fn is_multimodal_or_binary_ext(path: &Path) -> bool {
     for (i, b) in ext.bytes().enumerate() {
         buf[i] = b.to_ascii_lowercase();
     }
-    // SAFETY: `ext` was checked ASCII.
-    let low = unsafe { std::str::from_utf8_unchecked(&buf[..ext.len()]) };
+    let low = std::str::from_utf8(&buf[..ext.len()]).unwrap_or("");
     matches!(
         low,
         "png"

@@ -9,7 +9,14 @@ pub(super) fn read_mcp_resource(uri: &str, repo_root: Option<&Path>) -> Result<J
         "ctx://status" => {
             let reply =
                 call_daemon_or_inproc(Json::obj(vec![("op", Json::Str("status".to_string()))]));
-            let payload = reply.get("status").unwrap_or(&reply).to_json_string();
+            let mut status_val = reply.get("status").cloned().unwrap_or(reply);
+            if let Json::Obj(ref mut fields) = status_val {
+                fields.push((
+                    std::borrow::Cow::Borrowed("update"),
+                    crate::install::update::update_status_json(),
+                ));
+            }
+            let payload = status_val.to_json_string();
             Ok(Json::obj(vec![(
                 "contents",
                 Json::Arr(vec![Json::obj(vec![

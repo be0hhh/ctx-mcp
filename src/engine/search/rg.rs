@@ -1,17 +1,20 @@
-use super::{search_snippet, search_time_left, SearchCollection, SearchError, SearchHit};
+use super::{search_snippet, search_time_left, RgMatchMode, SearchCollection, SearchError, SearchHit};
 use crate::base::simd::search_lines_literals;
 use crate::engine::is_searchable_source_file;
 use crate::store::should_skip_dir;
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const RG_RECORD_LIMIT: usize = 16 * 1024;
 const RG_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
+const RG_MAX_COUNT_PER_FILE: usize = 25;
 const FALLBACK_SEARCH_FILE_LIMIT: usize = 3_000;
 
 enum RgError {
@@ -33,71 +36,6 @@ impl Drop for SearchProcess {
     }
 }
 
-fn resolve_rg_binary() -> &'static Path {
-    static RG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    RG_PATH
-        .get_or_init(|| {
-            let exe = if cfg!(windows) { "rg.exe" } else { "rg" };
-            if let Some(path_var) = std::env::var_os("PATH") {
-                for dir in std::env::split_paths(&path_var) {
-                    let cand = dir.join(exe);
-                    if cand.is_file() {
-                        return cand;
-                    }
-                }
-            }
-            // Desktop GUI apps (macOS / Linux / Windows) often spawn MCP & hook processes
-            // with a minimal system PATH omitting Homebrew, Cargo, WinGet, or ~/.local/bin.
-            let mut extra_dirs: Vec<PathBuf> = Vec::new();
-            #[cfg(unix)]
-            {
-                for sys_dir in [
-                    "/opt/homebrew/bin",
-                    "/usr/local/bin",
-                    "/home/linuxbrew/.linuxbrew/bin",
-                    "/usr/bin",
-                    "/bin",
-                ] {
-                    extra_dirs.push(PathBuf::from(sys_dir));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-                if !home.trim().is_empty() {
-                    let h = PathBuf::from(home);
-                    extra_dirs.push(h.join(".cargo").join("bin"));
-                    extra_dirs.push(h.join(".local").join("bin"));
-                    #[cfg(windows)]
-                    {
-                        extra_dirs.push(h.join("scoop").join("shims"));
-                    }
-                }
-            }
-            #[cfg(windows)]
-            {
-                if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-                    if !local_app.trim().is_empty() {
-                        let la = PathBuf::from(local_app);
-                        extra_dirs.push(la.join("Microsoft").join("WinGet").join("Links"));
-                        extra_dirs.push(la.join("Programs").join("ripgrep"));
-                    }
-                }
-                if let Ok(pf) = std::env::var("ProgramFiles") {
-                    if !pf.trim().is_empty() {
-                        extra_dirs.push(PathBuf::from(pf).join("ripgrep"));
-                    }
-                }
-            }
-            for dir in extra_dirs {
-                let cand = dir.join(exe);
-                if cand.is_file() {
-                    return cand;
-                }
-            }
-            PathBuf::from(exe)
-        })
-        .as_path()
-}
-
 fn run_rg_once(
     query: &str,
     roots: &[PathBuf],
@@ -105,28 +43,16 @@ fn run_rg_once(
     fixed_strings: bool,
 ) -> Result<(), RgError> {
     search_time_left(collection.deadline).map_err(|_| RgError::Timeout)?;
-    let mut cmd = Command::new(resolve_rg_binary());
-    cmd.arg("--no-config")
-        .arg("--threads=1")
-        .arg("--with-filename")
-        .arg("--null")
-        .arg("--line-number")
-        .arg("--no-heading")
-        .arg("--color=never")
-        .arg("--line-buffered")
-        .arg("--smart-case")
-        .arg("--max-count=25")
-        .arg("--glob=!**/.git/**")
-        .arg("--glob=!**/build*/**")
-        .arg("--glob=!**/node_modules/**")
-        .arg("--glob=!**/target/**");
+    let mut cmd = crate::base::platform::hidden_command(crate::base::platform::resolve_tool("rg"));
+    cmd.args([
+        "--no-config", "--threads=1", "--with-filename", "--null", "--line-number",
+        "--no-heading", "--color=never", "--line-buffered", "--smart-case", "--max-count=25",
+        "--glob=!**/.git/**", "--glob=!**/build*/**", "--glob=!**/node_modules/**", "--glob=!**/target/**",
+    ]);
     if fixed_strings {
         cmd.arg("--fixed-strings");
     }
-    cmd.arg("--").arg(query);
-    for r in roots {
-        cmd.arg(r);
-    }
+    cmd.arg("--").arg(query).args(roots);
     let _permit = collection
         .svc
         .subproc_sem
@@ -138,11 +64,11 @@ fn run_rg_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
                 RgError::Missing
             } else {
-                RgError::Process(format!("cannot run rg: {}", error))
+                RgError::Process(format!("cannot run rg: {}", e))
             }
         })?;
     collect_rg_output(SearchProcess(child), collection, fixed_strings)
@@ -159,8 +85,16 @@ fn collect_rg_output(
     collection: &mut SearchCollection<'_>,
     fixed_strings: bool,
 ) -> Result<(), RgError> {
-    let stdout = process.0.stdout.take().expect("piped rg stdout");
-    let stderr = process.0.stderr.take().expect("piped rg stderr");
+    let stdout = process
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| RgError::Process("missing piped rg stdout".to_string()))?;
+    let stderr = process
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| RgError::Process("missing piped rg stderr".to_string()))?;
     let deadline = collection.deadline;
     let (tx, rx) = mpsc::sync_channel(8);
     let stdout_tx = tx.clone();
@@ -179,6 +113,8 @@ fn collect_rg_output(
 
     let mut stdout_done = false;
     let mut diagnostic = None;
+    let mut last_path: Option<PathBuf> = None;
+    let mut file_hit_count = 0usize;
     while !stdout_done || diagnostic.is_none() {
         let remaining = search_time_left(deadline).map_err(|_| RgError::Timeout)?;
         let output = rx.recv_timeout(remaining).map_err(|error| match error {
@@ -198,13 +134,23 @@ fn collect_rg_output(
                     continue;
                 };
                 search_time_left(deadline).map_err(|_| RgError::Timeout)?;
+                if last_path.as_ref() == Some(&path) {
+                    file_hit_count += 1;
+                } else {
+                    last_path = Some(path.clone());
+                    file_hit_count = 1;
+                }
+                if file_hit_count >= RG_MAX_COUNT_PER_FILE {
+                    collection.scan_truncated = true;
+                }
                 collection.hits.push(SearchHit {
                     path,
                     workspace,
                     line,
                     snippet,
                 });
-                if collection.hits.len() == collection.cap {
+                if collection.hits.len() >= collection.cap {
+                    collection.scan_truncated = true;
                     return Ok(());
                 }
             }
@@ -323,10 +269,13 @@ pub(super) fn run_rg_or_fallback(
     });
     let result = match run_rg_once(query, roots, collection, false) {
         Ok(()) if collection.hits.is_empty() && has_regex_meta => {
+            collection.match_mode = RgMatchMode::FixedSmartCase;
             run_rg_once(query, roots, collection, true)
         }
         Err(RgError::RegexSyntax(_)) => {
             collection.hits.clear();
+            collection.scan_truncated = false;
+            collection.match_mode = RgMatchMode::FixedSmartCase;
             run_rg_once(query, roots, collection, true)
         }
         result => result,
@@ -346,7 +295,7 @@ fn visit_fallback_files(
     roots: &[PathBuf],
     deadline: Instant,
     mut visit: impl FnMut(&Path) -> Result<bool, SearchError>,
-) -> Result<(), SearchError> {
+) -> Result<bool, SearchError> {
     let mut files_left = FALLBACK_SEARCH_FILE_LIMIT;
     let mut roots = roots.iter().cloned();
     let mut dirs: Vec<fs::ReadDir> = Vec::new();
@@ -363,7 +312,7 @@ fn visit_fallback_files(
             },
             None => match roots.next() {
                 Some(path) => (path, true),
-                None => return Ok(()),
+                None => return Ok(false),
             },
         };
         let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -378,8 +327,10 @@ fn visit_fallback_files(
             }
         } else if is_searchable_source_file(&path, &meta) {
             files_left -= 1;
-            if visit(&path)? || files_left == 0 {
-                return search_time_left(deadline).map(|_| ());
+            let stopped = visit(&path)?;
+            if stopped || files_left == 0 {
+                search_time_left(deadline)?;
+                return Ok(files_left == 0 && !stopped);
             }
         }
     }
@@ -390,8 +341,9 @@ fn search_without_rg(
     roots: &[PathBuf],
     collection: &mut SearchCollection<'_>,
 ) -> Result<(), SearchError> {
+    collection.match_mode = RgMatchMode::FixedCi;
     let deadline = collection.deadline;
-    visit_fallback_files(roots, deadline, |path| {
+    let hit_file_limit = visit_fallback_files(roots, deadline, |path| {
         let Ok((path, workspace)) = collection.svc.allowlist.admit_file(path, collection.cwd)
         else {
             return Ok(false);
@@ -404,6 +356,7 @@ fn search_without_rg(
         };
         let remaining = collection.cap.saturating_sub(collection.hits.len());
         if remaining == 0 {
+            collection.scan_truncated = true;
             return Ok(true);
         }
         let line_nums = search_lines_literals(text, &entry.line_offsets, &[query], false, remaining);
@@ -414,12 +367,17 @@ fn search_without_rg(
                 line: ln as usize,
                 snippet: search_snippet(entry.line_slice(ln)),
             });
-            if collection.hits.len() == collection.cap {
+            if collection.hits.len() >= collection.cap {
+                collection.scan_truncated = true;
                 return Ok(true);
             }
         }
         Ok(false)
-    })
+    })?;
+    if hit_file_limit {
+        collection.scan_truncated = true;
+    }
+    Ok(())
 }
 
 fn parse_grep_line(record: &[u8]) -> Option<(PathBuf, usize, String)> {
@@ -457,18 +415,21 @@ mod tests {
         }
     }
 
+    fn new_collection<'a>(
+        svc: &'a BrokerService,
+        cwd: Option<&'a Path>,
+        deadline: Instant,
+        cap: usize,
+    ) -> SearchCollection<'a> {
+        SearchCollection { svc, cwd, deadline, cap, hits: Vec::new(), scan_truncated: false, match_mode: RgMatchMode::Regex }
+    }
+
     #[test]
     fn rg_distinguishes_no_matches_regex_syntax_and_process_errors() {
         assert!(check_rg_status(exited(1), b"rg: No files were searched", false).is_ok());
         let syntax_error = b"regex parse error:\nerror: unclosed character class";
-        assert!(matches!(
-            check_rg_status(exited(2), syntax_error, false),
-            Err(RgError::RegexSyntax(_))
-        ));
-        assert!(matches!(
-            check_rg_status(exited(2), syntax_error, true),
-            Err(RgError::Process(_))
-        ));
+        assert!(matches!(check_rg_status(exited(2), syntax_error, false), Err(RgError::RegexSyntax(_))));
+        assert!(matches!(check_rg_status(exited(2), syntax_error, true), Err(RgError::Process(_))));
         assert!(matches!(
             check_rg_status(exited(2), b"rg: Permission denied", false),
             Err(RgError::Process(message)) if message.contains("Permission denied")
@@ -478,36 +439,21 @@ mod tests {
     #[test]
     fn rg_match_has_an_unambiguous_path_separator() {
         let hit = parse_grep_line(b"a:b.rs\x0017:example: value").unwrap();
-        assert_eq!(
-            hit,
-            (PathBuf::from("a:b.rs"), 17, "example: value".to_string())
-        );
+        assert_eq!(hit, (PathBuf::from("a:b.rs"), 17, "example: value".to_string()));
     }
 
     #[test]
     fn rg_oversized_record_and_stderr_are_drained_with_bounded_prefixes() {
-        let mut data = b"a\nb.rs\0".to_vec();
-        data.extend_from_slice(b"17:");
+        let mut data = b"a\nb.rs\017:".to_vec();
         data.extend(std::iter::repeat(b'x').take(RG_RECORD_LIMIT * 2));
-        data.extend_from_slice(b"\nnext.rs\0");
-        data.extend_from_slice(b"18:next match\n");
+        data.extend_from_slice(b"\nnext.rs\018:next match\n");
         let mut reader = BufReader::with_capacity(7, io::Cursor::new(&data));
         let deadline = Instant::now() + SEARCH_TIMEOUT;
         let first = read_rg_record(&mut reader, deadline).unwrap().unwrap();
         assert_eq!(first.len(), RG_RECORD_LIMIT);
-        assert_eq!(
-            parse_grep_line(&first),
-            Some((
-                PathBuf::from("a\nb.rs"),
-                17,
-                "x".repeat(SEARCH_SNIPPET_CHARS)
-            ))
-        );
+        assert_eq!(parse_grep_line(&first), Some((PathBuf::from("a\nb.rs"), 17, "x".repeat(SEARCH_SNIPPET_CHARS))));
         let second = read_rg_record(&mut reader, deadline).unwrap().unwrap();
-        assert_eq!(
-            parse_grep_line(&second),
-            Some((PathBuf::from("next.rs"), 18, "next match".to_string()))
-        );
+        assert_eq!(parse_grep_line(&second), Some((PathBuf::from("next.rs"), 18, "next match".to_string())));
         assert!(read_rg_record(&mut reader, deadline).unwrap().is_none());
 
         let mut stderr = io::Cursor::new(&data);
@@ -519,9 +465,7 @@ mod tests {
     #[test]
     fn fallback_uses_one_file_budget_for_directory_and_explicit_roots() {
         let dir = std::env::temp_dir().join(format!(
-            "ctx-search-files-{}-{}",
-            std::process::id(),
-            crate::store::now_ms_u64()
+            "ctx-search-files-{}-{}", std::process::id(), crate::store::now_ms_u64()
         ));
         fs::create_dir(&dir).unwrap();
         let in_directory = dir.join("first.txt");
@@ -531,28 +475,22 @@ mod tests {
 
         let deadline = Instant::now() + SEARCH_TIMEOUT;
         let mut count = 0;
-        visit_fallback_files(&roots, deadline, |path| {
+        let limited = visit_fallback_files(&roots, deadline, |path| {
             assert_eq!(path, in_directory.as_path());
             count += 1;
             Ok(false)
         })
         .unwrap();
+        assert!(limited);
 
         let svc = BrokerService::new_ephemeral_inproc(dir.join("snapshot"));
         let workspace = svc.allowlist.register_hint(&dir, true).unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: Some(&dir),
-            deadline,
-            cap: 1,
-            hits: Vec::new(),
-        };
+        let mut collection = new_collection(&svc, Some(&dir), deadline, 1);
         search_without_rg("NEEDLE", &roots, &mut collection).unwrap();
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(count, FALLBACK_SEARCH_FILE_LIMIT);
-        let [hit] = collection.hits.as_slice() else {
-            panic!("expected one fallback match");
-        };
+        assert!(collection.scan_truncated);
+        let [hit] = collection.hits.as_slice() else { panic!("expected one fallback match"); };
         assert_eq!(hit.path, workspace.join("first.txt"));
         assert_eq!(hit.line, 1);
         assert_eq!(hit.snippet, "needle");
@@ -570,42 +508,28 @@ mod tests {
     #[test]
     fn rg_cap_counts_admitted_matches_and_stops_before_eof() {
         let dir = std::env::temp_dir().join(format!(
-            "ctx-search-rg-{}-{}",
-            std::process::id(),
-            crate::store::now_ms_u64()
+            "ctx-search-rg-{}-{}", std::process::id(), crate::store::now_ms_u64()
         ));
         fs::create_dir(&dir).unwrap();
-        let sensitive = dir.join(".env");
-        let source = dir.join("match.rs");
+        let (sensitive, source) = (dir.join(".env"), dir.join("match.rs"));
         fs::write(&sensitive, "needle").unwrap();
         fs::write(&source, "needle").unwrap();
         let svc = BrokerService::new_ephemeral_inproc(dir.join("snapshot"));
         let workspace = svc.allowlist.register_hint(&dir, true).unwrap();
         let child = Command::new("sh")
-            .args([
-                "-c",
-                r#"printf '%s\000%d:needle\n' "$1" 1 "$2" 1; exec sleep 30"#,
-                "rg-test",
-            ])
+            .args(["-c", r#"printf '%s\000%d:needle\n' "$1" 1 "$2" 1; exec sleep 30"#, "rg-test"])
             .arg(&sensitive)
             .arg(&source)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: Some(&dir),
-            deadline: Instant::now() + SEARCH_TIMEOUT,
-            cap: 1,
-            hits: Vec::new(),
-        };
+        let mut collection = new_collection(&svc, Some(&dir), Instant::now() + SEARCH_TIMEOUT, 1);
         let result = collect_rg_output(SearchProcess(child), &mut collection, false);
         fs::remove_dir_all(&dir).unwrap();
         assert!(result.is_ok());
-        let [hit] = collection.hits.as_slice() else {
-            panic!("expected one admitted rg match");
-        };
+        assert!(collection.scan_truncated);
+        let [hit] = collection.hits.as_slice() else { panic!("expected one admitted rg match"); };
         assert_eq!(hit.path, workspace.join("match.rs"));
     }
 
@@ -619,13 +543,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut collection = SearchCollection {
-            svc: &svc,
-            cwd: None,
-            deadline: Instant::now() + Duration::from_millis(25),
-            cap: 1,
-            hits: Vec::new(),
-        };
+        let mut collection = new_collection(&svc, None, Instant::now() + Duration::from_millis(25), 1);
         assert!(matches!(
             collect_rg_output(SearchProcess(child), &mut collection, false),
             Err(RgError::Timeout)

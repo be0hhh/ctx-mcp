@@ -430,8 +430,7 @@ fn has_known_source_ext(tok: &str) -> bool {
     for (i, b) in ext.bytes().enumerate() {
         buf[i] = b.to_ascii_lowercase();
     }
-    // SAFETY: `ext` was verified ASCII.
-    let low = unsafe { std::str::from_utf8_unchecked(&buf[..ext.len()]) };
+    let low = std::str::from_utf8(&buf[..ext.len()]).unwrap_or("");
     matches!(
         low,
         "h" | "hpp"

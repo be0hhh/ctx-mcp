@@ -53,6 +53,10 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
                 fields.retain(|(name, _)| name.as_ref() != "detail");
                 fields.push((Cow::Borrowed("detail"), Json::Str(value(&mut args)?)));
             }
+            "--code-only" => {
+                fields.retain(|(name, _)| name.as_ref() != "code_only");
+                fields.push((Cow::Borrowed("code_only"), Json::Bool(true)));
+            }
             "--" => {
                 positional.extend(args.map(|value| Json::Str(value.clone())));
                 break;

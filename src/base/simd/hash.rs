@@ -1,5 +1,5 @@
 //! Word-wise 64-bit hashing, LUT-accelerated ASCII path lowercasing,
-//! 64-bit trigram Bloom filter, and zero-overhead `HashMap` hashers.
+//! 64-bit and 128-bit trigram Bloom filters, and zero-overhead `HashMap` hashers.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
@@ -106,6 +106,18 @@ pub fn fast_hash64(bytes: &[u8]) -> u64 {
     finalize64(fold_bytes(SEED, bytes))
 }
 
+/// 12-bit 3-char lowercase hex line anchor derived from `fast_hash64` (`0 div/idiv`).
+#[inline]
+pub fn line_hash3(line: &str) -> [u8; 3] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let h = fast_hash64(line.as_bytes());
+    [
+        HEX[((h >> 8) & 0xF) as usize],
+        HEX[((h >> 4) & 0xF) as usize],
+        HEX[(h & 0xF) as usize],
+    ]
+}
+
 #[inline]
 pub fn fast_hash64_ascii_lower(bytes: &[u8]) -> u64 {
     let mut acc = SEED ^ (bytes.len() as u64).wrapping_mul(K1);
@@ -154,6 +166,38 @@ pub fn trigram_bloom64_ascii_lower(bytes: &[u8]) -> u64 {
         c1 = c2;
     }
     mask
+}
+
+/// Computes a 128-bit 2-bit-per-trigram Bloom filter on ASCII-lowercased bytes (`0 div/idiv`).
+/// Guarantees zero false negatives: if `needle` is a substring of `bytes`,
+/// `bloom128_may_contain(bloom(bytes), bloom(needle))` always holds.
+#[inline]
+pub fn trigram_bloom128_ascii_lower(bytes: &[u8]) -> [u64; 2] {
+    if bytes.len() < 3 {
+        return [0, 0];
+    }
+    let mut words = [0u64; 2];
+    let mut c0 = ASCII_PATH_LOWER[bytes[0] as usize] as u32;
+    let mut c1 = ASCII_PATH_LOWER[bytes[1] as usize] as u32;
+    for &raw in &bytes[2..] {
+        let c2 = ASCII_PATH_LOWER[raw as usize] as u32;
+        let tri = c0 | (c1 << 8) | (c2 << 16);
+        let h1 = tri.wrapping_mul(0x9e37_79b1);
+        let h2 = (tri ^ (h1 >> 16)).wrapping_mul(0x85eb_ca6b);
+        let b1 = (h1 >> 25) as usize;
+        let b2 = (h2 >> 25) as usize;
+        words[b1 >> 6] |= 1u64 << (b1 & 63);
+        words[b2 >> 6] |= 1u64 << (b2 & 63);
+        c0 = c1;
+        c1 = c2;
+    }
+    words
+}
+
+/// Returns `true` if every bit set in `needle` is also set in `haystack`.
+#[inline]
+pub fn bloom128_may_contain(haystack: [u64; 2], needle: [u64; 2]) -> bool {
+    (haystack[0] & needle[0]) == needle[0] && (haystack[1] & needle[1]) == needle[1]
 }
 
 /// Legacy FNV-1a 64-bit hash retained for `.ctx.sha256` upgrade verification.
@@ -289,6 +333,17 @@ mod tests {
         let bn = trigram_bloom64_ascii_lower(needle);
         assert_eq!(bp & bn, bn);
         assert_eq!(trigram_bloom64_ascii_lower(b"ab"), 0);
+
+        let bp128 = trigram_bloom128_ascii_lower(path);
+        let bn128 = trigram_bloom128_ascii_lower(needle);
+        assert!(bloom128_may_contain(bp128, bn128));
+        assert!(bloom128_may_contain(bp128, [0, 0]));
+        assert_eq!(trigram_bloom128_ascii_lower(b""), [0, 0]);
+        assert_eq!(trigram_bloom128_ascii_lower(b"ab"), [0, 0]);
+        assert!(!bloom128_may_contain(
+            trigram_bloom128_ascii_lower(b"alpha_beta"),
+            trigram_bloom128_ascii_lower(b"zzzz_qqqq_xxxx")
+        ));
     }
 
     #[test]

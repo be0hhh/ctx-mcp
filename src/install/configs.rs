@@ -18,13 +18,15 @@ const GLOBAL_BLOCK_END: &str = "<!-- END AGENT_CTX GLOBAL RULES -->";
 const GLOBAL_RULES_SNIPPET: &str = "<!-- BEGIN AGENT_CTX GLOBAL RULES -->\n\
 ## In-RAM Context Broker (`ctx` / MCP `agent_ctx`)\n\
 \n\
-- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
-  - Parallel search (`1-4` queries in `q`, `8 KiB` cap; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
+- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_impact`, `ctx_git`, `ctx_edit`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
+  - Parallel search (`1-6` queries in `q`, `8 KiB` cap; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
   - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols, `9 KB` inline default): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
   - Exact struct/function bodies: `ctx_symbols` with `{\"requests\": [\"ModOrPath#Symbol\"], \"compact\": true}` (CLI: `ctx sym \"Mod#Sym\" --compact`).\n\
   - Full files / slices: in Antigravity prefer parallel native `read_file` (`<=800L` / `46 KB` inline, zero MCP truncation) for full files, and `ctx_read` for `>800L` slices (`path:start-end`) or small batches (`<=9 KB`); in Codex/CLI batch full files in `ctx_read` / `ctx read` up to `1 MiB`.\n\
-  - Shared workspace findings board: `ctx_memo` with `{\"action\": \"list\" | \"put\", \"topic\": \"...\", \"summary\": \"...\", \"paths\": [...]}`.\n\
-- Reuse `[RAM-Ctx Startup]` when provided. Finish directly from grouped search hits or compact symbols when sufficient; in Antigravity swarm workers without MCP use the `ctx` CLI directly. Never slice files in `100-400` line shell loops (`sed`/`head`/`nl`) or re-read unchanged files already in context.\n\
+  - Impact & read-only Git: `ctx_impact` (`targets`) for callers/importers/tests; `ctx_git` (`diff` with optional `stat: true` | `status` with conflict-marker check | `log` | `show`) instead of chained `git diff | head` shell commands. When writing/creating scripts, use `ctx_edit` (`edits`/`renames`/`creates` + `verify_absent`).\n\
+  - Shared context & findings board: `ctx_memo` (`list` | `put` | `get` | `changes` | Shared Context Packs `pack`/`pack_get`/`packs` for MD/JSON rules shared across subagents).\n\
+  - Verbose CLI builds/tests/logs/JSON: wrap with `ctx diag -- <cmd>` to deduplicate compiler/test/syslog noise and compact large JSON.\n\
+- Reuse `[RAM-Ctx Startup]` when provided. Finish directly from grouped search hits or compact symbols (`Mod#Sym`, `doc.md#Heading`, `cfg.json#a.b`) when sufficient; in Antigravity swarm workers without MCP use the `ctx` CLI directly. Never slice files in `100-400` line shell loops (`sed`/`head`/`nl`), run ad-hoc `python3 -c` file/conflict scans, or re-read unchanged files already in context.\n\
 <!-- END AGENT_CTX GLOBAL RULES -->";
 
 pub const AGY_CORE_EAGER_TOOLS: &[&str] = &[
@@ -172,7 +174,7 @@ fn build_agy_context_hook_cfg_cmd(cmd_str: String) -> Json {
                 (
                     "matcher",
                     Json::Str(
-                        "^(read_file|view_file|run_command|call_mcp_tool|mcp_{1,2}agent_ctx_{1,2}ctx_(read|symbols|memo|capsule))$".to_string(),
+                        "^(read_file|view_file|run_command|call_mcp_tool|mcp_{1,2}agent_ctx_{1,2}ctx_(read|symbols|memo|capsule|impact|edit|git))$".to_string(),
                     ),
                 ),
                 ("hooks", Json::Arr(vec![hook_cmd.clone()])),
@@ -285,7 +287,10 @@ fn plan_mcp_custom(
     agy_eager: Option<(EagerMode, bool)>,
 ) -> Result<(), String> {
     let old = plan.json(path)?;
-    let mut root = old.as_obj().unwrap().to_vec();
+    let mut root = old
+        .as_obj()
+        .ok_or_else(|| format!("{}: expected JSON object", path.display()))?
+        .to_vec();
     let mut servers = object_field(&old, "mcpServers", path)?;
     if let Some((_, entry)) = servers.iter().find(|(k, _)| k.as_ref() == "agent_ctx") {
         if !is_owned_agent_ctx_mcp_entry(entry) {
@@ -391,7 +396,10 @@ fn merge_hook_events(
         .as_obj()
         .ok_or_else(|| format!("{}: expected hooks object", path.display()))?
         .to_vec();
-    for (event, desired) in generated.as_obj().unwrap() {
+    let gen_obj = generated
+        .as_obj()
+        .ok_or_else(|| format!("{}: generated hooks must be an object", path.display()))?;
+    for (event, desired) in gen_obj {
         let mut groups = vec![];
         if let Some(existing) = old.get(event.as_ref()) {
             let arr = existing
@@ -408,7 +416,10 @@ fn merge_hook_events(
                         .cloned()
                         .collect();
                     if !kept.is_empty() || handlers.is_empty() {
-                        let mut g_fields = g.as_obj().unwrap().to_vec();
+                        let mut g_fields = g
+                            .as_obj()
+                            .ok_or_else(|| format!("{}: malformed hook group object", path.display()))?
+                            .to_vec();
                         upsert_obj_field(&mut g_fields, "hooks", Json::Arr(kept));
                         groups.push(Json::Obj(g_fields));
                     }
@@ -417,7 +428,9 @@ fn merge_hook_events(
                 }
             }
         }
-        groups.extend_from_slice(desired.as_arr().unwrap());
+        if let Some(desired_arr) = desired.as_arr() {
+            groups.extend_from_slice(desired_arr);
+        }
         upsert_obj_field(&mut fields, event.clone(), Json::Arr(groups));
     }
     Ok(Json::Obj(fields))
@@ -461,7 +474,7 @@ fn plan_hooks_with_cmd(
                 ("SubagentStart", None),
                 (
                     "PreToolUse",
-                    Some("^(exec|exec_command|Bash|shell|mcp__agent_ctx__ctx_(read|symbols|memo|capsule))$"),
+                    Some("^(exec|exec_command|Bash|shell|mcp__agent_ctx__ctx_(read|symbols|memo|capsule|impact|edit|git))$"),
                 ),
                 ("PostToolUse", Some("^(apply_patch|exec|exec_command|Bash|shell)$")),
             ]
@@ -485,7 +498,10 @@ fn plan_hooks_with_cmd(
         Json::Obj(fields)
     };
     let fields = merge_hook_events(&current, &generated, flavor, path)?;
-    let mut root = old.as_obj().unwrap().to_vec();
+    let mut root = old
+        .as_obj()
+        .ok_or_else(|| format!("{}: expected JSON object", path.display()))?
+        .to_vec();
     upsert_obj_field(&mut root, key, fields);
     plan.set_json(path, &old, Json::Obj(root))
 }
@@ -505,7 +521,10 @@ pub(super) fn plan_remove_mcp(plan: &mut InstallPlan, path: &Path) -> Result<(),
         return Ok(());
     }
     let old = plan.json(path)?;
-    let mut root = old.as_obj().unwrap().to_vec();
+    let mut root = old
+        .as_obj()
+        .ok_or_else(|| format!("{}: expected JSON object", path.display()))?
+        .to_vec();
     let mut servers = object_field(&old, "mcpServers", path)?;
     let before_len = servers.len();
     servers.retain(|(name, entry)| {
@@ -530,7 +549,10 @@ pub(super) fn plan_remove_hooks(
         return Ok(());
     }
     let old = plan.json(path)?;
-    let mut root = old.as_obj().unwrap().to_vec();
+    let mut root = old
+        .as_obj()
+        .ok_or_else(|| format!("{}: expected JSON object", path.display()))?
+        .to_vec();
     if flavor == "agy" {
         let before_len = root.len();
         remove_obj_field(&mut root, "agent-context");
@@ -557,9 +579,11 @@ pub(super) fn plan_remove_hooks(
                     .cloned()
                     .collect();
                 if !kept.is_empty() {
-                    let mut g_fields = g.as_obj().unwrap().to_vec();
-                    upsert_obj_field(&mut g_fields, "hooks", Json::Arr(kept));
-                    kept_groups.push(Json::Obj(g_fields));
+                    if let Some(obj) = g.as_obj() {
+                        let mut g_fields = obj.to_vec();
+                        upsert_obj_field(&mut g_fields, "hooks", Json::Arr(kept));
+                        kept_groups.push(Json::Obj(g_fields));
+                    }
                 }
             } else if !owned_handler(g, flavor) {
                 kept_groups.push(g.clone());

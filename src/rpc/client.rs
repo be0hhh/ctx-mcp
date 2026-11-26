@@ -115,14 +115,17 @@ pub(super) fn changes_daemon_state(req: &Json) -> bool {
         return true;
     }
     match req.get_str("op") {
-        Some("capsule" | "clear" | "hook" | "save_snapshot" | "shutdown") => true,
-        Some("memo") => matches!(req.get_str("action"), Some("put" | "clear")),
+        Some("capsule" | "clear" | "edit" | "hook" | "save_snapshot" | "shutdown") => {
+            true
+        }
+        Some("memo") => matches!(req.get_str("action"), Some("put" | "clear" | "pack")),
         _ => false,
     }
 }
 
 fn requires_daemon(req: &Json) -> bool {
-    req.get("ctx_context").is_some() || matches!(req.get_str("op"), Some("search" | "capsule"))
+    req.get("ctx_context").is_some()
+        || matches!(req.get_str("op"), Some("search" | "capsule" | "edit"))
 }
 
 pub(super) fn complete_attempt(outcome: SendOutcome, req: &Json) -> Option<Json> {
@@ -440,14 +443,16 @@ pub fn call_daemon_or_inproc(req: Json) -> Json {
 /// Honest stateless fallback: never fakes cross-process mutations (`memo put/clear`,
 /// `clear`, `save_snapshot`, or stateful hooks) when the daemon is unreachable.
 pub(super) fn run_inproc(req: &Json) -> Json {
-    if requires_daemon(req) {
+    let op = req.get_str("op").unwrap_or("");
+    let explicit_inproc_write = op == "edit"
+        && std::env::var("AGENT_CTX_INPROC").as_deref() == Ok("1");
+    if requires_daemon(req) && !explicit_inproc_write {
         return error_reply(
             "daemon_unavailable",
             "this request requires a running ctx daemon",
             false,
         );
     }
-    let op = req.get_str("op").unwrap_or("");
     match op {
         "hook" => {
             let flavor = req.get_str("flavor").unwrap_or("");
@@ -460,7 +465,7 @@ pub(super) fn run_inproc(req: &Json) -> Json {
         }
         "memo" => {
             let action = req.get_str("action").unwrap_or("list");
-            if action == "put" || action == "clear" {
+            if matches!(action, "put" | "clear" | "pack") {
                 return Json::obj(vec![
                     ("ok", Json::Bool(false)),
                     ("degraded_inproc", Json::Bool(true)),
@@ -491,6 +496,18 @@ pub(super) fn run_inproc(req: &Json) -> Json {
                 )),
             ),
         ]),
+        "edit" => {
+            if std::env::var("AGENT_CTX_INPROC").as_deref() == Ok("1") {
+                let svc = BrokerService::new_ephemeral_inproc(default_snapshot_path());
+                execute_request(&svc, req)
+            } else {
+                error_reply(
+                    "daemon_unavailable",
+                    "ctx daemon unreachable: refusing file write in stateless in-process fallback (set AGENT_CTX_INPROC=1 to override)",
+                    false,
+                )
+            }
+        }
         "status" => {
             let svc = BrokerService::new_ephemeral_inproc(default_snapshot_path());
             let mut st = op_status(&svc);

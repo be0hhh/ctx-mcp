@@ -1,7 +1,7 @@
-//! Metadata-only `0600` reboot snapshot (`ACTXSNP2`, format_tag=4, zero raw source).
+//! Metadata-only `0600` reboot snapshot (`ACTXSNP2`, format_tag=5, zero raw source).
 
 use super::{
-    now_ms, shard_idx_for, CachedFile, RamStore, MAX_SINGLE_FILE_CACHE_BYTES,
+    now_ms, shard_idx_for, CachedFile, RamStore, CLEANED_EVICTED_BIT, MAX_SINGLE_FILE_CACHE_BYTES,
     SNAPSHOT_DISK_CAP_BYTES,
 };
 use crate::base::security::{ensure_private_dir, write_private_0600};
@@ -10,11 +10,11 @@ use crate::parser::{SymbolKind, SymbolSpan};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"ACTXSNP2";
-pub const SNAPSHOT_FORMAT_TAG: u32 = 4;
+pub const SNAPSHOT_FORMAT_TAG: u32 = 5;
 
 impl RamStore {
     pub fn save_snapshot_if_dirty(&self, force: bool) -> Result<(), String> {
@@ -100,12 +100,14 @@ impl RamStore {
         if &raw[0..8] != SNAPSHOT_MAGIC {
             return Err("snapshot magic mismatch (expected ACTXSNP2)".to_string());
         }
-        let tag = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+        let tag = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
         if tag != SNAPSHOT_FORMAT_TAG {
             return Err("snapshot format mismatch".to_string());
         }
-        let count = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
-        let expected_sum = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+        let count = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as usize;
+        let expected_sum = u64::from_le_bytes([
+            raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+        ]);
         let body = &raw[24..];
         if fast_hash64(body) != expected_sum {
             return Err("snapshot checksum mismatch".to_string());
@@ -155,6 +157,7 @@ impl RamStore {
                         ctime_ns,
                         ino,
                         content_hash64,
+                        content_bloom: [0, 0],
                         path_id,
                         size_bytes,
                         line_count,
@@ -162,6 +165,8 @@ impl RamStore {
                         line_offsets: Box::new([]),
                         symbols: Arc::from(symbols),
                         content: None,
+                        cleaned_code: OnceLock::new(),
+                        cleaned_charge: AtomicU32::new(CLEANED_EVICTED_BIT),
                         last_access: AtomicU64::new(tick),
                     }),
                 );
@@ -189,12 +194,14 @@ pub fn verify_snapshot_metadata_only(path: &Path) -> Result<(u32, u64), String> 
     if &raw[0..8] != SNAPSHOT_MAGIC {
         return Err("snapshot magic is not ACTXSNP2".to_string());
     }
-    let tag = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    let tag = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
     if tag != SNAPSHOT_FORMAT_TAG {
         return Err(format!("unexpected snapshot format tag {}", tag));
     }
-    let count = u32::from_le_bytes(raw[12..16].try_into().unwrap());
-    let expected_sum = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    let count = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
+    let expected_sum = u64::from_le_bytes([
+        raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+    ]);
     if fast_hash64(&raw[24..]) != expected_sum {
         return Err("snapshot checksum mismatch".to_string());
     }
@@ -220,21 +227,32 @@ fn read_u8(buf: &[u8], cur: &mut usize) -> Result<u8, String> {
 
 #[inline]
 fn read_u32(buf: &[u8], cur: &mut usize) -> Result<u32, String> {
-    if *cur + 4 > buf.len() {
+    let i = *cur;
+    if i + 4 > buf.len() {
         return Err("truncated u32".to_string());
     }
-    let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
-    *cur += 4;
+    let v = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+    *cur = i + 4;
     Ok(v)
 }
 
 #[inline]
 fn read_u64(buf: &[u8], cur: &mut usize) -> Result<u64, String> {
-    if *cur + 8 > buf.len() {
+    let i = *cur;
+    if i + 8 > buf.len() {
         return Err("truncated u64".to_string());
     }
-    let v = u64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap());
-    *cur += 8;
+    let v = u64::from_le_bytes([
+        buf[i],
+        buf[i + 1],
+        buf[i + 2],
+        buf[i + 3],
+        buf[i + 4],
+        buf[i + 5],
+        buf[i + 6],
+        buf[i + 7],
+    ]);
+    *cur = i + 8;
     Ok(v)
 }
 

@@ -5,6 +5,7 @@ mod index;
 mod paths;
 mod session;
 mod snapshot;
+pub mod warm;
 
 pub use index::MissingResolution;
 pub use paths::{
@@ -12,21 +13,24 @@ pub use paths::{
     norm_key_from_canon, norm_path, resolve_input_path, restore_caller_path_style, runtime_dir,
     should_skip_dir,
 };
+#[allow(unused_imports)]
+pub use session::{DeltaHit, DuplicateHit, SessionReadStatus};
 pub use snapshot::verify_snapshot_metadata_only;
+pub use warm::{spawn_background_prewarm, PrewarmTracker};
 
-use crate::base::security::{is_sensitive_path, is_sensitive_path_lexical};
+use crate::base::security::{is_sensitive_path, is_sensitive_path_with_ws};
 use crate::base::simd::{
-    fast_hash64, line_slice_at, push_u32, push_usize, scan_source_bytes, CachePadded, FastHashMap,
-    ScanError,
+    fast_hash64, line_slice_at, push_u32, push_usize, scan_source_bytes,
+    trigram_bloom128_ascii_lower, CachePadded, FastHashMap, ScanError,
 };
-use crate::parser::{extract_symbols, SymbolSpan};
+use crate::parser::{build_cleaned_code_buffer_for_ext, extract_symbols, SymbolSpan};
 use index::WorkspaceIndexCache;
-use session::{DedupRing, SessionShardMap};
+use session::{DedupRing, DeltaSnapshotRing, SessionShardMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_SINGLE_FILE_CACHE_BYTES: usize = 1_048_576; // 1 MiB full-file read/cache ceiling
@@ -34,6 +38,7 @@ pub const HARD_RAM_CAP_BYTES: usize = 4usize << 30; // 4 GiB ceiling
 pub const SNAPSHOT_DISK_CAP_BYTES: usize = 64 << 20; // 64 MiB max metadata-only snapshot
 const SHARD_COUNT: usize = 64;
 const SHARD_MASK: usize = SHARD_COUNT - 1;
+pub(super) const CLEANED_EVICTED_BIT: u32 = 1u32 << 31;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,6 +75,7 @@ pub struct CachedFile {
     pub ctime_ns: u64,
     pub ino: u64,
     pub content_hash64: u64,
+    pub content_bloom: [u64; 2],
     pub path_id: PathId,
     pub size_bytes: u32,
     pub line_count: u32,
@@ -77,6 +83,8 @@ pub struct CachedFile {
     pub line_offsets: Box<[u32]>,
     pub symbols: Arc<[SymbolSpan]>,
     pub content: Option<Arc<str>>,
+    pub(super) cleaned_code: OnceLock<Arc<str>>,
+    pub(super) cleaned_charge: AtomicU32,
     pub last_access: AtomicU64,
 }
 
@@ -89,6 +97,7 @@ impl CachedFile {
             ctime_ns: self.ctime_ns,
             ino: self.ino,
             content_hash64: self.content_hash64,
+            content_bloom: [0, 0],
             path_id: self.path_id,
             size_bytes: self.size_bytes,
             line_count: self.line_count,
@@ -96,8 +105,50 @@ impl CachedFile {
             line_offsets: Box::new([]),
             symbols: Arc::clone(&self.symbols),
             content: None,
+            cleaned_code: OnceLock::new(),
+            cleaned_charge: AtomicU32::new(CLEANED_EVICTED_BIT),
             last_access: AtomicU64::new(self.last_access.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Lazily builds and caches the comment/string-blanked buffer once per file version in RAM.
+    /// Uses `cleaned_charge` with `CLEANED_EVICTED_BIT` so evicted entries never leak RAM accounting.
+    pub fn cleaned_code_for_ext(&self, ext: &str, store: &RamStore) -> Option<Arc<str>> {
+        if let Some(existing) = self.cleaned_code.get() {
+            return Some(Arc::clone(existing));
+        }
+        let text = self.content.as_deref()?;
+        let built: Arc<str> = Arc::from(build_cleaned_code_buffer_for_ext(text, ext));
+        if self.cleaned_code.set(Arc::clone(&built)).is_ok() {
+            let max_charge = (CLEANED_EVICTED_BIT - 1) as usize;
+            let len = built.len().min(max_charge) as u32;
+            if len > 0
+                && self
+                    .cleaned_charge
+                    .compare_exchange(0, len, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                store.used_ram_bytes.fetch_add(len as usize, Ordering::Relaxed);
+            }
+        }
+        Some(Arc::clone(self.cleaned_code.get().unwrap_or(&built)))
+    }
+
+    pub(super) fn release_total_charge(&self) -> usize {
+        let base = if self.content.is_some() {
+            self.ram_charge as usize
+        } else {
+            0
+        };
+        let prev = self
+            .cleaned_charge
+            .swap(CLEANED_EVICTED_BIT, Ordering::AcqRel);
+        let cleaned = if prev & CLEANED_EVICTED_BIT != 0 {
+            0
+        } else {
+            prev as usize
+        };
+        base.saturating_add(cleaned)
     }
 
     #[inline]
@@ -147,6 +198,7 @@ pub struct RamStore {
     inflight: Mutex<FastHashMap<Arc<str>, Arc<InflightSlot>>>,
     sessions: Box<[CachePadded<Mutex<SessionShardMap>>; SHARD_COUNT]>,
     dedup_ring: Mutex<DedupRing>,
+    delta_ring: Mutex<DeltaSnapshotRing>,
     ws_cache: Arc<WorkspaceIndexCache>,
     pub snapshot_path: PathBuf,
 }
@@ -165,29 +217,7 @@ pub fn now_ms_u64() -> u64 {
 }
 
 pub fn detect_ram_budget() -> usize {
-    if let Ok(val) = std::env::var("AGENT_CTX_MAX_RAM_MB") {
-        if let Ok(mb) = val.trim().parse::<usize>() {
-            if mb >= 16 {
-                return (mb << 20).min(HARD_RAM_CAP_BYTES);
-            }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-            for line in meminfo.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    let trimmed = rest.trim_start();
-                    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
-                    if let Ok(kb) = trimmed[..digits].parse::<usize>() {
-                        let half = (kb >> 1) << 10;
-                        return half.clamp(128 << 20, HARD_RAM_CAP_BYTES);
-                    }
-                }
-            }
-        }
-    }
-    HARD_RAM_CAP_BYTES
+    crate::base::platform::detect_ram_budget_bytes(HARD_RAM_CAP_BYTES)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,6 +300,7 @@ impl RamStore {
             inflight: Mutex::new(FastHashMap::default()),
             sessions,
             dedup_ring: Mutex::new(DedupRing::default()),
+            delta_ring: Mutex::new(DeltaSnapshotRing::default()),
             ws_cache: Arc::new(WorkspaceIndexCache::default()),
             snapshot_path,
         };
@@ -310,6 +341,14 @@ impl RamStore {
         }
     }
 
+    #[inline]
+    pub fn ram_usage_and_budget(&self) -> (usize, usize) {
+        (
+            self.used_ram_bytes.load(Ordering::Relaxed),
+            self.max_ram_bytes,
+        )
+    }
+
     pub fn cached_file_count(&self) -> usize {
         self.shards
             .iter()
@@ -335,8 +374,15 @@ impl RamStore {
                 g.clear();
             }
         }
+        if let Ok(mut dr) = self.delta_ring.lock() {
+            dr.clear();
+        }
         if let Ok(mut wi) = self.ws_cache.indices.write() {
             wi.clear();
+        }
+        if let Ok(mut p) = self.paths.write() {
+            p.to_id.clear();
+            p.from_id.clear();
         }
         self.used_ram_bytes.store(0, Ordering::Relaxed);
         let _ = fs::remove_file(&self.snapshot_path);
@@ -388,10 +434,12 @@ impl RamStore {
             if let Ok(mut guard) = self.shards[s_idx as usize].write() {
                 if let Some(existing) = guard.get(&key) {
                     if existing.content.is_some() && existing.ram_charge > 0 {
-                        let freed = existing.ram_charge as usize;
+                        let freed = existing.release_total_charge();
                         let stripped = Arc::new(existing.without_body());
                         guard.insert(key, stripped);
-                        self.sub_ram_bytes(freed);
+                        if freed > 0 {
+                            self.sub_ram_bytes(freed);
+                        }
                     }
                 }
             }
@@ -403,13 +451,42 @@ impl RamStore {
         let s_idx = shard_idx_for(&key);
         if let Ok(mut guard) = self.shards[s_idx].write() {
             if let Some(old) = guard.remove(key.as_str()) {
-                if old.content.is_some() && old.ram_charge > 0 {
-                    self.sub_ram_bytes(old.ram_charge as usize);
+                let freed = old.release_total_charge();
+                if freed > 0 {
+                    self.sub_ram_bytes(freed);
                 }
                 self.dirty_since_save.store(true, Ordering::Relaxed);
             }
         }
         self.invalidate_workspace_indices();
+    }
+
+    /// Refreshes an existing file's cached body, symbols, and `content_hash64` in RAM
+    /// without wiping the workspace directory index (`ws_cache`).
+    pub fn refresh_file_content(
+        &self,
+        canon_path: &Path,
+        ws_root: Option<&Path>,
+    ) -> Result<Arc<CachedFile>, String> {
+        let key = norm_key_from_canon(canon_path);
+        let s_idx = shard_idx_for(&key);
+        let old_entry = if let Ok(mut guard) = self.shards[s_idx].write() {
+            guard.remove(key.as_str()).inspect(|old| {
+                let freed = old.release_total_charge();
+                if freed > 0 {
+                    self.sub_ram_bytes(freed);
+                }
+                self.dirty_since_save.store(true, Ordering::Relaxed);
+            })
+        } else {
+            None
+        };
+        if let Some(old) = old_entry {
+            if let Some(ref content) = old.content {
+                self.snapshot_delta(old.path_id, old.content_hash64, content);
+            }
+        }
+        self.get_full_entry(canon_path, ws_root)
     }
 
     pub fn current_file_hash64(&self, path: &Path, ws_root: Option<&Path>) -> Option<u64> {
@@ -455,7 +532,7 @@ impl RamStore {
         ws_root: Option<&Path>,
         require_content: bool,
     ) -> Result<Arc<CachedFile>, String> {
-        if is_sensitive_path_lexical(canon_path) {
+        if is_sensitive_path_with_ws(canon_path, ws_root, false) {
             return Err(format!("refusing sensitive path: {}", canon_path.display()));
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -488,7 +565,9 @@ impl RamStore {
             }
             let (hit, previous) = cached(stamp)?;
             if hit {
-                return Ok(previous.expect("cache hit has an entry"));
+                if let Some(entry) = previous {
+                    return Ok(entry);
+                }
             }
 
             let mut loads = self
@@ -519,7 +598,9 @@ impl RamStore {
             // first cache lookup and acquisition of the load lock.
             let (hit, previous) = cached(stamp)?;
             if hit {
-                return Ok(previous.expect("cache hit has an entry"));
+                if let Some(entry) = previous {
+                    return Ok(entry);
+                }
             }
             let (path_id, key_arc) = match &previous {
                 Some(entry) => (entry.path_id, Arc::clone(&entry.norm_path)),
@@ -604,6 +685,7 @@ impl RamStore {
             _ => display_workspace_path(canon_path, ws_root).into_boxed_str(),
         };
 
+        let content_bloom = trigram_bloom128_ascii_lower(scanned.text.as_bytes());
         let new_entry = Arc::new(CachedFile {
             norm_path: Arc::clone(&key_arc),
             rel_path,
@@ -611,6 +693,7 @@ impl RamStore {
             ctime_ns: st.ctime_ns,
             ino: st.ino,
             content_hash64,
+            content_bloom,
             path_id,
             size_bytes: st.size_bytes as u32,
             line_count: scanned.line_count,
@@ -618,24 +701,36 @@ impl RamStore {
             line_offsets: scanned.line_offsets,
             symbols,
             content: Some(Arc::from(scanned.text)),
+            cleaned_code: OnceLock::new(),
+            cleaned_charge: AtomicU32::new(0),
             last_access: AtomicU64::new(self.next_tick()),
         });
 
         if file_stat(canon_path)? != st {
             return Ok(None);
         }
-        {
+        let replaced_old = {
             let mut guard = self.shards[shard_idx_for(&key_arc)]
                 .write()
                 .map_err(|_| "shard write poisoned".to_string())?;
-            if let Some(old) = guard.insert(key_arc, Arc::clone(&new_entry)) {
-                if old.content.is_some() && old.ram_charge > 0 {
-                    self.sub_ram_bytes(old.ram_charge as usize);
+            let old = guard.insert(key_arc, Arc::clone(&new_entry));
+            if let Some(ref old_entry) = old {
+                let freed = old_entry.release_total_charge();
+                if freed > 0 {
+                    self.sub_ram_bytes(freed);
                 }
             }
             self.used_ram_bytes
                 .fetch_add(charge_bytes, Ordering::Relaxed);
             self.dirty_since_save.store(true, Ordering::Relaxed);
+            old
+        };
+        if let Some(old) = replaced_old {
+            if old.content_hash64 != content_hash64 {
+                if let Some(ref content) = old.content {
+                    self.snapshot_delta(old.path_id, old.content_hash64, content);
+                }
+            }
         }
 
         Ok(Some(new_entry))

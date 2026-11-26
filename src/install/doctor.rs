@@ -5,8 +5,11 @@
 use super::configs::{
     check_agy_config_dir, check_codex_tool_config, detect_wsl_windows_gemini_dirs, TargetSet,
 };
+use super::update;
 use super::{effective_codex_home, effective_home_dir, load_saved_targets, target_ctx_bin};
+use crate::base::ext;
 use crate::base::json::Json;
+use crate::base::mode;
 use crate::base::security::find_superproject_root;
 use crate::mcp::{check_mcp_protocol, expected_tool_names};
 use crate::rpc::{
@@ -31,7 +34,11 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
         ]));
     };
 
-    // 1. Binary check
+    let flavor = ext::policy().build_flavor();
+    let write_mode = mode::current_write_mode(None);
+    let update_status = update::update_status_json();
+
+    // 1. Binary, build flavor, write mode, and cached update status
     if let Ok(home) = effective_home_dir() {
         let bin = target_ctx_bin(&home);
         if bin.is_file() {
@@ -49,6 +56,50 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
             record("binary", false, "ctx binary not found".to_string());
         }
     }
+    record(
+        "build_flavor",
+        true,
+        format!("{} (v{})", flavor, update::CURRENT_VERSION),
+    );
+    record(
+        "write_mode",
+        true,
+        format!(
+            "{} (source={})",
+            if write_mode.enabled { "write" } else { "read-only" },
+            write_mode.source.as_str()
+        ),
+    );
+    let update_detail = if update_status.get_bool("update_available") == Some(true) {
+        let latest = update_status.get_str("latest").unwrap_or("unknown");
+        let url = update_status.get_str("url").unwrap_or("");
+        if flavor == "upstream" {
+            format!(
+                "update available: v{} -> {} ({}) — run `ctx update`",
+                update::CURRENT_VERSION,
+                latest,
+                url
+            )
+        } else {
+            let hint = ext::policy().update_hint().unwrap_or("local rebuild");
+            format!(
+                "upstream {} released ({}); local {} build active — {}",
+                latest, url, flavor, hint
+            )
+        }
+    } else if let Some(latest) = update_status.get_str("latest").filter(|s| !s.is_empty()) {
+        format!(
+            "up to date (current=v{}, latest={})",
+            update::CURRENT_VERSION,
+            latest
+        )
+    } else {
+        format!(
+            "no cached release check (current=v{}, run `ctx update --check`)",
+            update::CURRENT_VERSION
+        )
+    };
+    record("update_check", true, update_detail);
 
     // 2. Daemon IPC + `0600` `daemon.json`
     let status_reply =
@@ -238,11 +289,13 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
 
         // Codex layers are checked when Codex is selected (or when `[mcp_servers.agent_ctx]` is present).
         let expected = expected_tool_names();
+        let write_enabled = write_mode.enabled;
         let global_codex_toml = codex_home.join("config.toml");
         let global_has_table = fs::read_to_string(&global_codex_toml)
             .is_ok_and(|s| s.contains("mcp_servers.agent_ctx"));
         if selected.codex || global_has_table {
-            let (ok, detail) = check_codex_tool_config(&global_codex_toml, &expected);
+            let (ok, detail) =
+                check_codex_tool_config(&global_codex_toml, &expected, write_enabled);
             record("codex_global_mcp_tools", ok, detail);
         }
         if let Some(path) = std::env::current_dir()
@@ -254,7 +307,7 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
             let proj_has_table =
                 fs::read_to_string(&path).is_ok_and(|s| s.contains("mcp_servers.agent_ctx"));
             if selected.codex || proj_has_table {
-                let (ok, detail) = check_codex_tool_config(&path, &expected);
+                let (ok, detail) = check_codex_tool_config(&path, &expected, write_enabled);
                 record("codex_project_mcp_tools", ok, detail);
             }
         }
@@ -263,6 +316,18 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
     if as_json {
         let report = Json::obj(vec![
             ("ok", Json::Bool(all_ok)),
+            ("build_flavor", Json::Str(flavor.to_string())),
+            (
+                "write_mode",
+                Json::obj(vec![
+                    ("enabled", Json::Bool(write_mode.enabled)),
+                    (
+                        "source",
+                        Json::Str(write_mode.source.as_str().to_string()),
+                    ),
+                ]),
+            ),
+            ("update_check", update_status),
             ("checks", Json::Arr(checks)),
         ]);
         println!("{}", report.to_json_string());

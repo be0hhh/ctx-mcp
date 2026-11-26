@@ -12,6 +12,7 @@ mod configs;
 mod doctor;
 mod plan;
 mod toml_cfg;
+pub mod update;
 
 pub use configs::{EagerMode, TargetSet};
 pub use doctor::run_doctor_cli;
@@ -216,6 +217,7 @@ fn open_interactive_tty() -> Option<(Box<dyn BufRead>, Box<dyn Write>)> {
 fn prompt_targets_interactive(
     home: &Path,
     codex_home: &Path,
+    eager_mode: EagerMode,
 ) -> Result<Option<TargetSet>, String> {
     let (agy_det, claude_det, codex_det) = scan_detected_harnesses(home, codex_home);
     let mut sel = recommended_default_targets(home, codex_home);
@@ -225,6 +227,8 @@ fn prompt_targets_interactive(
 
     let tag = |det: bool| if det { "[detected] " } else { "[not found]" };
     let mark = |on: bool| if on { "x" } else { " " };
+    let eager_count = eager_mode.eager_tool_names().len();
+    let eager_word = if eager_count == 1 { "tool" } else { "tools" };
     let mut line = String::new();
 
     loop {
@@ -232,9 +236,11 @@ fn prompt_targets_interactive(
         let _ = writeln!(writer, "  ctx-mcp setup — select AI harnesses to configure:");
         let _ = writeln!(
             writer,
-            "    [{}] 1. Antigravity (CLI, App 2.0 & IDE) {}  * Default (4 eager tools, -45% time, -38% new tokens)",
+            "    [{}] 1. Antigravity (CLI, App 2.0 & IDE) {}  * Default ({} eager {}, -45% time, -38% new tokens)",
             mark(sel.agy),
-            tag(agy_det)
+            tag(agy_det),
+            eager_count,
+            eager_word
         );
         let _ = writeln!(
             writer,
@@ -450,7 +456,7 @@ pub fn run_install_cli(args: &[String]) -> i32 {
     let targets = if let Some(t) = explicit_targets {
         t
     } else if interactive && !check_only {
-        match prompt_targets_interactive(&home, &codex_home) {
+        match prompt_targets_interactive(&home, &codex_home, eager_mode) {
             Ok(Some(chosen)) => chosen,
             Ok(None) => {
                 println!("ctx setup: cancelled (no changes written)");
@@ -623,6 +629,8 @@ pub fn run_uninstall_cli(args: &[String]) -> i32 {
         let _ = fs::remove_file(&ctx_bin);
         let _ = fs::remove_file(ctx_bin.with_file_name(".ctx.sha256"));
         let _ = fs::remove_file(&t_stamp);
+        crate::base::mode::remove_persisted_mode_file();
+        update::remove_update_state_file();
         if let Some(cache_dir) = default_snapshot_path().parent() {
             let _ = fs::remove_dir_all(cache_dir);
         }

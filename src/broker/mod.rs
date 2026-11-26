@@ -2,11 +2,14 @@
 //! and the shared Capsule registry.
 
 pub mod capsule;
+pub mod change_feed;
+pub mod pack;
 pub mod secret;
 
 pub use capsule::{
     key_in_assignment, CapsuleRegistry, ClaimError, HostContext, Recipient, WorkspaceMode,
 };
+pub use pack::PackStore;
 pub use secret::contains_known_secret;
 
 use crate::base::json::{self, Json, JsonKey};
@@ -17,6 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+const MAX_MEMO_WORKSPACES: usize = 64;
 const MAX_MEMOS_PER_WORKSPACE: usize = 256;
 const MAX_MEMO_SUMMARY_BYTES: usize = 4096;
 const MAX_MEMO_TOPIC_BYTES: usize = 128;
@@ -96,6 +100,8 @@ impl MemoBoard {
 
 pub struct ContextBroker {
     pub capsules: CapsuleRegistry,
+    pub changes: change_feed::ChangeFeed,
+    pub packs: PackStore,
     memos: RwLock<MemoBoard>,
     memo_path: Option<PathBuf>,
 }
@@ -111,6 +117,8 @@ impl ContextBroker {
         let loaded = MemoBoard::load(memo_path.as_deref());
         Self {
             capsules: CapsuleRegistry::default(),
+            changes: change_feed::ChangeFeed::new(),
+            packs: PackStore::default(),
             memos: RwLock::new(loaded),
             memo_path,
         }
@@ -123,6 +131,8 @@ impl ContextBroker {
             .map_err(|_| "memo board lock poisoned".to_string())?;
         self.commit_memos(&mut board, MemoMap::default())?;
         self.capsules.clear();
+        self.changes.clear_all();
+        self.packs.clear_all();
         Ok(())
     }
 
@@ -211,6 +221,15 @@ impl ContextBroker {
             .write()
             .map_err(|_| "memo board lock poisoned".to_string())?;
         let mut next = board.entries.clone();
+        if !next.contains_key(workspace_norm) && next.len() >= MAX_MEMO_WORKSPACES {
+            if let Some(oldest_ws) = next
+                .iter()
+                .min_by_key(|(_, list)| list.iter().map(|m| m.updated_ms).max().unwrap_or(0))
+                .map(|(k, _)| k.clone())
+            {
+                next.remove(&oldest_ws);
+            }
+        }
         let list = next.entry(workspace_norm.to_string()).or_default();
         list.retain(|m| m.is_visible(now) && m.topic != topic);
         if list.len() >= MAX_MEMOS_PER_WORKSPACE {

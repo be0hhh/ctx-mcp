@@ -17,19 +17,24 @@ use crate::base::json::{self, Json};
 use crate::base::security::{ensure_private_dir, write_private_0600, WorkspaceAllowlist};
 use crate::base::simd::CachePadded;
 use crate::broker::{ClaimError, ContextBroker, WorkspaceMode};
+use crate::edit::{impact::op_impact_with_git, op_edit_with_session, op_git};
 use crate::engine::{
-    cap_text, op_elf_audit, op_inspect, op_memo, op_outline, op_read_for_host, op_search,
-    op_search_batch, op_status, op_symbols, parse_shorthand_search_spec, SearchError,
-    SearchOptions, AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP, DEFAULT_INSPECT_MAX_BYTES,
-    DEFAULT_READ_MAX_BYTES,
+    cap_text, materialize_pack_for_workspace, op_elf_audit_with_baseline, op_inspect,
+    op_memo_full, op_outline, op_read_for_host, op_search, op_search_batch, op_status,
+    op_symbols_with_options, parse_shorthand_search_spec, SearchError, SearchOptions,
+    AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP, DEFAULT_READ_MAX_BYTES,
 };
 use crate::hooks::handle_hook;
-use crate::store::{now_ms_u64, resolve_input_path, runtime_dir, RamStore};
+use crate::store::{
+    now_ms_u64, resolve_input_path, runtime_dir, spawn_background_prewarm, PrewarmTracker,
+    RamStore,
+};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
@@ -119,6 +124,8 @@ pub struct BrokerService {
     pub broker: ContextBroker,
     pub allowlist: WorkspaceAllowlist,
     pub subproc_sem: SubprocSemaphore,
+    pub write_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    pub prewarm: Arc<PrewarmTracker>,
     pub last_active_ms: CachePadded<AtomicU64>,
     pub shutting_down: AtomicBool,
     pub is_daemon: bool,
@@ -132,10 +139,27 @@ impl BrokerService {
             broker: ContextBroker::new(Some(memo_path)),
             allowlist: WorkspaceAllowlist::new(),
             subproc_sem: SubprocSemaphore::new(MAX_CONCURRENT_SUBPROCS),
+            write_locks: Mutex::new(HashMap::new()),
+            prewarm: Arc::new(PrewarmTracker::default()),
             last_active_ms: CachePadded::new(AtomicU64::new(now_ms_u64())),
             shutting_down: AtomicBool::new(false),
             is_daemon,
         }
+    }
+
+    pub fn workspace_write_lock(&self, ws_root: &Path) -> Result<Arc<Mutex<()>>, String> {
+        let mut guard = self
+            .write_locks
+            .lock()
+            .map_err(|_| "workspace write lock map poisoned".to_string())?;
+        if guard.len() >= 64 && !guard.contains_key(ws_root) {
+            guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        Ok(Arc::clone(
+            guard
+                .entry(ws_root.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
     }
 
     pub fn new(snapshot_path: PathBuf) -> Self {
@@ -193,6 +217,9 @@ enum OpCode {
     Capsule = 11,
     ElfAudit = 12,
     Hook = 13,
+    Impact = 14,
+    Edit = 15,
+    Git = 16,
 }
 
 impl OpCode {
@@ -212,12 +239,27 @@ impl OpCode {
             "capsule" => Some(Self::Capsule),
             "elf_audit" => Some(Self::ElfAudit),
             "hook" => Some(Self::Hook),
+            "impact" => Some(Self::Impact),
+            "edit" => Some(Self::Edit),
+            "git" => Some(Self::Git),
             _ => None,
         }
     }
 }
 
 pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
+    execute_request_inner(svc, None, req)
+}
+
+pub fn execute_request_arc(svc: &Arc<BrokerService>, req: &Json) -> Json {
+    execute_request_inner(svc.as_ref(), Some(svc), req)
+}
+
+fn execute_request_inner(
+    svc: &BrokerService,
+    daemon_arc: Option<&Arc<BrokerService>>,
+    req: &Json,
+) -> Json {
     let now = now_ms_u64();
     if now.saturating_sub(svc.last_active_ms.load(Ordering::Relaxed)) >= 1_000 {
         svc.last_active_ms.store(now, Ordering::Relaxed);
@@ -235,12 +277,14 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         .as_ref()
         .map(|context| context.workspace.clone())
         .or_else(|| req.get_str("cwd").map(|s| resolve_input_path(s, None)));
+    let mut registered_ws: Option<PathBuf> = None;
     if let Some(ref c) = cwd {
         let explicit = context.is_none() && req.get_bool("explicit_root").unwrap_or(false);
         if let Some(ws_root) = svc.allowlist.register_hint(c, explicit) {
             if svc.is_daemon {
                 svc.store.prewarm_workspace_index_async(&ws_root);
             }
+            registered_ws = Some(ws_root);
         }
     }
     let scoped_session = context.as_ref().and_then(|context| context.identity());
@@ -256,7 +300,18 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
     };
 
     match opcode {
-        OpCode::Ping => Json::obj(vec![("ok", Json::Bool(true))]),
+        OpCode::Ping => {
+            if let (Some(svc_arc), Some(ws_root)) = (daemon_arc, registered_ws) {
+                if svc.is_daemon {
+                    spawn_background_prewarm(
+                        Arc::clone(svc_arc),
+                        ws_root,
+                        Arc::clone(&svc.prewarm),
+                    );
+                }
+            }
+            Json::obj(vec![("ok", Json::Bool(true))])
+        }
         OpCode::Status => Json::obj(vec![("ok", Json::Bool(true)), ("status", op_status(svc))]),
         OpCode::Clear => {
             if let Err(error) = svc.broker.clear_all() {
@@ -279,13 +334,9 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             let paths = str_vec(req.get("paths"));
             let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
                 || req.get_str("host") == Some("agy");
-            let explicit_max = req.get_usize("max_bytes").filter(|&v| v > 0);
-            let max_bytes = explicit_max.unwrap_or(if is_agy {
-                AGY_MCP_DEFAULT_MAX_BYTES
-            } else {
-                DEFAULT_READ_MAX_BYTES
-            });
+            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
             let force = req.get_bool("force").unwrap_or(false);
+            let hashes = req.get_bool("hashes").unwrap_or(false);
             let inline_cap = is_agy.then_some(AGY_MCP_INLINE_CAP);
             match op_read_for_host(
                 svc,
@@ -295,6 +346,7 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
                 session_key,
                 cwd.as_deref(),
                 inline_cap,
+                hashes,
             ) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
@@ -305,10 +357,7 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
                 || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(40);
-            let max_bytes = req
-                .get_usize("max_bytes")
-                .filter(|&v| v > 0)
-                .unwrap_or(if is_agy { AGY_MCP_DEFAULT_MAX_BYTES } else { 0 });
+            let max_bytes = effective_max_bytes(req, is_agy, 0);
             match op_outline(svc, &paths, max_files, max_bytes, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
@@ -319,14 +368,7 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
                 || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(80);
-            let max_bytes = req
-                .get_usize("max_bytes")
-                .filter(|&v| v > 0)
-                .unwrap_or(if is_agy {
-                    DEFAULT_INSPECT_MAX_BYTES
-                } else {
-                    DEFAULT_READ_MAX_BYTES
-                });
+            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
             let warn_lines = req.get_usize("warn_lines").unwrap_or(600);
             match op_inspect(svc, &paths, max_files, max_bytes, warn_lines, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -337,22 +379,28 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             let requests = str_vec(req.get("requests"));
             let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
                 || req.get_str("host") == Some("agy");
-            let max_bytes = req
-                .get_usize("max_bytes")
-                .filter(|&v| v > 0)
-                .unwrap_or(if is_agy {
-                    AGY_MCP_DEFAULT_MAX_BYTES
-                } else {
-                    DEFAULT_READ_MAX_BYTES
-                });
+            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
             let compact = req.get_bool("compact").unwrap_or(false);
-            match op_symbols(svc, &requests, max_bytes, compact, session_key, cwd.as_deref()) {
+            let hashes = req.get_bool("hashes").unwrap_or(false);
+            let raw = req.get_bool("raw").unwrap_or(false);
+            match op_symbols_with_options(
+                svc,
+                &requests,
+                max_bytes,
+                compact,
+                session_key,
+                cwd.as_deref(),
+                hashes,
+                raw,
+            ) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
             }
         }
         OpCode::Search => {
-            let options = SearchOptions::from_request(
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
+            let mut options = SearchOptions::from_request(
                 req,
                 if req.get("q").and_then(Json::as_arr).is_some() || req.get("queries").is_some() {
                     32
@@ -360,6 +408,9 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
                     40
                 },
             );
+            if is_agy {
+                options.max_bytes = options.max_bytes.min(AGY_MCP_DEFAULT_MAX_BYTES);
+            }
             let result = search_request(svc, req, options, cwd.as_deref());
             match result {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -383,17 +434,36 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         }
         OpCode::Memo => {
             let action = req.get_str("action").unwrap_or("list");
-            let topic = req.get_str("topic").unwrap_or("");
+            let since_buf;
+            let topic = if action == "changes" {
+                if let Some(seq) = req.get_i64("since_seq").filter(|&v| v >= 0) {
+                    since_buf = seq.to_string();
+                    since_buf.as_str()
+                } else {
+                    req.get_str("topic").unwrap_or("0")
+                }
+            } else {
+                req.get_str("topic").unwrap_or("")
+            };
             let summary = req.get_str("summary").unwrap_or("");
             let paths = str_vec(req.get("paths"));
-            match op_memo(
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
+            let force = req.get_bool("force").unwrap_or(false);
+            let raw = req.get_bool("raw").unwrap_or(false);
+            let max_bytes = effective_max_bytes(req, is_agy, 32_768);
+            match op_memo_full(
                 svc,
                 action,
                 topic,
                 summary,
                 req.get_str("kind"),
                 scoped_session.as_deref(),
+                session_key,
                 &paths,
+                force,
+                raw,
+                max_bytes,
                 cwd.as_deref(),
             ) {
                 Ok(Json::Obj(mut fields)) => {
@@ -416,10 +486,12 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
                 "prepare" => WorkspaceMode::parse(req.get_str("workspace").unwrap_or("inherit"))
                     .map_err(str::to_owned)
                     .and_then(|mode| {
-                        svc.broker.capsules.prepare(
+                        let pack_refs = str_vec(req.get("pack_refs"));
+                        svc.broker.capsules.prepare_with_packs(
                             context,
                             mode,
                             req.get_str("assignment").unwrap_or_default(),
+                            pack_refs,
                             None,
                             0,
                         )
@@ -427,9 +499,32 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
                 "claim" => match svc
                     .broker
                     .capsules
-                    .claim(context, req.get_str("key").unwrap_or_default())
+                    .claim_with_packs(context, req.get_str("key").unwrap_or_default())
                 {
-                    Ok(text) => Ok(text),
+                    Ok((mut text, pack_refs)) => {
+                        if !pack_refs.is_empty() {
+                            let ws_root = svc
+                                .allowlist
+                                .register_hint(&context.workspace, false)
+                                .unwrap_or_else(|| context.workspace.clone());
+                            let per_pack = if context.host == "agy" { 4096 } else { 16_384 };
+                            for pname in &pack_refs {
+                                if let Ok(rendered) = materialize_pack_for_workspace(
+                                    svc,
+                                    &ws_root,
+                                    pname,
+                                    session_key,
+                                    false,
+                                    false,
+                                    per_pack,
+                                ) {
+                                    text.push_str("\n\n");
+                                    text.push_str(&rendered);
+                                }
+                            }
+                        }
+                        Ok(text)
+                    }
                     Err(ClaimError::Pending) => {
                         return error_reply(
                             "capsule_pending",
@@ -451,7 +546,9 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         OpCode::ElfAudit => {
             let elf = req.get_str("elf_path").unwrap_or("");
             let asm = req.get_str("asm_path");
-            match op_elf_audit(svc, elf, asm, cwd.as_deref()) {
+            let base_elf = req.get_str("baseline_elf_path");
+            let base_asm = req.get_str("baseline_asm_path");
+            match op_elf_audit_with_baseline(svc, elf, asm, base_elf, base_asm, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
             }
@@ -462,6 +559,55 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
             let reply = handle_hook(svc, flavor, payload_str);
             Json::obj(vec![("ok", Json::Bool(true)), ("hook_reply", reply)])
         }
+        OpCode::Impact => {
+            let mut targets = str_vec(req.get("targets"));
+            if targets.is_empty() {
+                if let Some(single) = req.get_str("target") {
+                    if !single.trim().is_empty() {
+                        targets.push(single.to_string());
+                    }
+                }
+            }
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
+            let max_callers = req.get_usize("max_callers").unwrap_or(20);
+            let include_tests = req.get_bool("include_tests").unwrap_or(true);
+            let include_git_status = req.get_bool("include_git_status").unwrap_or(true);
+            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
+            match op_impact_with_git(
+                svc,
+                &targets,
+                max_callers,
+                include_tests,
+                max_bytes,
+                cwd.as_deref(),
+                include_git_status,
+            ) {
+                Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
+                Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
+            }
+        }
+        OpCode::Edit => match op_edit_with_session(svc, req, session_key, cwd.as_deref()) {
+            Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
+            Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
+        },
+        OpCode::Git => match op_git(svc, req, cwd.as_deref()) {
+            Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
+            Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
+        },
+    }
+}
+
+/// Hard-clamps Antigravity MCP responses to `AGY_MCP_DEFAULT_MAX_BYTES` (`<= 9 KB`) even when
+/// callers pass larger `max_bytes`, preventing blind middle-truncation by the host harness.
+fn effective_max_bytes(req: &Json, is_agy: bool, non_agy_default: usize) -> usize {
+    let explicit = req.get_usize("max_bytes").filter(|&v| v > 0);
+    if is_agy {
+        explicit
+            .map(|v| v.min(AGY_MCP_DEFAULT_MAX_BYTES))
+            .unwrap_or(AGY_MCP_DEFAULT_MAX_BYTES)
+    } else {
+        explicit.unwrap_or(non_agy_default)
     }
 }
 
@@ -497,12 +643,29 @@ fn search_request(
         return fail("use q or queries, not both");
     }
     if let Some(items) = queries.or_else(|| q.filter(|value| value.as_arr().is_some())) {
-        if query.is_some() || explicit_roots.is_some() {
+        if query.is_some() || (queries.is_some() && explicit_roots.is_some()) {
             return fail("use queries or single-search fields");
         }
         let Some(items) = items.as_arr() else {
             return fail("queries must be an array");
         };
+        if let Some(roots_arr) = explicit_roots.and_then(Json::as_arr).filter(|a| !a.is_empty()) {
+            let scoped: Vec<Json> = items
+                .iter()
+                .map(|item| {
+                    if let Some(spec) = item.as_str() {
+                        if matches!(parse_shorthand_search_spec(spec, false), Ok((_, ref r)) if r.is_empty()) {
+                            return Json::obj(vec![
+                                ("query", Json::Str(spec.to_string())),
+                                ("roots", Json::Arr(roots_arr.to_vec())),
+                            ]);
+                        }
+                    }
+                    item.clone()
+                })
+                .collect();
+            return op_search_batch(svc, &scoped, options, cwd);
+        }
         return op_search_batch(svc, items, options, cwd);
     }
 
@@ -512,7 +675,7 @@ fn search_request(
             return fail("use q or query, not both");
         }
         let Some(spec) = q.as_str() else {
-            return fail("q must be a string or array of 1–4 'root:query' strings");
+            return fail("q must be a string or array of 1–6 'root:query' strings");
         };
         let (query, shorthand_roots) = parse_shorthand_search_spec(spec, false)?;
         if !roots.is_empty() && !shorthand_roots.is_empty() {
@@ -683,6 +846,38 @@ mod tests {
         server.join().unwrap();
         assert_eq!(accepted.load(Ordering::Acquire), 1);
         assert_eq!(waiters.load(Ordering::Acquire), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_effective_max_bytes_hard_clamps_and_search_accepts_q_with_roots() {
+        let big = Json::obj(vec![("max_bytes", Json::Int(65_536))]);
+        let small = Json::obj(vec![("max_bytes", Json::Int(4_096))]);
+        let none = Json::obj(vec![]);
+        assert_eq!(effective_max_bytes(&big, true, DEFAULT_READ_MAX_BYTES), AGY_MCP_DEFAULT_MAX_BYTES);
+        assert_eq!(effective_max_bytes(&small, true, DEFAULT_READ_MAX_BYTES), 4_096);
+        assert_eq!(effective_max_bytes(&none, true, DEFAULT_READ_MAX_BYTES), AGY_MCP_DEFAULT_MAX_BYTES);
+        assert_eq!(effective_max_bytes(&big, false, DEFAULT_READ_MAX_BYTES), 65_536);
+        assert_eq!(effective_max_bytes(&none, false, DEFAULT_READ_MAX_BYTES), DEFAULT_READ_MAX_BYTES);
+
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-rpc-qroots-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.py"), "def alpha_tok():\n    return beta_tok\n").unwrap();
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        svc.allowlist.register_hint(&dir, true).unwrap();
+        let req = Json::obj(vec![
+            ("op", Json::Str("search".into())),
+            ("q", Json::Arr(vec![Json::Str("alpha_tok".into()), Json::Str("beta_tok".into())])),
+            ("roots", Json::Arr(vec![Json::Str("sub".into())])),
+        ]);
+        let opts = SearchOptions::from_request(&req, 32);
+        let out = search_request(&svc, &req, opts, Some(&dir)).unwrap();
+        assert!(out.contains("alpha_tok") && out.contains("beta_tok"), "out={out}");
         let _ = fs::remove_dir_all(&dir);
     }
 

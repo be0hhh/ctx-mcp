@@ -1,74 +1,74 @@
 //! Structural outline parsers for Python, Rust, Go, TypeScript/JS, Java, C#,
 //! Kotlin, Swift, Zig, Proto, and Shell.
 
-use super::clean::build_cleaned_code_buffer;
+use super::clean::{build_cleaned_code_buffer, build_cleaned_code_buffer_for_ext};
 use super::{compact_ws, is_ident_char, SymbolKind, SymbolSpan};
 use crate::base::simd::line_slice_at;
 
 pub(super) fn parse_python(text: &str, line_offsets: &[u32]) -> Vec<SymbolSpan> {
+    let cleaned = build_cleaned_code_buffer_for_ext(text, "py");
     let total_lines = line_offsets.len() as u32;
     let mut symbols: Vec<SymbolSpan> = Vec::new();
     let mut stack: Vec<(u32, u32)> = Vec::new();
     let mut last_nonempty_line = 0u32;
-    let mut in_triple: Option<&str> = None;
+    let mut paren_depth: i32 = 0;
 
     for line_no in 1..=total_lines {
         let raw = line_slice_at(text, line_offsets, line_no);
-        let trimmed = raw.trim();
+        let raw_trim = raw.trim();
+        let clean = line_slice_at(&cleaned, line_offsets, line_no);
+        let clean_trim = clean.trim();
 
-        if let Some(delim) = in_triple {
-            if trimmed.contains(delim) {
-                in_triple = None;
+        if clean_trim.is_empty() {
+            if !raw_trim.is_empty() && !raw_trim.starts_with('#') {
+                last_nonempty_line = line_no;
             }
-            last_nonempty_line = line_no;
-            continue;
-        }
-        for delim in &["\"\"\"", "'''"] {
-            if let Some(pos) = raw.find(delim) {
-                if raw[pos + 3..].find(delim).is_none() {
-                    in_triple = Some(delim);
-                    break;
-                }
-            }
-        }
-
-        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let indent = raw.bytes().take_while(|&b| b == b' ' || b == b'\t').count() as u32;
 
-        while let Some(&(top_indent, sym_idx)) = stack.last() {
-            if indent <= top_indent {
-                let sym = &mut symbols[sym_idx as usize];
-                sym.end_line = last_nonempty_line.max(sym.start_line);
-                stack.pop();
+        if paren_depth == 0 {
+            while let Some(&(top_indent, sym_idx)) = stack.last() {
+                if indent <= top_indent {
+                    let sym = &mut symbols[sym_idx as usize];
+                    sym.end_line = last_nonempty_line.max(sym.start_line);
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            let (kind, rest) = if let Some(r) = clean_trim.strip_prefix("class ") {
+                (Some(SymbolKind::Class), r)
+            } else if let Some(r) = clean_trim.strip_prefix("def ") {
+                (Some(SymbolKind::Def), r)
+            } else if let Some(r) = clean_trim.strip_prefix("async def ") {
+                (Some(SymbolKind::AsyncDef), r)
             } else {
-                break;
+                (None, "")
+            };
+
+            if let Some(k) = kind {
+                let name_len = rest.bytes().take_while(|&b| is_ident_char(b)).count();
+                if name_len > 0 {
+                    let sym_idx = symbols.len() as u32;
+                    symbols.push(SymbolSpan {
+                        kind: k,
+                        name: rest[..name_len].into(),
+                        signature: compact_ws(raw_trim, 110),
+                        start_line: line_no,
+                        end_line: line_no,
+                    });
+                    stack.push((indent, sym_idx));
+                }
             }
         }
 
-        let (kind, rest) = if let Some(r) = trimmed.strip_prefix("class ") {
-            (Some(SymbolKind::Class), r)
-        } else if let Some(r) = trimmed.strip_prefix("def ") {
-            (Some(SymbolKind::Def), r)
-        } else if let Some(r) = trimmed.strip_prefix("async def ") {
-            (Some(SymbolKind::AsyncDef), r)
-        } else {
-            (None, "")
-        };
-
-        if let Some(k) = kind {
-            let name_len = rest.bytes().take_while(|&b| is_ident_char(b)).count();
-            if name_len > 0 {
-                let sym_idx = symbols.len() as u32;
-                symbols.push(SymbolSpan {
-                    kind: k,
-                    name: rest[..name_len].into(),
-                    signature: compact_ws(trimmed, 110),
-                    start_line: line_no,
-                    end_line: line_no,
-                });
-                stack.push((indent, sym_idx));
+        for b in clean.bytes() {
+            match b {
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth = (paren_depth - 1).max(0),
+                _ => {}
             }
         }
         last_nonempty_line = line_no;
@@ -143,7 +143,7 @@ fn parse_ts_const_fn(trimmed: &str) -> Option<&str> {
 }
 
 pub(super) fn parse_brace_lang(text: &str, line_offsets: &[u32], ext: &str) -> Vec<SymbolSpan> {
-    let cleaned = build_cleaned_code_buffer(text);
+    let cleaned = build_cleaned_code_buffer_for_ext(text, ext);
     let total_lines = line_offsets.len() as u32;
     let mut symbols: Vec<SymbolSpan> = Vec::new();
     let mut stack: Vec<Option<u32>> = Vec::with_capacity(16);
