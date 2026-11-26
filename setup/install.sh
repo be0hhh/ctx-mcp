@@ -90,14 +90,14 @@ fi
 if [ "$BUILT" -eq 0 ]; then
   if [ -f "${LOCAL_MAIN:-}" ] && RUSTC_BIN="$(find_rustc)"; then
     printf 'Building ctx from local source (%s)...\n' "$RUSTC_BIN"
-    "$RUSTC_BIN" --edition 2021 -C opt-level=3 -C strip=symbols "$LOCAL_MAIN" -o "$CTX_TMP"
+    "$RUSTC_BIN" --edition 2021 -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 -C strip=symbols "$LOCAL_MAIN" -o "$CTX_TMP"
     chmod 0755 "$CTX_TMP"
     BUILT=1
   elif RUSTC_BIN="$(find_rustc)" && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
     printf 'No prebuilt release found for this platform; compiling from %s main...\n' "$REPO"
     curl -fsSL "https://codeload.github.com/${REPO}/tar.gz/refs/heads/main" | tar -xz -C "$TMP_DIR"
     SRC_MAIN="$(find "$TMP_DIR" -maxdepth 3 -path '*/src/main.rs' | head -n 1)"
-    "$RUSTC_BIN" --edition 2021 -C opt-level=3 -C strip=symbols "$SRC_MAIN" -o "$CTX_TMP"
+    "$RUSTC_BIN" --edition 2021 -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 -C strip=symbols "$SRC_MAIN" -o "$CTX_TMP"
     chmod 0755 "$CTX_TMP"
     BUILT=1
   fi

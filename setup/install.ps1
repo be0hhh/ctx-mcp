@@ -58,14 +58,14 @@ try {
         }
         if ($LocalMain -and (Test-Path $LocalMain)) {
             Write-Host "Building ctx.exe from local source..."
-            & $Rustc --edition 2021 -C opt-level=3 $LocalMain -o $CtxTmp
+            & $Rustc --edition 2021 -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 $LocalMain -o $CtxTmp
         } else {
             Write-Host "Downloading source archive from $Repo and compiling..."
             $ZipPath = Join-Path $TmpDir "src.zip"
             Invoke-WebRequest -UseBasicParsing -Uri "https://codeload.github.com/$Repo/zip/refs/heads/main" -OutFile $ZipPath
             Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
             $SrcMain = Get-ChildItem -Path $TmpDir -Recurse -Filter "main.rs" | Where-Object { $_.FullName -match "[\\/]src[\\/]main\.rs$" } | Select-Object -First 1 -ExpandProperty FullName
-            & $Rustc --edition 2021 -C opt-level=3 $SrcMain -o $CtxTmp
+            & $Rustc --edition 2021 -C opt-level=3 -C panic=abort -C lto=fat -C codegen-units=1 $SrcMain -o $CtxTmp
         }
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $CtxTmp)) {
             throw "rustc failed to build ctx.exe"

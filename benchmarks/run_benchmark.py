@@ -2,7 +2,7 @@
 """Reproducible `ctx-mcp` benchmark runner (synthetic 1-200 agent waves + optional live A/B).
 
 Zero external Python dependencies. Supports:
-  - `--synthetic-only`: runs `ctx bench --agents 1,10,50,100,200 --ops 25 --json`
+  - `--synthetic-only`: runs `ctx-bench waves --agents 1,10,50,100,200 --ops 25 --json`
   - `--tasks-json <path>`: runs parallel `direct` (rg) vs `ctx` (MCP) waves on Antigravity (`agy`)
     and/or Codex (`codex`) and emits a complete summary with absolute and percentage deltas.
 """
@@ -24,6 +24,15 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAIN_RS = REPO_ROOT / "src" / "main.rs"
+LIB_RS = REPO_ROOT / "src" / "lib.rs"
+BENCH_MAIN_RS = REPO_ROOT / "benchmarks" / "ctx_bench" / "main.rs"
+
+
+def _find_rustc() -> str:
+    rustc = shutil.which("rustc") or str(Path.home() / ".cargo" / "bin" / ("rustc.exe" if os.name == "nt" else "rustc"))
+    if not Path(rustc).is_file() and not shutil.which(rustc):
+        raise RuntimeError("`rustc` not found in PATH or ~/.cargo/bin")
+    return rustc
 
 
 def ensure_ctx_binary(explicit_bin: str | None, tmp_dir: Path) -> Path:
@@ -31,17 +40,53 @@ def ensure_ctx_binary(explicit_bin: str | None, tmp_dir: Path) -> Path:
         p = Path(explicit_bin).expanduser().resolve()
         if p.is_file():
             return p
+    local_rel = REPO_ROOT / "target" / "release" / ("ctx.exe" if os.name == "nt" else "ctx")
+    if local_rel.is_file():
+        return local_rel
     installed = Path.home() / ".local" / "bin" / ("ctx.exe" if os.name == "nt" else "ctx")
     if installed.is_file():
         return installed
     found_path = shutil.which("ctx")
     if found_path:
         return Path(found_path)
-    rustc = shutil.which("rustc") or str(Path.home() / ".cargo" / "bin" / ("rustc.exe" if os.name == "nt" else "rustc"))
-    if not Path(rustc).is_file() and not shutil.which(rustc):
-        raise RuntimeError("Neither `ctx` nor `rustc` found in PATH")
+    rustc = _find_rustc()
     out = tmp_dir / ("ctx.exe" if os.name == "nt" else "ctx")
     subprocess.run([rustc, "--edition", "2021", "-C", "opt-level=3", str(MAIN_RS), "-o", str(out)], check=True)
+    return out
+
+
+def ensure_ctx_bench_binary(explicit_bench: str | None, ctx_bin: Path, tmp_dir: Path) -> Path:
+    exe = "ctx-bench.exe" if os.name == "nt" else "ctx-bench"
+    if explicit_bench:
+        p = Path(explicit_bench).expanduser().resolve()
+        if p.is_file():
+            return p
+    sibling = ctx_bin.parent / exe
+    if sibling.is_file():
+        return sibling
+    local_rel = REPO_ROOT / "target" / "release" / exe
+    if local_rel.is_file():
+        return local_rel
+    cargo = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo"))
+    if (Path(cargo).is_file() or shutil.which(cargo)) and (REPO_ROOT / "Cargo.toml").is_file():
+        res = subprocess.run(
+            [cargo, "build", "--release", "--offline", "--manifest-path", str(REPO_ROOT / "Cargo.toml"), "--bin", "ctx-bench"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and local_rel.is_file():
+            return local_rel
+    rustc = _find_rustc()
+    rlib = tmp_dir / "libctx.rlib"
+    out = tmp_dir / exe
+    subprocess.run(
+        [rustc, "--crate-type", "lib", "--crate-name", "ctx", "--edition", "2021", "-C", "opt-level=3", str(LIB_RS), "-o", str(rlib)],
+        check=True,
+    )
+    subprocess.run(
+        [rustc, "--edition", "2021", "-C", "opt-level=3", "--extern", f"ctx={rlib}", str(BENCH_MAIN_RS), "-o", str(out)],
+        check=True,
+    )
     return out
 
 
@@ -49,8 +94,8 @@ def extract_citations(text: str, workspace: Path) -> set[tuple[str, int]]:
     refs: set[tuple[str, int]] = set()
     prefixes = (f"file://{workspace.as_posix()}/", f"{workspace.as_posix()}/", "./")
     for pat in (
-        r"((?:file://)?[\w./-]+\.(?:hpp|cpp|py|rs|ts|tsx|js|go|h|cc)):(\d+)",
-        r"((?:file://)?[\w./-]+\.(?:hpp|cpp|py|rs|ts|tsx|js|go|h|cc))#L(\d+)",
+        r"((?:file://)?[\w./-]+\.(?:hpp|ipp|cpp|cc|cxx|hh|hxx|h|c|py|rs|java|cs|ts|tsx|js|jsx|mjs|cjs|go|kt|swift|zig|sh|sql|proto|md|mdx|json|toml|yml|yaml)):(\d+)",
+        r"((?:file://)?[\w./-]+\.(?:hpp|ipp|cpp|cc|cxx|hh|hxx|h|c|py|rs|java|cs|ts|tsx|js|jsx|mjs|cjs|go|kt|swift|zig|sh|sql|proto|md|mdx|json|toml|yml|yaml))#L(\d+)",
     ):
         for m in re.finditer(pat, text):
             raw_p = m.group(1)
@@ -225,6 +270,8 @@ def summarize_pair(direct_rows: list[dict[str, Any]], ctx_rows: list[dict[str, A
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ctx-bin", default=None, help="Path to ctx binary")
+    ap.add_argument("--bench-bin", default=None, help="Path to ctx-bench binary")
+    ap.add_argument("--micro", action="store_true", help="Also run in-process hot-kernel microbenchmarks")
     ap.add_argument("--synthetic-only", action="store_true", help="Run only built-in synthetic multi-agent waves")
     ap.add_argument("--workspace", type=Path, default=Path.cwd(), help="Target repository for live tasks")
     ap.add_argument("--tasks-json", type=Path, default=None, help="JSON file defining benchmark tasks")
@@ -240,14 +287,24 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="ctx-mcp-bench-") as tmp:
         ctx_bin = ensure_ctx_binary(args.ctx_bin, Path(tmp))
-        micro_raw = subprocess.run(
-            [str(ctx_bin), "bench", "--agents", "1,10,50,100,200", "--ops", "25", "--json"],
+        bench_bin = ensure_ctx_bench_binary(args.bench_bin, ctx_bin, Path(tmp))
+        waves_raw = subprocess.run(
+            [str(bench_bin), "waves", "--ctx-bin", str(ctx_bin), "--agents", "1,10,50,100,200", "--ops", "25", "--json"],
             capture_output=True,
             text=True,
             check=True,
             timeout=120,
         ).stdout
-        report: dict[str, Any] = {"synthetic_waves": json.loads(micro_raw).get("waves", [])}
+        report: dict[str, Any] = {"synthetic_waves": json.loads(waves_raw).get("waves", [])}
+        if args.micro:
+            micro_raw = subprocess.run(
+                [str(bench_bin), "micro", "--iters", "200", "--json"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=120,
+            ).stdout
+            report["micro"] = json.loads(micro_raw)
         if args.synthetic_only or not args.tasks_json:
             print(json.dumps(report, indent=2))
             return 0

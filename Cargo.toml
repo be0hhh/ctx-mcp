@@ -1,10 +1,24 @@
 [package]
 name = "ctx"
-version = "2.3.3"
+version = "2.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/be0hhh/ctx-mcp"
 description = "Zero-dependency Rust in-RAM Context Broker, MCP server, CLI, interactive installer, and hook router for AI coding agents"
+
+[lib]
+name = "ctx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ctx"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "ctx-bench"
+path = "benchmarks/ctx_bench/main.rs"
+test = false
 
 [profile.release]
 opt-level = 3

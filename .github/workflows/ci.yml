@@ -18,18 +18,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binary & run Cargo unit tests
+      - name: Verify bare rustc single-command build (-D warnings)
+        shell: bash
         run: |
-          cargo build --release --locked || cargo build --release
+          OUT="tmp-rustc-ctx"
+          if [ "${RUNNER_OS:-}" = "Windows" ]; then
+            OUT="tmp-rustc-ctx.exe"
+          fi
+          rustc --edition 2021 -D warnings -O src/main.rs -o "$OUT"
+          "./$OUT" mcp --protocol-check
+          rm -f "$OUT"
+      - name: Build release binaries & run Cargo unit tests
+        run: |
+          cargo build --release --bins --locked || cargo build --release --bins
           cargo test --release --locked || cargo test --release
-      - name: Verify MCP protocol & isolated setup/uninstall
+      - name: Verify MCP protocol, benchmarks & isolated setup/uninstall
         shell: bash
         run: |
           BIN="target/release/ctx"
+          BENCH="target/release/ctx-bench"
           if [ -f "target/release/ctx.exe" ]; then
             BIN="target/release/ctx.exe"
+            BENCH="target/release/ctx-bench.exe"
           fi
           "$BIN" mcp --protocol-check
+          "$BENCH" waves --ctx-bin "$BIN" --agents 1,10 --ops 6 --json
+          "$BENCH" micro --iters 10 --json
           ROOT_DIR="$(pwd -W 2>/dev/null || pwd)"
           TMP_HOME="$ROOT_DIR/tmp-ci-home"
           mkdir -p "$TMP_HOME"
