@@ -1,8 +1,12 @@
 //! CTX unit tests. The test target compiles the production modules and attaches their private tests here.
 #![allow(dead_code)]
 
-#[path = "../src/hooks.rs"]
-mod hooks;
+mod hooks {
+    include!("../src/hooks.rs");
+    mod hook_tests {
+        include!("unit/hooks.rs");
+    }
+}
 #[path = "../src/json.rs"]
 mod json;
 #[path = "../src/parser.rs"]

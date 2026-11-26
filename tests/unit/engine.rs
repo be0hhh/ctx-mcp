@@ -214,3 +214,73 @@ fn rg_timeout_applies_with_silent_open_pipes() {
         Err(RgError::Timeout)
     ));
 }
+
+#[test]
+fn agy_inline_cap_skips_session_dedup_when_truncated_and_records_when_inline() {
+    let workspace = std::env::temp_dir().join(format!(
+        "ctx-agy-dedup-{}-{}",
+        std::process::id(),
+        crate::store::now_ms_u64()
+    ));
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("small.cpp"), "int small_ok = 1;\n").unwrap();
+    let big_body = (1..=320).map(|i| format!("int big_line_{i:03} = {i}; // padding_0123456789_abcdef\n")).collect::<String>();
+    fs::write(workspace.join("large.cpp"), &big_body).unwrap();
+    let svc = BrokerService::new_ephemeral_inproc(workspace.join("snapshot"));
+    svc.allowlist.register_hint(&workspace, true).unwrap();
+
+    // 1. Oversized AGY read (> AGY_MCP_INLINE_CAP) must NOT poison SessionState with ALREADY IN CONTEXT
+    let oversized = op_read_for_host(
+        &svc,
+        &["small.cpp".into(), "large.cpp".into()],
+        16_384,
+        false,
+        Some("agy-sess-1"),
+        Some(&workspace),
+        Some(AGY_MCP_INLINE_CAP),
+    )
+    .unwrap();
+    assert!(oversized.len() > AGY_MCP_INLINE_CAP);
+
+    let re_read = op_read_for_host(
+        &svc,
+        &["small.cpp".into()],
+        AGY_MCP_DEFAULT_MAX_BYTES,
+        false,
+        Some("agy-sess-1"),
+        Some(&workspace),
+        Some(AGY_MCP_INLINE_CAP),
+    )
+    .unwrap();
+    assert!(re_read.contains("small_ok = 1;"));
+    assert!(!re_read.contains("ALREADY IN CONTEXT"));
+
+    // 2. Now that `small.cpp` fit inline (<= AGY_MCP_INLINE_CAP), the next identical read deduplicates cleanly
+    let dedup = op_read_for_host(
+        &svc,
+        &["small.cpp".into()],
+        AGY_MCP_DEFAULT_MAX_BYTES,
+        false,
+        Some("agy-sess-1"),
+        Some(&workspace),
+        Some(AGY_MCP_INLINE_CAP),
+    )
+    .unwrap();
+    assert!(dedup.contains("ALREADY IN CONTEXT"));
+
+    // 3. Default AGY cap note recommends parallel native read_file
+    let capped = op_read_for_host(
+        &svc,
+        &["large.cpp".into()],
+        AGY_MCP_DEFAULT_MAX_BYTES,
+        true,
+        Some("agy-sess-2"),
+        Some(&workspace),
+        Some(AGY_MCP_INLINE_CAP),
+    )
+    .unwrap();
+    assert!(capped.len() <= AGY_MCP_INLINE_CAP);
+    assert!(capped.contains("read_file"));
+
+    fs::remove_dir_all(&workspace).unwrap();
+}

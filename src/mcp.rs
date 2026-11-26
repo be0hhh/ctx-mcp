@@ -2,7 +2,6 @@
 //! over newline-delimited frames (`2024-11-05`, `2025-03-26`, `2025-06-18`).
 //! The published tool inventory is checked against `mcp_tools.json`.
 
-use crate::engine::DEFAULT_READ_MAX_BYTES;
 use crate::json::{self, Json};
 use crate::protocol::{call_daemon_or_inproc, workspace_cwd_str};
 use std::io::{self, BufRead, Write};
@@ -23,6 +22,7 @@ pub fn run_mcp_stdio(repo_root: Option<&Path>) -> i32 {
     let dedicated = std::env::var("AGENT_CTX_DEDICATED_STDIO").ok().as_deref() == Some("1");
     let session = dedicated.then(crate::security::generate_csprng_token)
         .and_then(Result::ok).map(|key| format!("mcp:stdio:{key}"));
+    let mut host_hint = std::env::var("AGENT_CTX_HOST").ok().filter(|s| !s.is_empty());
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -54,29 +54,53 @@ pub fn run_mcp_stdio(repo_root: Option<&Path>) -> i32 {
                 continue;
             }
         };
-        if parsed.get_str("method") == Some("initialize")
-            && std::env::var("AGENT_CTX_INPROC").as_deref() != Ok("1")
-        {
-            let warm_cwd = workspace_cwd_str(repo_root);
-            let explicit = repo_root.is_some();
-            let _ = std::thread::Builder::new()
-                .name("ctx-mcp-warm".into())
-                .spawn(move || {
-                    let _ = call_daemon_or_inproc(Json::obj(vec![
-                        ("op", Json::Str("ping".to_string())),
-                        ("cwd", Json::Str(warm_cwd)),
-                        ("explicit_root", Json::Bool(explicit)),
-                    ]));
-                });
+        if parsed.get_str("method") == Some("initialize") {
+            if host_hint.is_none() {
+                if let Some(name) = parsed
+                    .get("params")
+                    .and_then(|p| p.get("clientInfo"))
+                    .and_then(|c| c.get_str("name"))
+                {
+                    let lower = name.to_ascii_lowercase();
+                    if lower.contains("antigravity")
+                        || lower.contains("agy")
+                        || lower.contains("gemini")
+                        || lower.contains("cascade")
+                        || lower.contains("jetski")
+                    {
+                        host_hint = Some("agy".to_string());
+                    }
+                }
+            }
+            if std::env::var("AGENT_CTX_INPROC").as_deref() != Ok("1") {
+                let warm_cwd = workspace_cwd_str(repo_root);
+                let explicit = repo_root.is_some();
+                let _ = std::thread::Builder::new()
+                    .name("ctx-mcp-warm".into())
+                    .spawn(move || {
+                        let _ = call_daemon_or_inproc(Json::obj(vec![
+                            ("op", Json::Str("ping".to_string())),
+                            ("cwd", Json::Str(warm_cwd)),
+                            ("explicit_root", Json::Bool(explicit)),
+                        ]));
+                    });
+            }
         }
-        if let Some(reply) = handle_mcp_message_scoped(&parsed, repo_root, session.as_deref()) {
+        if let Some(reply) =
+            handle_mcp_message_scoped(&parsed, repo_root, session.as_deref(), host_hint.as_deref())
+        {
             let _ = writeln!(stdout, "{}", reply.to_json_string());
             let _ = stdout.flush();
         }
     }
 }
 
-fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Option<&str>) -> Option<Json> {
+fn handle_mcp_message_scoped(
+    msg: &Json,
+    repo_root: Option<&Path>,
+    session: Option<&str>,
+    host_hint: Option<&str>,
+) -> Option<Json> {
     if msg.get_str("jsonrpc") != Some("2.0") {
         return Some(rpc_error(Json::Null, -32600, "invalid JSON-RPC envelope"));
     }
@@ -113,7 +137,7 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
                         "serverInfo",
                         Json::obj(vec![
                             ("name", Json::Str("agent_ctx".to_string())),
-                            ("version", Json::Str("2.3.1".to_string())),
+                            ("version", Json::Str("2.3.3".to_string())),
                         ]),
                     ),
                     (
@@ -155,7 +179,7 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
                 return Some(rpc_error(req_id, -32602, "missing tool name"));
             };
             let args = params.get("arguments").unwrap_or(&empty_obj);
-            Some(rpc_result(req_id, invoke_mcp_tool(name, args, repo_root, session)))
+            Some(rpc_result(req_id, invoke_mcp_tool(name, args, repo_root, session, host_hint)))
         }
         _ => Some(rpc_error(
             req_id,
@@ -165,7 +189,13 @@ fn handle_mcp_message_scoped(msg: &Json, repo_root: Option<&Path>, session: Opti
     }
 }
 
-fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: Option<&str>) -> Json {
+fn invoke_mcp_tool(
+    name: &str,
+    args: &Json,
+    repo_root: Option<&Path>,
+    session: Option<&str>,
+    host_hint: Option<&str>,
+) -> Json {
     let cwd = workspace_cwd_str(repo_root);
     let explicit_root = repo_root.is_some();
     let mcp_session = session.unwrap_or_default().to_string();
@@ -182,7 +212,7 @@ fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: O
             ),
             (
                 "max_bytes",
-                Json::Int(args.get_i64("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES as i64)),
+                Json::Int(args.get_i64("max_bytes").unwrap_or(0)),
             ),
             ("force", Json::Bool(args.get_bool("force").unwrap_or(false))),
         ]),
@@ -217,7 +247,7 @@ fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: O
             ),
             (
                 "max_bytes",
-                Json::Int(args.get_i64("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES as i64)),
+                Json::Int(args.get_i64("max_bytes").unwrap_or(0)),
             ),
             (
                 "warn_lines",
@@ -238,7 +268,7 @@ fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: O
             ),
             (
                 "max_bytes",
-                Json::Int(args.get_i64("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES as i64)),
+                Json::Int(args.get_i64("max_bytes").unwrap_or(0)),
             ),
         ]),
         "ctx_search" => {
@@ -304,6 +334,9 @@ fn invoke_mcp_tool(name: &str, args: &Json, repo_root: Option<&Path>, session: O
 
     if let (Some(ticket), Json::Obj(fields)) = (args.get_str("ctx_context"), &mut rpc_req) {
         fields.push(("ctx_context".into(), Json::Str(ticket.into())));
+    }
+    if let (Some(host), Json::Obj(fields)) = (host_hint, &mut rpc_req) {
+        fields.push(("host".into(), Json::Str(host.into())));
     }
     let reply = call_daemon_or_inproc(rpc_req);
     if reply.get_bool("ok") == Some(true) {
@@ -704,7 +737,7 @@ pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
         ("method", Json::Str("resources/list".to_string())),
         ("params", Json::Obj(Vec::new())),
     ]);
-    let reply = handle_mcp_message_scoped(&init, repo_root, None).ok_or("initialize did not reply")?;
+    let reply = handle_mcp_message_scoped(&init, repo_root, None, None).ok_or("initialize did not reply")?;
     if reply.get("result").and_then(|r| r.get_str("protocolVersion")) != Some(DEFAULT_WIRE_VER) {
         return Err("initialize did not return the default protocol version".into());
     }
@@ -716,7 +749,7 @@ pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
     {
         return Err("initialize did not advertise resources capability".into());
     }
-    let reply = handle_mcp_message_scoped(&list, repo_root, None).ok_or("tools/list did not reply")?;
+    let reply = handle_mcp_message_scoped(&list, repo_root, None, None).ok_or("tools/list did not reply")?;
     let mut actual: Vec<_> = reply.get("result")
         .and_then(|r| r.get("tools"))
         .and_then(Json::as_arr)
@@ -729,7 +762,7 @@ pub fn check_mcp_protocol(repo_root: Option<&Path>) -> Result<usize, String> {
     if !actual.iter().copied().eq(expected.iter().map(String::as_str)) {
         return Err(format!("tools/list mismatch: expected {expected:?}, got {actual:?}"));
     }
-    let r_reply = handle_mcp_message_scoped(&res_list, repo_root, None).ok_or("resources/list did not reply")?;
+    let r_reply = handle_mcp_message_scoped(&res_list, repo_root, None, None).ok_or("resources/list did not reply")?;
     let uris: Vec<_> = r_reply
         .get("result")
         .and_then(|r| r.get("resources"))

@@ -27,6 +27,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_READ_MAX_BYTES: usize = 1_048_576; // 1 MiB
+pub const DEFAULT_INSPECT_MAX_BYTES: usize = 9_000; // Fits under Antigravity's ~10 KB MCP inline cap
+pub const AGY_MCP_DEFAULT_MAX_BYTES: usize = 9_000;
+pub const AGY_MCP_INLINE_CAP: usize = 9_200;
 
 pub fn parse_path_slice_spec(spec: &str) -> (&str, Option<(usize, usize)>) {
     let trimmed = spec.trim();
@@ -50,13 +53,14 @@ pub fn parse_path_slice_spec(spec: &str) -> (&str, Option<(usize, usize)>) {
     (trimmed, None)
 }
 
-pub fn op_read(
+pub fn op_read_for_host(
     svc: &BrokerService,
     specs: &[String],
     max_bytes: usize,
     force: bool,
     session_key: Option<&str>,
     cwd: Option<&Path>,
+    inline_dedup_cap: Option<usize>,
 ) -> Result<String, String> {
     if specs.is_empty() {
         return Err("provide at least one file path".to_string());
@@ -64,6 +68,7 @@ pub fn op_read(
     let budget = max_bytes.clamp(1024, DEFAULT_READ_MAX_BYTES << 1);
     let mut out = String::new();
     let mut any_ok = false;
+    let mut pending_reads: Vec<(PathBuf, PathBuf, usize, usize)> = Vec::new();
 
     for (index, spec) in specs.iter().enumerate() {
         let (raw_p, slice) = parse_path_slice_spec(spec);
@@ -189,11 +194,18 @@ pub fn op_read(
                     None => (1, total),
                 };
 
-                let cap_note = format!(
-                    "... [output capped at {budget} bytes; {} later paths left unread]\n",
-                    specs.len() - index - 1
-                );
-                let content_limit = budget - cap_note.len() - 1;
+                let cap_note = if inline_dedup_cap.is_some() {
+                    format!(
+                        "... [AGY inline cap {budget}B reached; {} later paths unread — prefer parallel native read_file (<=800L/46KB inline) for full files, or ctx_read path:start-end slices for >800L]\n",
+                        specs.len() - index - 1
+                    )
+                } else {
+                    format!(
+                        "... [output capped at {budget} bytes; {} later paths left unread]\n",
+                        specs.len() - index - 1
+                    )
+                };
+                let content_limit = budget.saturating_sub(cap_note.len() + 1);
                 let approx_cap = (entry.size_bytes as usize + (e - s + 2) * 8).min(budget);
                 let mut section = String::with_capacity(approx_cap.max(128));
                 section.push_str("=== ");
@@ -209,10 +221,17 @@ pub fn op_read(
                 section.push_str("B) ===\n");
 
                 if out.len() + section.len() > content_limit {
-                    out.push_str(&format!(
-                        "... [output capped at {budget} bytes; {} paths left unread]\n",
-                        specs.len() - index
-                    ));
+                    if inline_dedup_cap.is_some() {
+                        out.push_str(&format!(
+                            "... [AGY inline cap {budget}B reached; {} paths unread — prefer parallel native read_file (<=800L/46KB inline) for full files, or ctx_read path:start-end slices for >800L]\n",
+                            specs.len() - index
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "... [output capped at {budget} bytes; {} paths left unread]\n",
+                            specs.len() - index
+                        ));
+                    }
                     break;
                 }
                 let mut actual_end = None;
@@ -237,9 +256,8 @@ pub fn op_read(
                 }
                 section.push('\n');
                 out.push_str(&section);
-                if let (Some(sk), Some(actual_end)) = (session_key, actual_end) {
-                    svc.store
-                        .record_read(sk, &canon, Some(&ws_root), s, actual_end);
+                if let Some(actual_end) = actual_end {
+                    pending_reads.push((canon.clone(), ws_root.clone(), s, actual_end));
                 }
                 if clipped {
                     break;
@@ -256,6 +274,15 @@ pub fn op_read(
     }
     if !any_ok {
         return Err(out.trim().to_string());
+    }
+    // Never mark files as ALREADY IN CONTEXT when the host client will middle-truncate the payload.
+    let safe_to_record = inline_dedup_cap.map_or(true, |cap| out.len() <= cap);
+    if safe_to_record {
+        if let Some(sk) = session_key {
+            for (canon, ws_root, s, actual_end) in pending_reads {
+                svc.store.record_read(sk, &canon, Some(&ws_root), s, actual_end);
+            }
+        }
     }
     Ok(out)
 }

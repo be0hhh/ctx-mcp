@@ -29,13 +29,13 @@ const GLOBAL_BLOCK_END: &str = "<!-- END AGENT_CTX GLOBAL RULES -->";
 const GLOBAL_RULES_SNIPPET: &str = "<!-- BEGIN AGENT_CTX GLOBAL RULES -->\n\
 ## In-RAM Context Broker (`ctx` / MCP `agent_ctx`)\n\
 \n\
-- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_capsule`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
+- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
   - Parallel search (`1-4` queries in `q`, `8 KiB` cap; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
-  - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
+  - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols, `9 KB` inline default): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
   - Exact struct/function bodies: `ctx_symbols` with `{\"requests\": [\"ModOrPath#Symbol\"], \"compact\": true}` (CLI: `ctx sym \"Mod#Sym\" --compact`).\n\
-  - Full files or slices (`<=1 MiB`, no 800-line cap): `ctx_read` with `{\"paths\": [\"path\" | \"path:1-250\"]}` (CLI: `ctx read <paths...>`).\n\
+  - Full files / slices: in Antigravity prefer parallel native `read_file` (`<=800L` / `46 KB` inline, zero MCP truncation) for full files, and `ctx_read` for `>800L` slices (`path:start-end`) or small batches (`<=9 KB`); in Codex/CLI batch full files in `ctx_read` / `ctx read` up to `1 MiB`.\n\
   - Shared workspace findings board: `ctx_memo` with `{\"action\": \"list\" | \"put\", \"topic\": \"...\", \"summary\": \"...\", \"paths\": [...]}`.\n\
-- Reuse `[RAM-Ctx Startup]` when provided. Batch known paths into a single `ctx_inspect`, `ctx_read`, or `ctx_symbols` call (`1 MiB` default budget per batch), finish directly from grouped search hits or compact symbols when sufficient, and never slice files in `100-400` line shell loops (`sed`/`head`/`nl`) or re-read unchanged files already in context.\n\
+- Reuse `[RAM-Ctx Startup]` when provided. Finish directly from grouped search hits or compact symbols when sufficient; in Antigravity swarm workers without MCP use the `ctx` CLI directly. Never slice files in `100-400` line shell loops (`sed`/`head`/`nl`) or re-read unchanged files already in context.\n\
 <!-- END AGENT_CTX GLOBAL RULES -->";
 
 fn effective_home_dir() -> Result<PathBuf, String> {
@@ -341,7 +341,6 @@ pub const AGY_CORE_EAGER_TOOLS: &[&str] = &[
     "ctx_inspect",
     "ctx_read",
     "ctx_symbols",
-    "ctx_capsule",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,7 +398,7 @@ fn build_agy_context_hook_cfg_cmd(cmd_str: String) -> Json {
                 (
                     "matcher",
                     Json::Str(
-                        "^(read_file|view_file|run_command|swarm|invoke_subagent|call_mcp_tool|mcp_{1,2}agent_ctx_{1,2}ctx_.*)$".to_string(),
+                        "^(read_file|view_file|run_command|call_mcp_tool|mcp_{1,2}agent_ctx_{1,2}ctx_(read|symbols|memo|capsule))$".to_string(),
                     ),
                 ),
                 ("hooks", Json::Arr(vec![hook_cmd.clone()])),
@@ -477,6 +476,13 @@ fn apply_agy_eager_tools(
     } else {
         existing_tools
     };
+    if !force_override && mode == EagerMode::Core {
+        merged.retain(|(k, v)| {
+            !(k == "ctx_capsule"
+                && v.as_obj()
+                    .is_some_and(|o| o.len() == 1 && o[0].0 == "eager" && o[0].1.as_bool() == Some(true)))
+        });
+    }
     for tool_name in desired_names {
         if force_override || !merged.iter().any(|(k, _)| k == &tool_name) {
             upsert_obj_field(
@@ -525,6 +531,14 @@ fn plan_mcp_custom(
         Json::Arr(args_vec.into_iter().map(Json::Str).collect()),
     );
     if let Some((mode, force)) = agy_eager {
+        let mut env_fields = entry
+            .iter()
+            .find(|(k, _)| k == "env")
+            .and_then(|(_, v)| v.as_obj())
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        upsert_obj_field(&mut env_fields, "AGENT_CTX_HOST", Json::Str("agy".into()));
+        upsert_obj_field(&mut entry, "env", Json::Obj(env_fields));
         apply_agy_eager_tools(&mut entry, mode, force, path)?;
     }
     upsert_obj_field(&mut servers, "agent_ctx", Json::Obj(entry));
@@ -839,6 +853,9 @@ fn owned_handler(item: &Json, flavor: &str, guard: Option<&str>) -> bool {
             }
         }
     }
+    if flavor == "codex" && cmd.contains("codex_subagent_guard.py") {
+        return true;
+    }
     guard == Some(cmd)
 }
 
@@ -890,8 +907,8 @@ fn plan_hooks_with_cmd(
     } else {
         let events: &[(&str, Option<&str>)] = if flavor == "codex" {
             &[("SessionStart", Some("^(compact|clear)$")), ("SubagentStart", None),
-              ("PreToolUse", Some("^(spawn_agent|Agent|exec|exec_command|Bash|shell|mcp__agent_ctx__ctx_.*)$")),
-              ("PostToolUse", Some("^(spawn_agent|Agent|apply_patch|exec|exec_command|Bash|shell)$"))]
+              ("PreToolUse", Some("^(exec|exec_command|Bash|shell|mcp__agent_ctx__ctx_(read|symbols|memo|capsule))$")),
+              ("PostToolUse", Some("^(apply_patch|exec|exec_command|Bash|shell)$"))]
         } else {
             &[("SubagentStart", None), ("PreCompact", None), ("PreToolUse", Some("Agent|Task|Read|Bash|mcp__agent_ctx__ctx_.*")),
               ("PostToolUse", Some("Agent|Task|Read|Edit|MultiEdit|Write|Bash"))]
@@ -1208,7 +1225,7 @@ fn prompt_targets_interactive(home: &Path, codex_home: &Path) -> Result<Option<T
         let _ = writeln!(writer, "  ctx-mcp setup — select AI harnesses to configure:");
         let _ = writeln!(
             writer,
-            "    [{}] 1. Antigravity (CLI, App 2.0 & IDE) {}  * Default (5 eager tools, -45% time, -38% new tokens)",
+            "    [{}] 1. Antigravity (CLI, App 2.0 & IDE) {}  * Default (4 eager tools, -45% time, -38% new tokens)",
             mark(sel.agy),
             tag(agy_det)
         );
@@ -1526,23 +1543,11 @@ fn prepare_install(
     let mut plan = InstallPlan::default();
     plan_binary(&mut plan, bin)?;
     let agy = home.join(".gemini/config");
-    let mut guard_cmd = None;
+    let guard_cmd: Option<String> = None;
     if let Some(repo) = repo {
+        // Project-local `.codex/hooks.json` is the single owner of `CodexSubagentGuardHook.py`
+        // so it always reads the live repo `AgentRouting.json` without duplicate global execution.
         plan_cxet_python(&mut plan, repo, home, codex)?;
-        let src = repo.join("agents/hooks/CodexSubagentGuardHook.py");
-        let bytes = fs::read(&src).map_err(|e| format!("{}: {}", src.display(), e))?;
-        let dest = codex.join("hooks/codex_subagent_guard.py");
-        if let Some(old) = plan.target(&dest)?.content() {
-            if old != bytes && !old.starts_with(b"#!/usr/bin/env python3\n\"\"\"Codex CLI subagent model/effort/capsule guard hook") {
-                return Err(format!("unmanaged guard {}", dest.display()));
-            }
-        }
-        plan.set(&dest, bytes, Some(0o755))?;
-        let policy_src = repo.join("agents/routing/AgentRouting.json");
-        let policy = fs::read(&policy_src).map_err(|e| format!("{}: {e}", policy_src.display()))?;
-        plan.set(&dest.with_file_name("AgentRouting.json"), policy, Some(0o644))?;
-        let py = if cfg!(windows) { "python" } else { "python3" };
-        guard_cmd = Some(format!("{} -B \"{}\"", py, dest.display()));
     } else {
         if targets.agy {
             plan_mcp(&mut plan, &agy.join("mcp_config.json"), bin, false, Some(eager))?;

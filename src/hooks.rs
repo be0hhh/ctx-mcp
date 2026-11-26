@@ -1,11 +1,11 @@
-//! Sub-millisecond lifecycle hook router (`ctx hook <agy|codex|claude>`):
-//!   - Strict per-agent isolation (`agy:{conversationId}`, `codex:{session_id}:{agent_id}`,
-//!     `claude:{session_id}:{agent_id}`).
-//!   - Addressed `TaskCapsule` staging & claiming + `ctx_memo` digest injection.
-//!   - Antigravity turn-0 `PreInvocation` parsing paired swarm briefs from `transcript.jsonl` /
-//!     `transcript_full.jsonl` when `invocationNum` is omitted in protojson and `lastUserInput` is empty.
-//!   - Non-blocking `> 800L` `read_file` in Antigravity with exact `800 lines` / `46,080 bytes`
-//!     delivery accounting in `PostToolUse`, plus `WorkspaceIndex` moved-file auto-resolution.
+// Sub-millisecond lifecycle hook router (`ctx hook <agy|codex|claude>`):
+//   - Strict per-agent isolation (`agy:{conversationId}`, `codex:{session_id}:{agent_id}`,
+//     `claude:{session_id}:{agent_id}`).
+//   - Addressed `TaskCapsule` staging & claiming + `ctx_memo` digest injection.
+//   - Antigravity turn-0 `PreInvocation` parsing paired swarm briefs from `transcript.jsonl` /
+//     `transcript_full.jsonl` when `invocationNum` is omitted in protojson and `lastUserInput` is empty.
+//   - Non-blocking `> 800L` `read_file` in Antigravity with exact `800 lines` / `46,080 bytes`
+//     delivery accounting in `PostToolUse`, plus `WorkspaceIndex` moved-file auto-resolution.
 
 use crate::capsule::{key_in_assignment, HostContext, Recipient, WorkspaceMode};
 use crate::engine::walk_source_dir;
@@ -29,9 +29,14 @@ const STARTUP_BUDGET_BYTES: usize = 2500;
 const SUBAGENT_REPORT_DIGEST: &str = "Subagent report (skip ReportFormat.md): \
 Outcome (answer/change + paths), Evidence (symbols/lines; `static-only` if unrun), \
 Boundaries (callers/shared files), Integration (risks). \
-Batch calls: ctx_inspect (dirs), ctx_search (`queries` <=4 or `query` + shorthand `roots`), ctx_symbols (`compact=true`), ctx_read (full files <=1MiB); CLI `ctx` if no MCP. Finish from search/symbols when sufficient.";
+Batch calls: ctx_inspect (dirs), ctx_search (`q`: 1-4 `Mod:pat`), ctx_symbols (`compact=true`), ctx_read (slices >800L in AGY or full files <=1MiB in Codex); use CLI `ctx inspect|search|outline|sym` if MCP is absent (e.g., swarm workers). Finish from search/symbols when sufficient.";
 
-const AGY_LAZY_MCP_SIGNATURES: &str = "Call eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_capsule`); use call_mcp_tool for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) or CLI `ctx`.";
+const AGY_LAZY_MCP_SIGNATURES: &str = "In Antigravity: call eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`) and prefer parallel native `read_file` (<=800L/46KB inline) for full files; use `call_mcp_tool` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) or CLI `ctx` when MCP is absent.";
+
+#[inline]
+fn capsule_auto_stage_enabled() -> bool {
+    std::env::var("AGENT_CTX_ENABLE_CAPSULE").ok().as_deref() == Some("1")
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -416,10 +421,15 @@ fn mcp_context_rewrite(svc: &BrokerService, payload: &Json, context: &HostContex
             .or_else(|| name.strip_prefix("mcp_agent_ctx_ctx_"))?;
         (op, args.clone(), false)
     };
-    if !matches!(
-        op,
-        "capsule" | "inspect" | "read" | "outline" | "symbols" | "search" | "memo" | "elf_audit"
-    ) {
+    // Only bind host/session tickets for operations that actually consume `scoped_session` or
+    // host-aware budgets (`read`, `symbols`, `memo` mutations, `capsule`). Stateless read-only
+    // ops (`search`, `inspect`, `outline`, `elf_audit`, `memo` list/get) skip argument rewrites.
+    let needs_context = match op {
+        "capsule" | "read" | "symbols" => true,
+        "memo" => matches!(inner_args.get_str("action"), Some("put" | "clear")),
+        _ => false,
+    };
+    if !needs_context {
         return None;
     }
     let mut context = context.clone();
@@ -1179,6 +1189,13 @@ fn extract_codex_exec_commands(tool_name: &str, tool_input: &Json) -> Vec<String
         return cmds;
     }
     if tool_name == "exec" {
+        if let Some(c) = tool_input
+            .get_str("cmd")
+            .or_else(|| tool_input.get_str("command"))
+        {
+            cmds.push(c.to_string());
+            return cmds;
+        }
         let script = tool_input
             .as_str()
             .or_else(|| tool_input.get_str("script"))
@@ -1346,7 +1363,10 @@ fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
             if let Some(reply) = mcp_context_rewrite(svc, payload, &context, tool_name, args) {
                 return reply;
             }
-            if tool_name == "invoke_subagent" || (tool_name == "swarm" && args.get_str("action") == Some("add")) {
+            if capsule_auto_stage_enabled()
+                && (tool_name == "invoke_subagent"
+                    || (tool_name == "swarm" && args.get_str("action") == Some("add")))
+            {
                 return agy_capsule_rewrite(svc, &context, call_id, tool_name, args);
             }
         }
@@ -1685,7 +1705,7 @@ fn handle_codex(svc: &BrokerService, payload: &Json) -> Json {
             if let Some(reply) = mcp_context_rewrite(svc, payload, &context, tool_name, &tool_input) {
                 return reply;
             }
-            if matches!(tool_name, "spawn_agent" | "Agent") {
+            if capsule_auto_stage_enabled() && matches!(tool_name, "spawn_agent" | "Agent") {
                 return codex_capsule_rewrite(svc, &context, payload, &tool_input);
             }
         }

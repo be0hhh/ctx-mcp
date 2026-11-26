@@ -7,8 +7,9 @@
 
 use crate::broker::ContextBroker;
 use crate::engine::{
-    op_elf_audit, op_inspect, op_memo, op_outline, op_read, op_search, op_search_batch,
-    op_status, op_symbols, SearchOptions, DEFAULT_READ_MAX_BYTES,
+    op_elf_audit, op_inspect, op_memo, op_outline, op_read_for_host, op_search, op_search_batch,
+    op_status, op_symbols, SearchOptions, AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP,
+    DEFAULT_INSPECT_MAX_BYTES, DEFAULT_READ_MAX_BYTES,
 };
 use crate::hooks::{handle_hook, passthrough_raw};
 use crate::json::{self, Json};
@@ -278,17 +279,30 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         },
         OpCode::Read => {
             let paths = str_vec(req.get("paths"));
-            let max_bytes = req.get_usize("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES);
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
+            let explicit_max = req.get_usize("max_bytes").filter(|&v| v > 0);
+            let max_bytes = explicit_max.unwrap_or(if is_agy {
+                AGY_MCP_DEFAULT_MAX_BYTES
+            } else {
+                DEFAULT_READ_MAX_BYTES
+            });
             let force = req.get_bool("force").unwrap_or(false);
-            match op_read(svc, &paths, max_bytes, force, session_key, cwd.as_deref()) {
+            let inline_cap = is_agy.then_some(AGY_MCP_INLINE_CAP);
+            match op_read_for_host(svc, &paths, max_bytes, force, session_key, cwd.as_deref(), inline_cap) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
             }
         }
         OpCode::Outline => {
             let paths = str_vec(req.get("paths"));
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(40);
-            let max_bytes = req.get_usize("max_bytes").unwrap_or(0);
+            let max_bytes = req
+                .get_usize("max_bytes")
+                .filter(|&v| v > 0)
+                .unwrap_or(if is_agy { AGY_MCP_DEFAULT_MAX_BYTES } else { 0 });
             match op_outline(svc, &paths, max_files, max_bytes, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
@@ -296,8 +310,17 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         }
         OpCode::Inspect => {
             let paths = str_vec(req.get("paths"));
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(80);
-            let max_bytes = req.get_usize("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES);
+            let max_bytes = req
+                .get_usize("max_bytes")
+                .filter(|&v| v > 0)
+                .unwrap_or(if is_agy {
+                    DEFAULT_INSPECT_MAX_BYTES
+                } else {
+                    DEFAULT_READ_MAX_BYTES
+                });
             let warn_lines = req.get_usize("warn_lines").unwrap_or(600);
             match op_inspect(svc, &paths, max_files, max_bytes, warn_lines, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -306,7 +329,16 @@ pub fn execute_request(svc: &BrokerService, req: &Json) -> Json {
         }
         OpCode::Symbols => {
             let requests = str_vec(req.get("requests"));
-            let max_bytes = req.get_usize("max_bytes").unwrap_or(DEFAULT_READ_MAX_BYTES);
+            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+                || req.get_str("host") == Some("agy");
+            let max_bytes = req
+                .get_usize("max_bytes")
+                .filter(|&v| v > 0)
+                .unwrap_or(if is_agy {
+                    AGY_MCP_DEFAULT_MAX_BYTES
+                } else {
+                    DEFAULT_READ_MAX_BYTES
+                });
             let compact = req.get_bool("compact").unwrap_or(false);
             match op_symbols(svc, &requests, max_bytes, compact, session_key, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),

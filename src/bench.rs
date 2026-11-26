@@ -294,6 +294,7 @@ pub fn run_bench_cli(args: &[String]) -> i32 {
         .env("AGENT_CTX_RUNTIME_DIR", &rt)
         .env("AGENT_CTX_SNAPSHOT_PATH", &snap)
         .env("AGENT_CTX_MAX_RAM_MB", "512")
+        .env("AGENT_CTX_ENABLE_CAPSULE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
