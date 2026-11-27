@@ -8,7 +8,7 @@ use std::sync::{Mutex, RwLock};
 
 pub const MAX_PACK_WORKSPACES: usize = 64;
 pub const MAX_PACKS_PER_WORKSPACE: usize = 64;
-pub const MAX_PACK_SELECTORS: usize = 16;
+pub const MAX_PACK_SELECTORS: usize = 32;
 pub const MAX_PACK_DEDUP_ENTRIES: usize = 2048;
 pub const MAX_PACK_NAME_BYTES: usize = 96;
 pub const MAX_PACK_SUMMARY_BYTES: usize = 4096;
@@ -331,6 +331,8 @@ mod tests {
         assert!(store.put_pack("ws", "ok", vec!["a.md#H".into()], Some(fake_tok), "w").is_err());
         assert!(store.put_pack("ws", "bad\nname", vec!["a.md#H".into()], None, "w").is_err());
         assert!(store.put_pack("ws", "ok", vec![], None, "w").is_err());
+        let max_ok: Vec<String> = (0..MAX_PACK_SELECTORS).map(|i| format!("f{i}.md#H")).collect();
+        assert!(store.put_pack("ws", "ok_max", max_ok, None, "w").is_ok());
         let too_many: Vec<String> = (0..=MAX_PACK_SELECTORS).map(|i| format!("f{i}.md#H")).collect();
         assert!(store.put_pack("ws", "ok", too_many, None, "w").is_err());
         let too_big = "x".repeat(MAX_PACK_SUMMARY_BYTES + 1);

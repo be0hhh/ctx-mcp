@@ -26,7 +26,8 @@ use crate::engine::{
     cap_text, materialize_pack_for_workspace, op_elf_audit_with_baseline, op_inspect,
     op_memo_full, op_outline_with_options, op_read_for_host, op_search, op_search_batch, op_status,
     op_symbols_with_options, parse_shorthand_search_spec, SearchError, SearchOptions,
-    AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP, DEFAULT_READ_MAX_BYTES,
+    AGY_CLI_DEFAULT_MAX_BYTES, AGY_CLI_INLINE_CAP, AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP,
+    DEFAULT_READ_MAX_BYTES,
 };
 use crate::hooks::handle_hook;
 use crate::store::{
@@ -294,6 +295,7 @@ fn execute_request_inner(
         }
     }
     let mut scoped_session = context.as_ref().and_then(|context| context.identity());
+    let mut cli_lease_is_agy = false;
     if scoped_session.is_none() {
         if let Some(tok) = req.get_str("cli_token").filter(|s| !s.is_empty()) {
             if let Some((lease_sess, lease_ws)) = svc.broker.capsules.verify_cli_lease(tok) {
@@ -318,6 +320,7 @@ fn execute_request_inner(
                     false
                 };
                 if cwd_matches {
+                    cli_lease_is_agy = lease_sess.starts_with("agy:");
                     scoped_session = Some(lease_sess);
                 }
             }
@@ -326,6 +329,9 @@ fn execute_request_inner(
     let session_key = scoped_session
         .as_deref()
         .or_else(|| req.get_str("session").filter(|s| !s.is_empty()));
+    let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
+        || req.get_str("host") == Some("agy");
+    let is_agy_cli = !is_agy && cli_lease_is_agy;
 
     let Some(opcode) = OpCode::parse(op) else {
         return Json::obj(vec![
@@ -368,12 +374,17 @@ fn execute_request_inner(
         },
         OpCode::Read => {
             let paths = str_vec(req.get("paths"));
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
-            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
+            let max_bytes =
+                effective_host_max_bytes(req, is_agy, is_agy_cli, DEFAULT_READ_MAX_BYTES);
             let force = req.get_bool("force").unwrap_or(false);
             let hashes = req.get_bool("hashes").unwrap_or(false);
-            let inline_cap = is_agy.then_some(AGY_MCP_INLINE_CAP);
+            let inline_cap = if is_agy {
+                Some(AGY_MCP_INLINE_CAP)
+            } else if is_agy_cli {
+                Some(AGY_CLI_INLINE_CAP)
+            } else {
+                None
+            };
             match op_read_for_host(
                 svc,
                 &paths,
@@ -390,8 +401,6 @@ fn execute_request_inner(
         }
         OpCode::Outline => {
             let paths = str_vec(req.get("paths"));
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(40);
             let max_bytes = effective_max_bytes(req, is_agy, 0);
             let max_symbols = req.get_usize("max_symbols").unwrap_or(0);
@@ -402,10 +411,9 @@ fn execute_request_inner(
         }
         OpCode::Inspect => {
             let paths = str_vec(req.get("paths"));
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(80);
-            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
+            let max_bytes =
+                effective_host_max_bytes(req, is_agy, is_agy_cli, DEFAULT_READ_MAX_BYTES);
             let warn_lines = req.get_usize("warn_lines").unwrap_or(600);
             match op_inspect(svc, &paths, max_files, max_bytes, warn_lines, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -414,9 +422,8 @@ fn execute_request_inner(
         }
         OpCode::Symbols => {
             let requests = str_vec(req.get("requests"));
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
-            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
+            let max_bytes =
+                effective_host_max_bytes(req, is_agy, is_agy_cli, DEFAULT_READ_MAX_BYTES);
             let compact = req.get_bool("compact").unwrap_or(false);
             let hashes = req.get_bool("hashes").unwrap_or(false);
             let raw = req.get_bool("raw").unwrap_or(false);
@@ -435,8 +442,6 @@ fn execute_request_inner(
             }
         }
         OpCode::Search => {
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
             let batch_len = req
                 .get("q")
                 .and_then(Json::as_arr)
@@ -496,8 +501,6 @@ fn execute_request_inner(
             };
             let summary = req.get_str("summary").unwrap_or("");
             let paths = str_vec(req.get("paths"));
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
             let force = req.get_bool("force").unwrap_or(false);
             let raw = req.get_bool("raw").unwrap_or(false);
             let max_bytes = effective_max_bytes(req, is_agy, 32_768);
@@ -617,8 +620,6 @@ fn execute_request_inner(
                     }
                 }
             }
-            let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
-                || req.get_str("host") == Some("agy");
             let max_callers = req.get_usize("max_callers").unwrap_or(20);
             let include_tests = req.get_bool("include_tests").unwrap_or(true);
             let include_git_status = req.get_bool("include_git_status").unwrap_or(true);
@@ -658,6 +659,31 @@ fn effective_max_bytes(req: &Json, is_agy: bool, non_agy_default: usize) -> usiz
     } else {
         explicit.unwrap_or(non_agy_default)
     }
+}
+
+/// Host-aware byte budget for `Read` / `Inspect` / `Symbols`:
+/// - AGY MCP (`is_agy`): hard-clamped to `AGY_MCP_DEFAULT_MAX_BYTES` (`9,000 B`).
+/// - AGY `run_command` CLI (`is_agy_cli`, verified `agy:` `CliLease`): defaults to
+///   `AGY_CLI_DEFAULT_MAX_BYTES` (`14,000 B`) when `max_bytes` is omitted, while respecting an
+///   explicit `--max-bytes` clamped to `DEFAULT_READ_MAX_BYTES` (`1 MiB`).
+/// - Non-AGY CLI: preserves `non_agy_default` (`1 MiB`).
+fn effective_host_max_bytes(
+    req: &Json,
+    is_agy: bool,
+    is_agy_cli: bool,
+    non_agy_default: usize,
+) -> usize {
+    if is_agy {
+        return effective_max_bytes(req, true, non_agy_default);
+    }
+    if is_agy_cli {
+        return req
+            .get_usize("max_bytes")
+            .filter(|&v| v > 0)
+            .map(|v| v.min(DEFAULT_READ_MAX_BYTES))
+            .unwrap_or(AGY_CLI_DEFAULT_MAX_BYTES);
+    }
+    effective_max_bytes(req, false, non_agy_default)
 }
 
 fn request_error(code: &str, error: String) -> Json {
@@ -1060,6 +1086,224 @@ mod tests {
             run_inproc(&leased_req).get_str("code"),
             Some("daemon_unavailable")
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_cli_lease_uses_14k_default_cap_non_poisoning_dedup_and_preserves_plain_cli_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-rpc-agy-cli-cap-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("small.rs"), "pub fn small_ok() -> i32 {\n    7\n}\n").unwrap();
+        let mut big_sym = String::from("pub fn huge_fn() -> i32 {\n");
+        for i in 1..=320 {
+            big_sym.push_str(&format!(
+                "    let v_{i:03} = {i}; // padding_0123456789abcdef0123456789\n"
+            ));
+        }
+        big_sym.push_str("    0\n}\n");
+        assert!(big_sym.len() > AGY_CLI_INLINE_CAP + 4_000);
+        fs::write(dir.join("big.rs"), &big_sym).unwrap();
+        for f in 0..90 {
+            fs::write(
+                dir.join(format!("mod_{f:02}.rs")),
+                format!(
+                    "pub fn alpha_{f:02}() {{}}\npub fn beta_{f:02}() {{}}\npub fn gamma_{f:02}() {{}}\npub fn delta_{f:02}() {{}}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let root = svc.allowlist.register_hint(&dir, true).unwrap();
+        let agy_tok = svc
+            .broker
+            .capsules
+            .issue_cli_lease("agy:worker-cap-1".into(), root.clone())
+            .unwrap();
+        let agy_tok_dedup = svc
+            .broker
+            .capsules
+            .issue_cli_lease("agy:worker-cap-2".into(), root.clone())
+            .unwrap();
+        let other_tok = svc
+            .broker
+            .capsules
+            .issue_cli_lease("codex:worker-cap-1".into(), root)
+            .unwrap();
+        let cwd_str = dir.to_string_lossy().into_owned();
+
+        // (a) `agy:` CliLease defaults Read / Inspect / Symbols to AGY_CLI_DEFAULT_MAX_BYTES (14,000 B)
+        let agy_read = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("paths", Json::Arr(vec![Json::Str("big.rs".into())])),
+            ]),
+        );
+        assert_eq!(agy_read.get_bool("ok"), Some(true));
+        let agy_read_txt = agy_read.get_str("text").unwrap();
+        assert!(
+            agy_read_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES
+                && agy_read_txt.len() > AGY_MCP_DEFAULT_MAX_BYTES + 1_000
+                && agy_read_txt.contains("AGY CLI inline cap")
+                && agy_read_txt.contains("ctx sym")
+                && !agy_read_txt.contains("read_file"),
+            "len={} text_tail={}",
+            agy_read_txt.len(),
+            &agy_read_txt[agy_read_txt.len().saturating_sub(200)..]
+        );
+
+        let agy_inspect = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("inspect".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("max_files", Json::Int(100)),
+                ("paths", Json::Arr(vec![Json::Str(".".into())])),
+            ]),
+        );
+        assert_eq!(agy_inspect.get_bool("ok"), Some(true));
+        let agy_inspect_txt = agy_inspect.get_str("text").unwrap();
+        assert!(
+            agy_inspect_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES + 128,
+            "inspect len={}",
+            agy_inspect_txt.len()
+        );
+
+        let agy_sym = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("symbols".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("requests", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+            ]),
+        );
+        assert_eq!(agy_sym.get_bool("ok"), Some(true));
+        let agy_sym_txt = agy_sym.get_str("text").unwrap();
+        assert!(
+            agy_sym_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "sym len={}",
+            agy_sym_txt.len()
+        );
+
+        // Explicit `--max-bytes` is respected on `agy:` CliLease (clamped to 1 MiB)
+        let agy_sym_big = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("symbols".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("max_bytes", Json::Int(65_536)),
+                ("requests", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+            ]),
+        );
+        assert!(agy_sym_big.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP);
+        assert_eq!(
+            effective_host_max_bytes(
+                &Json::obj(vec![("max_bytes", Json::Int(4_000_000))]),
+                false,
+                true,
+                DEFAULT_READ_MAX_BYTES,
+            ),
+            DEFAULT_READ_MAX_BYTES
+        );
+
+        // (b) `agy:` CliLease explicit `--max-bytes` returning > 14,800 B must NOT poison dedup
+        let oversized = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok_dedup.clone())),
+                ("max_bytes", Json::Int(65_536)),
+                (
+                    "paths",
+                    Json::Arr(vec![Json::Str("small.rs".into()), Json::Str("big.rs".into())]),
+                ),
+            ]),
+        );
+        assert_eq!(oversized.get_bool("ok"), Some(true));
+        assert!(oversized.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP);
+
+        let followup = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok_dedup.clone())),
+                ("paths", Json::Arr(vec![Json::Str("small.rs".into())])),
+            ]),
+        );
+        let followup_txt = followup.get_str("text").unwrap();
+        assert!(
+            followup_txt.contains("small_ok") && !followup_txt.contains("ALREADY IN CONTEXT"),
+            "oversized AGY CLI read must not poison SessionState: {followup_txt}"
+        );
+
+        // Once read inline (<= 14,800 B), subsequent read deduplicates normally
+        let dedup = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok_dedup)),
+                ("paths", Json::Arr(vec![Json::Str("small.rs".into())])),
+            ]),
+        );
+        assert!(dedup.get_str("text").unwrap().contains("ALREADY IN CONTEXT"));
+
+        // (c) Non-`agy:` CLI (both plain and non-`agy:` CliLease) keeps 1 MiB default & normal dedup
+        let plain_first = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("session", Json::Str("plain-cli-1".into())),
+                ("paths", Json::Arr(vec![Json::Str("big.rs".into())])),
+            ]),
+        );
+        assert!(plain_first.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP + 4_000);
+        let plain_second = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("session", Json::Str("plain-cli-1".into())),
+                ("paths", Json::Arr(vec![Json::Str("big.rs".into())])),
+            ]),
+        );
+        assert!(plain_second.get_str("text").unwrap().contains("ALREADY IN CONTEXT"));
+
+        let codex_first = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(other_tok.clone())),
+                ("paths", Json::Arr(vec![Json::Str("big.rs".into())])),
+            ]),
+        );
+        assert!(codex_first.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP + 4_000);
+        let codex_second = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(cwd_str)),
+                ("cli_token", Json::Str(other_tok)),
+                ("paths", Json::Arr(vec![Json::Str("big.rs".into())])),
+            ]),
+        );
+        assert!(codex_second.get_str("text").unwrap().contains("ALREADY IN CONTEXT"));
 
         let _ = fs::remove_dir_all(&dir);
     }

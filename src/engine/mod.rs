@@ -44,6 +44,8 @@ use std::sync::atomic::Ordering;
 pub const DEFAULT_READ_MAX_BYTES: usize = 1_048_576; // 1 MiB
 pub const AGY_MCP_DEFAULT_MAX_BYTES: usize = 9_000; // Fits under Antigravity's ~10 KB MCP inline cap
 pub const AGY_MCP_INLINE_CAP: usize = 9_200;
+pub const AGY_CLI_DEFAULT_MAX_BYTES: usize = 14_000; // Fits under Antigravity's ~15.4 KB run_command inline cap
+pub const AGY_CLI_INLINE_CAP: usize = 14_800;
 
 pub fn is_safe_shorthand_candidate(raw: &str) -> bool {
     let t = raw.trim().trim_matches('"').trim_matches('\'');

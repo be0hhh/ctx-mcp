@@ -1,4 +1,4 @@
-use super::DEFAULT_READ_MAX_BYTES;
+use super::{AGY_MCP_INLINE_CAP, DEFAULT_READ_MAX_BYTES};
 use crate::base::security::is_sensitive_path;
 use crate::base::simd::{decimal_digits, line_hash3, push_u32, push_usize};
 use crate::rpc::BrokerService;
@@ -133,7 +133,7 @@ pub fn op_read_for_host(
                     None => (1, total),
                 };
 
-                let cap_note = format_cap_note(budget, specs.len() - index - 1, inline_dedup_cap.is_some(), true);
+                let cap_note = format_cap_note(budget, specs.len() - index - 1, inline_dedup_cap, true);
                 let content_limit = budget.saturating_sub(cap_note.len() + 1);
                 let other_note = format_other_actor_note(svc, session_key, &ws_root, &entry.rel_path);
                 if let Some(ref delta) = delta_hit {
@@ -160,7 +160,7 @@ pub fn op_read_for_host(
                 if let Some(note) = other_note.as_deref() { section.push_str(note); }
 
                 if out.len() + section.len() > content_limit {
-                    out.push_str(&format_cap_note(budget, specs.len() - index, inline_dedup_cap.is_some(), false));
+                    out.push_str(&format_cap_note(budget, specs.len() - index, inline_dedup_cap, false));
                     break;
                 }
                 let mut actual_end = None;
@@ -227,12 +227,21 @@ pub fn op_read_for_host(
     Ok(out)
 }
 
-fn format_cap_note(budget: usize, unread: usize, is_agy: bool, later: bool) -> String {
+fn format_cap_note(
+    budget: usize,
+    unread: usize,
+    inline_dedup_cap: Option<usize>,
+    later: bool,
+) -> String {
     let qual = if later { "later paths" } else { "paths" };
-    if is_agy {
-        format!("... [AGY inline cap {budget}B reached; {unread} {qual} unread — prefer ctx_symbols / ctx_read path:start-end slices, or parallel native read_file (<=800L/46KB inline) for full files]\n")
-    } else {
-        format!("... [output capped at {budget} bytes; {unread} {qual} left unread]\n")
+    match inline_dedup_cap {
+        Some(cap) if cap <= AGY_MCP_INLINE_CAP => format!(
+            "... [AGY inline cap {budget}B reached; {unread} {qual} unread — prefer ctx_symbols / ctx_read path:start-end slices, or parallel native read_file (<=800L/46KB inline) for full files]\n"
+        ),
+        Some(_) => format!(
+            "... [AGY CLI inline cap {budget}B reached; {unread} {qual} unread — prefer `ctx sym`, narrow `path:start-end` slices, or `--max-bytes`]\n"
+        ),
+        None => format!("... [output capped at {budget} bytes; {unread} {qual} left unread]\n"),
     }
 }
 
@@ -466,12 +475,26 @@ mod tests {
         ).unwrap();
         assert!(dedup.contains("ALREADY IN CONTEXT"));
 
-        // 3. Default AGY cap note recommends parallel native read_file
+        // 3. Default AGY MCP cap note recommends parallel native read_file;
+        //    AGY CLI cap note recommends `ctx sym`, narrow slices, or `--max-bytes`.
         let capped = op_read_for_host(
             &svc, &["large.cpp".into()], AGY_MCP_DEFAULT_MAX_BYTES, true,
             Some("agy-sess-2"), Some(&workspace), Some(AGY_MCP_INLINE_CAP), false,
         ).unwrap();
         assert!(capped.len() <= AGY_MCP_INLINE_CAP && capped.contains("read_file"));
+
+        let cli_capped = op_read_for_host(
+            &svc, &["large.cpp".into()], crate::engine::AGY_CLI_DEFAULT_MAX_BYTES, true,
+            Some("agy-cli-2"), Some(&workspace), Some(crate::engine::AGY_CLI_INLINE_CAP), false,
+        ).unwrap();
+        assert!(
+            cli_capped.len() <= crate::engine::AGY_CLI_INLINE_CAP
+                && cli_capped.contains("AGY CLI inline cap")
+                && cli_capped.contains("ctx sym")
+                && cli_capped.contains("--max-bytes")
+                && !cli_capped.contains("read_file"),
+            "cli_capped={cli_capped}"
+        );
         fs::remove_dir_all(&workspace).unwrap();
     }
 

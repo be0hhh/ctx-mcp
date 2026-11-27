@@ -104,6 +104,13 @@ Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor ta
 | **Codex · GPT-6.2 Astra (XHigh)** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s | baseline |
 | **Codex · GPT-6.2 Astra (XHigh)** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%, 2.1×)** | **2,678 (−78.1%, 4.6×)** | **164 (−16.3%)** | **11.9 s (−16.2%)** | **−60%…−66%** |
 
+## What's New in `v2.5.4`
+
+- **Antigravity CLI `14 KiB` inline cap & non-poisoning dedup:** `ctx read`, `ctx inspect`, and `ctx sym` executed via verified `agy:` `CliLease` sessions now default to `14,000 B` (fitting cleanly inside Antigravity's `~15.4 KB` `run_command` stdout window while still honoring explicit `--max-bytes` up to `1 MiB`), and `ctx read` enforces a `14,800 B` `inline_dedup_cap` so oversized responses truncated to `output.txt` never poison `SessionState` with false `ALREADY IN CONTEXT` replies. Plain non-Antigravity CLI sessions preserve the full `1 MiB` default and normal dedup.
+- **Larger Shared Context Packs (`32` selectors):** raised `MAX_PACK_SELECTORS` from `16` to `32` so multi-subsystem discovery packs publish cleanly without artificial fragmentation.
+- **Root-coordinator `is_worker` false-positive fix:** `inspect_agy_inbox_messages` ignores the conversation's own background-task notifications (`<conv_id>/...` and `<conv_id>-...`), and `classify_agy_startup` always keeps transcripts starting with `USER_EXPLICIT` as `RootUser` across daemon/IDE restarts.
+- **Cross-platform CI & macOS `ChangeFeed` polish:** canonicalizes macOS `/var -> /private/var` deleted-file paths in `ChangeFeed` and resolves Windows `rustc -D warnings` CI issues.
+
 ## What's New in `v2.5.3`
 
 - **Worktree-unified broker & content-addressed RAM deduplication (`1×` memory across `K` worktrees):** `shared_repo_key` unifies `MemoBoard`, `PackStore`, and `ChangeFeed` across a repository and its linked `git worktree`s using bidirectional backlink verification (with symlink-spoofing protection and full `v3` `memos.json` compatibility). Immutable file contents, line offsets, and symbol tables now live in content-addressed `Arc<ParsedBody>` entries keyed by `(hash64, size, parser_kind, clean_lang)` with exact byte-equality checks and exact refcounted RAM accounting — keeping daemon memory flat (`2,847 KiB` across `8` linked worktrees at `10`, `50`, and `100` agents).

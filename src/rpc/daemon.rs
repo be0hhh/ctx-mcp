@@ -188,8 +188,6 @@ pub fn run_daemon_forever() -> Result<(), String> {
     }
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let token = generate_csprng_token()?;
-    write_daemon_info(port, &token)?;
-    let _ = fs::remove_file(runtime_dir().join("daemon.spawn.lock"));
     let _ = listener.set_nonblocking(false);
 
     let service = Arc::new(BrokerService::new(default_snapshot_path()));
@@ -234,6 +232,10 @@ pub fn run_daemon_forever() -> Result<(), String> {
             }
         });
     }
+
+    // Publish daemon.json only after BrokerService and worker threads are ready.
+    write_daemon_info(port, &token)?;
+    let _ = fs::remove_file(runtime_dir().join("daemon.spawn.lock"));
 
     // Background periodic metadata-only snapshot saver, 4h idle reaper, and ETag auto-patch updater
     let bg_svc = Arc::clone(&service);

@@ -277,7 +277,8 @@ fn try_send_fresh_stream(
     allow_keep: bool,
 ) -> (SendOutcome, Option<TcpStream>) {
     let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+    // Dead loopback ports return ECONNREFUSED immediately; 1s tolerates VM/CI scheduler stalls.
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(1000)) {
         Ok(s) => s,
         Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
             return (SendOutcome::ConnRefused, None);
@@ -428,7 +429,9 @@ pub fn call_daemon_or_inproc(req: Json) -> Json {
     }
 
     let _ = spawn_background_daemon_once();
-    for attempt in 0..46u8 {
+    // Up to 3.0s cold-start wait (10×10ms fast path + 116×25ms) so heavy CPU load
+    // or CI runners do not falsely degrade stateful `memo` mutations to in-proc.
+    for attempt in 0..126u8 {
         let wait_ms = if attempt < 10 { 10 } else { 25 };
         thread::sleep(Duration::from_millis(wait_ms));
         if let Some(info) = read_daemon_info() {

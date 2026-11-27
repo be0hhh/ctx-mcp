@@ -89,12 +89,21 @@ pub(super) fn read_first_transcript_entries(path: &Path, max_lines: usize) -> Ve
     entries
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(super) enum AgyStartupKind {
     RootUser,
     IgnoreAux,
     Worker { brief: String, cli_only: bool },
     ForkedWorker,
     Undetermined,
+}
+
+fn is_own_agy_sender(sender: &str, conv_id: &str) -> bool {
+    sender == conv_id
+        || (!conv_id.is_empty()
+            && sender
+                .strip_prefix(conv_id)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('-')))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,7 +186,7 @@ pub(super) fn bind_agy_inbound(svc: &BrokerService, payload: &Json, child: &Host
             };
             if message.get_str("recipient") != Some(&child.session)
                 || sender == "system"
-                || sender == child.session
+                || is_own_agy_sender(sender, &child.session)
             {
                 continue;
             }
@@ -292,7 +301,7 @@ fn inspect_agy_inbox_messages(payload: &Json, conv_id: &str) -> AgyStartupKind {
             }
             let sender = obj.get_str("sender").unwrap_or("");
             let content = obj.get_str("content").unwrap_or("").trim();
-            if content.is_empty() || sender == conv_id {
+            if content.is_empty() || is_own_agy_sender(sender, conv_id) {
                 continue;
             }
             if obj.get_bool("hideFromUser") == Some(true)
@@ -349,15 +358,6 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
                 .iter()
                 .any(|e| e.get_str("type") == Some("PLANNER_RESPONSE"));
             if has_prior_startup || has_planner_response {
-                let explicit_worker_marker = entries.iter().any(|e| {
-                    e.get_str("source") == Some("SYSTEM")
-                        && e.get_str("content").is_some_and(|c| {
-                            c.contains("<swarm_worker>")
-                                || c.contains("You have just started.")
-                                || c.contains("Your assignment (recorded on the board")
-                                || c.contains("recorded on the board as #")
-                        })
-                });
                 let is_explicit_root = entries
                     .iter()
                     .find(|e| {
@@ -368,14 +368,23 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
                         e.get_str("type") == Some("USER_INPUT")
                             && e.get_str("source") == Some("USER_EXPLICIT")
                     });
+                if is_explicit_root {
+                    return AgyStartupKind::RootUser;
+                }
+                let explicit_worker_marker = entries.iter().any(|e| {
+                    e.get_str("source") == Some("SYSTEM")
+                        && e.get_str("content").is_some_and(|c| {
+                            c.contains("<swarm_worker>")
+                                || c.contains("You have just started.")
+                                || c.contains("Your assignment (recorded on the board")
+                                || c.contains("recorded on the board as #")
+                        })
+                });
                 let inbox_is_worker = matches!(
                     inspect_agy_inbox_messages(payload, conv_id),
                     AgyStartupKind::Worker { .. }
                 );
-                if explicit_worker_marker
-                    || inbox_is_worker
-                    || (has_prior_startup && !is_explicit_root)
-                {
+                if explicit_worker_marker || inbox_is_worker || has_prior_startup {
                     return AgyStartupKind::ForkedWorker;
                 }
                 return AgyStartupKind::RootUser;
@@ -947,6 +956,82 @@ mod tests {
         assert!(msg.contains("Recent workspace changes:"), "{msg}");
         assert!(msg.contains("engine.rs"), "{msg}");
         assert!(!msg.contains("mcp_agent_ctx_"), "worker startup must be CLI-first: {msg}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn root_coordinator_with_own_task_inbox_classifies_as_root_user() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-startup-root-inbox-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        let conv_id = "8f83c2c5-root-conv";
+        let logs_dir = dir.join(".system_generated").join("logs");
+        let msg_dir = dir.join(".system_generated").join("messages");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::create_dir_all(&msg_dir).unwrap();
+
+        let transcript = logs_dir.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"SYSTEM_MESSAGE\",\"source\":\"SYSTEM_SDK\",\"content\":\"SessionStart\"}\n",
+                "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\",\"content\":\"<USER_REQUEST>Run audit</USER_REQUEST>\"}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"Inspecting files.\"}\n"
+            ),
+        )
+        .unwrap();
+
+        // Own background task notification (`<conv_id>/task-215`) in root inbox
+        fs::write(
+            msg_dir.join("001-task.json"),
+            format!(
+                "{{\"recipient\":\"{conv_id}\",\"sender\":\"{conv_id}/task-215\",\"content\":\"Background command completed with exit code 0\"}}"
+            ),
+        )
+        .unwrap();
+        // Own dash-suffixed helper/task sender (`<conv_id>-bg-1`)
+        fs::write(
+            msg_dir.join("002-dash.json"),
+            format!(
+                "{{\"recipient\":\"{conv_id}\",\"sender\":\"{conv_id}-bg-1\",\"content\":\"Timer fired\"}}"
+            ),
+        )
+        .unwrap();
+
+        let payload = Json::obj(vec![
+            (
+                "transcriptPath",
+                Json::Str(transcript.to_string_lossy().into_owned()),
+            ),
+            (
+                "artifactDirectoryPath",
+                Json::Str(dir.to_string_lossy().into_owned()),
+            ),
+        ]);
+        assert_eq!(
+            inspect_agy_inbox_messages(&payload, conv_id),
+            AgyStartupKind::Undetermined
+        );
+        assert_eq!(
+            classify_agy_startup(&payload, conv_id),
+            AgyStartupKind::RootUser
+        );
+
+        // Even if an external worker message lands in root inbox later, explicit USER_EXPLICIT root stays RootUser
+        fs::write(
+            msg_dir.join("003-worker-report.json"),
+            format!(
+                "{{\"recipient\":\"{conv_id}\",\"sender\":\"other-worker-id\",\"content\":\"Worker finished task\"}}"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            classify_agy_startup(&payload, conv_id),
+            AgyStartupKind::RootUser
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

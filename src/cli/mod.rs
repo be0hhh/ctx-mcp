@@ -5,7 +5,6 @@ pub mod search_args;
 
 use crate::base::json::{self, Json};
 use crate::base::mode::{current_write_mode, set_persisted_write_mode};
-use crate::engine::DEFAULT_READ_MAX_BYTES;
 use crate::hooks::{passthrough_raw, should_skip_global_duplicate};
 use crate::install;
 use crate::mcp;
@@ -14,29 +13,182 @@ use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-pub(super) fn cli_session_fields(explicit_session: Option<&str>) -> Vec<(&'static str, Json)> {
+fn cli_session_fields_from(
+    explicit_session: Option<&str>,
+    env_session: Option<&str>,
+    env_token: Option<&str>,
+) -> Vec<(&'static str, Json)> {
     let mut out = Vec::new();
-    let env_session = std::env::var("AGENT_CTX_SESSION")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let env_s = env_session.map(str::trim).filter(|s| !s.is_empty());
     let explicit = explicit_session.map(str::trim).filter(|s| !s.is_empty());
-    let session = explicit.map(str::to_owned).or_else(|| env_session.clone());
-    if let Some(s) = session {
-        out.push(("session", Json::Str(s)));
+    if let Some(s) = explicit.or(env_s) {
+        out.push(("session", Json::Str(s.to_string())));
     }
-    let attach_token = match (explicit, env_session.as_deref()) {
+    let attach_token = match (explicit, env_s) {
         (None, _) => true,
-        (Some(exp), Some(env_s)) => exp == env_s,
+        (Some(exp), Some(env_val)) => exp == env_val,
         (Some(_), None) => false,
     };
     if attach_token {
-        if let Ok(tok) = std::env::var("AGENT_CTX_CLI_TOKEN") {
-            let trimmed = tok.trim();
-            if !trimmed.is_empty() {
-                out.push(("cli_token", Json::Str(trimmed.to_string())));
-            }
+        if let Some(tok) = env_token.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(("cli_token", Json::Str(tok.to_string())));
         }
+    }
+    out
+}
+
+pub(super) fn cli_session_fields(explicit_session: Option<&str>) -> Vec<(&'static str, Json)> {
+    let env_session = std::env::var("AGENT_CTX_SESSION").ok();
+    let env_token = std::env::var("AGENT_CTX_CLI_TOKEN").ok();
+    cli_session_fields_from(
+        explicit_session,
+        env_session.as_deref(),
+        env_token.as_deref(),
+    )
+}
+
+fn build_read_request(args: &[String], cwd: String, session_fields: Vec<(&'static str, Json)>) -> Json {
+    let mut max_bytes: Option<i64> = None;
+    let mut force = false;
+    let mut hashes = false;
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--force" | "-f" => force = true,
+            "--hashes" => hashes = true,
+            "--max-bytes" if i + 1 < args.len() => {
+                i += 1;
+                if let Ok(v) = args[i].parse::<i64>() {
+                    max_bytes = Some(v);
+                }
+            }
+            "--session" if i + 1 < args.len() => {
+                i += 1;
+            }
+            other => paths.push(Json::Str(other.to_string())),
+        }
+        i += 1;
+    }
+    let mut fields = vec![
+        ("op", Json::Str("read".to_string())),
+        ("cwd", Json::Str(cwd)),
+        ("force", Json::Bool(force)),
+        ("hashes", Json::Bool(hashes)),
+        ("paths", Json::Arr(paths)),
+    ];
+    if let Some(mb) = max_bytes {
+        fields.push(("max_bytes", Json::Int(mb)));
+    }
+    fields.extend(session_fields);
+    Json::obj(fields)
+}
+
+fn build_inspect_request(
+    args: &[String],
+    cwd: String,
+    session_fields: Vec<(&'static str, Json)>,
+) -> Json {
+    let mut max_files: i64 = 80;
+    let mut max_bytes: Option<i64> = None;
+    let mut warn_lines: i64 = 600;
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-files" if i + 1 < args.len() => {
+                i += 1;
+                if let Ok(v) = args[i].parse::<i64>() {
+                    max_files = v;
+                }
+            }
+            "--max-bytes" if i + 1 < args.len() => {
+                i += 1;
+                if let Ok(v) = args[i].parse::<i64>() {
+                    max_bytes = Some(v);
+                }
+            }
+            "--warn-lines" if i + 1 < args.len() => {
+                i += 1;
+                if let Ok(v) = args[i].parse::<i64>() {
+                    warn_lines = v;
+                }
+            }
+            "--session" if i + 1 < args.len() => {
+                i += 1;
+            }
+            other => paths.push(Json::Str(other.to_string())),
+        }
+        i += 1;
+    }
+    let mut fields = vec![
+        ("op", Json::Str("inspect".to_string())),
+        ("cwd", Json::Str(cwd)),
+        ("max_files", Json::Int(max_files)),
+        ("warn_lines", Json::Int(warn_lines)),
+        ("paths", Json::Arr(paths)),
+    ];
+    if let Some(mb) = max_bytes {
+        fields.push(("max_bytes", Json::Int(mb)));
+    }
+    fields.extend(session_fields);
+    Json::obj(fields)
+}
+
+fn build_symbols_request(
+    args: &[String],
+    cwd: String,
+    session_fields: Vec<(&'static str, Json)>,
+) -> Json {
+    let mut max_bytes: Option<i64> = None;
+    let mut compact = false;
+    let mut hashes = false;
+    let mut raw = false;
+    let mut reqs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--max-bytes" && i + 1 < args.len() {
+            i += 1;
+            if let Ok(v) = args[i].parse::<i64>() {
+                max_bytes = Some(v);
+            }
+        } else if args[i] == "--session" && i + 1 < args.len() {
+            i += 1;
+        } else if args[i] == "--compact" {
+            compact = true;
+        } else if args[i] == "--hashes" {
+            hashes = true;
+        } else if args[i] == "--raw" {
+            raw = true;
+        } else {
+            reqs.push(Json::Str(args[i].clone()));
+        }
+        i += 1;
+    }
+    let mut fields = vec![
+        ("op", Json::Str("symbols".to_string())),
+        ("cwd", Json::Str(cwd)),
+        ("compact", Json::Bool(compact)),
+        ("hashes", Json::Bool(hashes)),
+        ("raw", Json::Bool(raw)),
+        ("requests", Json::Arr(reqs)),
+    ];
+    if let Some(mb) = max_bytes {
+        fields.push(("max_bytes", Json::Int(mb)));
+    }
+    fields.extend(session_fields);
+    Json::obj(fields)
+}
+
+fn extract_cli_session_flag(args: &[String]) -> Option<&str> {
+    let mut out = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--session" && i + 1 < args.len() {
+            i += 1;
+            out = Some(args[i].as_str());
+        }
+        i += 1;
     }
     out
 }
@@ -159,40 +311,13 @@ pub fn dispatch(args: &[String]) -> i32 {
             0
         }
         "read" => {
-            let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
-            let mut force = false;
-            let mut hashes = false;
-            let mut session: Option<String> = None;
-            let mut paths = Vec::new();
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--force" | "-f" => force = true,
-                    "--hashes" => hashes = true,
-                    "--max-bytes" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            max_bytes = v;
-                        }
-                    }
-                    "--session" if i + 1 < args.len() => {
-                        i += 1;
-                        session = Some(args[i].clone());
-                    }
-                    other => paths.push(Json::Str(other.to_string())),
-                }
-                i += 1;
-            }
-            let mut fields = vec![
-                ("op", Json::Str("read".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("force", Json::Bool(force)),
-                ("hashes", Json::Bool(hashes)),
-                ("max_bytes", Json::Int(max_bytes)),
-                ("paths", Json::Arr(paths)),
-            ];
-            fields.extend(cli_session_fields(session.as_deref()));
-            let reply = call_daemon_or_inproc(Json::obj(fields));
+            let session = extract_cli_session_flag(&args[1..]);
+            let req = build_read_request(
+                &args[1..],
+                workspace_cwd_str(None),
+                cli_session_fields(session),
+            );
+            let reply = call_daemon_or_inproc(req);
             print_reply(&reply)
         }
         "outline" => {
@@ -233,43 +358,13 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_reply(&reply)
         }
         "inspect" => {
-            let mut max_files: i64 = 80;
-            let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
-            let mut warn_lines: i64 = 600;
-            let mut paths = Vec::new();
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--max-files" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            max_files = v;
-                        }
-                    }
-                    "--max-bytes" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            max_bytes = v;
-                        }
-                    }
-                    "--warn-lines" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            warn_lines = v;
-                        }
-                    }
-                    other => paths.push(Json::Str(other.to_string())),
-                }
-                i += 1;
-            }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
-                ("op", Json::Str("inspect".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("max_files", Json::Int(max_files)),
-                ("max_bytes", Json::Int(max_bytes)),
-                ("warn_lines", Json::Int(warn_lines)),
-                ("paths", Json::Arr(paths)),
-            ]));
+            let session = extract_cli_session_flag(&args[1..]);
+            let req = build_inspect_request(
+                &args[1..],
+                workspace_cwd_str(None),
+                cli_session_fields(session),
+            );
+            let reply = call_daemon_or_inproc(req);
             print_reply(&reply)
         }
         "capsule" => {
@@ -340,49 +435,18 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_reply(&reply)
         }
         "sym" | "symbols" => {
-            let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
-            let mut compact = false;
-            let mut hashes = false;
-            let mut raw = false;
-            let mut session: Option<String> = None;
-            let mut reqs = Vec::new();
-            let mut i = 1;
-            while i < args.len() {
-                if args[i] == "--max-bytes" && i + 1 < args.len() {
-                    i += 1;
-                    if let Ok(v) = args[i].parse::<i64>() {
-                        max_bytes = v;
-                    }
-                } else if args[i] == "--session" && i + 1 < args.len() {
-                    i += 1;
-                    session = Some(args[i].clone());
-                } else if args[i] == "--compact" {
-                    compact = true;
-                } else if args[i] == "--hashes" {
-                    hashes = true;
-                } else if args[i] == "--raw" {
-                    raw = true;
-                } else {
-                    reqs.push(Json::Str(args[i].clone()));
-                }
-                i += 1;
-            }
-            let mut fields = vec![
-                ("op", Json::Str("symbols".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("max_bytes", Json::Int(max_bytes)),
-                ("compact", Json::Bool(compact)),
-                ("hashes", Json::Bool(hashes)),
-                ("raw", Json::Bool(raw)),
-                ("requests", Json::Arr(reqs)),
-            ];
-            fields.extend(cli_session_fields(session.as_deref()));
-            let reply = call_daemon_or_inproc(Json::obj(fields));
+            let session = extract_cli_session_flag(&args[1..]);
+            let req = build_symbols_request(
+                &args[1..],
+                workspace_cwd_str(None),
+                cli_session_fields(session),
+            );
+            let reply = call_daemon_or_inproc(req);
             print_reply(&reply)
         }
         "impact" => {
             let mut max_callers: i64 = 20;
-            let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
+            let mut max_bytes: Option<i64> = None;
             let mut include_tests = true;
             let mut include_git_status = true;
             let mut session: Option<String> = None;
@@ -399,7 +463,7 @@ pub fn dispatch(args: &[String]) -> i32 {
                     "--max-bytes" if i + 1 < args.len() => {
                         i += 1;
                         if let Ok(v) = args[i].parse::<i64>() {
-                            max_bytes = v;
+                            max_bytes = Some(v);
                         }
                     }
                     "--session" if i + 1 < args.len() => {
@@ -419,8 +483,10 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("max_callers", Json::Int(max_callers)),
                 ("include_tests", Json::Bool(include_tests)),
                 ("include_git_status", Json::Bool(include_git_status)),
-                ("max_bytes", Json::Int(max_bytes)),
             ];
+            if let Some(mb) = max_bytes {
+                fields.push(("max_bytes", Json::Int(mb)));
+            }
             fields.extend(cli_session_fields(session.as_deref()));
             let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
@@ -842,10 +908,10 @@ fn print_usage() {
          \x20 ctx doctor [--json]\n\
          \x20 ctx mode [write|read-only]\n\
          \x20 ctx update [--check] [--rebuild] [--force] [--auto [off|patch|all]] [--json]\n\
-         \x20 ctx inspect <file_or_dir...> [--max-files 80] [--max-bytes 1048576] [--warn-lines 600]\n\
-         \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--session ID] [--force] [--hashes]\n\
+         \x20 ctx inspect <file_or_dir...> [--max-files 80] [--max-bytes N] [--warn-lines 600] [--session ID]\n\
+         \x20 ctx read <path[:start-end]> [...] [--max-bytes N] [--session ID] [--force] [--hashes]\n\
          \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-symbols N] [--max-bytes N]\n\
-         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--session ID] [--max-bytes 1048576]\n\
+         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--session ID] [--max-bytes N]\n\
          \x20 ctx search -q <ModOrDir:query> [-q ...] [--code-only] [--session ID] [--max-bytes 14336]  (8 KiB default, 12 KiB for 3-6 queries, 14 KiB cap)\n\
          \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--code-only] [--session ID] [--max-bytes 14336]\n\
          \x20 ctx search --batch-json '<array>' [--code-only] [--session ID] [--max-bytes 14336]\n\
@@ -861,4 +927,120 @@ fn print_usage() {
          \x20 ctx mcp [--repo-root DIR] [--read-only|--write] [--protocol-check]\n\
          \x20 ctx hook <agy|codex|claude> [--global]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{AGY_CLI_DEFAULT_MAX_BYTES, AGY_CLI_INLINE_CAP};
+    use crate::rpc::{execute_request, BrokerService};
+    use crate::store::now_ms_u64;
+    use std::fs;
+
+    fn svec(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cli_read_inspect_sym_omit_default_max_bytes_attach_lease_and_hit_agy_cli_14k_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-cli-rpc-agy-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut big = String::from("pub fn big_entry() -> i32 {\n");
+        for i in 1..=320 {
+            big.push_str(&format!(
+                "    let x_{i:03} = {i}; // padding_0123456789abcdef0123456789\n"
+            ));
+        }
+        big.push_str("    0\n}\n");
+        fs::write(dir.join("big.rs"), &big).unwrap();
+        for f in 0..90 {
+            fs::write(
+                dir.join(format!("m_{f:02}.rs")),
+                format!("pub fn f1_{f:02}() {{}}\npub fn f2_{f:02}() {{}}\npub fn f3_{f:02}() {{}}\n"),
+            )
+            .unwrap();
+        }
+
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let root = svc.allowlist.register_hint(&dir, true).unwrap();
+        let tok = svc
+            .broker
+            .capsules
+            .issue_cli_lease("agy:cli-path-1".into(), root)
+            .unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        // 1. Serialization omits `max_bytes` unless `--max-bytes` is explicitly supplied,
+        //    and attaches `cli_token` + `session` on `read`, `inspect`, and `sym`.
+        let sess_fields = |explicit: Option<&str>| {
+            cli_session_fields_from(explicit, Some("agy:cli-path-1"), Some(&tok))
+        };
+
+        let read_args = svec(&["big.rs"]);
+        let read_req = build_read_request(&read_args, cwd.clone(), sess_fields(None));
+        assert!(read_req.get("max_bytes").is_none());
+        assert_eq!(read_req.get_str("cli_token"), Some(tok.as_str()));
+
+        let read_explicit = build_read_request(
+            &svec(&["big.rs", "--max-bytes", "65536"]),
+            cwd.clone(),
+            sess_fields(None),
+        );
+        assert_eq!(read_explicit.get_i64("max_bytes"), Some(65_536));
+
+        let inspect_args = svec(&[".", "--max-files", "100", "--session", "agy:cli-path-1"]);
+        let inspect_req = build_inspect_request(
+            &inspect_args,
+            cwd.clone(),
+            sess_fields(extract_cli_session_flag(&inspect_args)),
+        );
+        assert!(inspect_req.get("max_bytes").is_none());
+        assert_eq!(inspect_req.get_str("session"), Some("agy:cli-path-1"));
+        assert_eq!(inspect_req.get_str("cli_token"), Some(tok.as_str()));
+
+        // Overriding `--session` to a different value must drop the mismatched env `cli_token`.
+        let foreign_fields = cli_session_fields_from(Some("other:s"), Some("agy:cli-path-1"), Some(&tok));
+        let foreign_inspect = build_inspect_request(&svec(&["."]), cwd.clone(), foreign_fields);
+        assert_eq!(foreign_inspect.get_str("session"), Some("other:s"));
+        assert!(foreign_inspect.get("cli_token").is_none());
+
+        let sym_args = svec(&["big.rs#big_entry"]);
+        let sym_req = build_symbols_request(&sym_args, cwd.clone(), sess_fields(None));
+        assert!(sym_req.get("max_bytes").is_none());
+        assert_eq!(sym_req.get_str("cli_token"), Some(tok.as_str()));
+
+        // 2. End-to-end CLI-to-RPC execution applies the 14,000 B default cap on all 3 ops
+        //    and respects explicit `--max-bytes`.
+        let r_read = execute_request(&svc, &read_req);
+        let r_read_txt = r_read.get_str("text").unwrap();
+        assert!(
+            r_read_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES
+                && r_read_txt.contains("AGY CLI inline cap"),
+            "len={}",
+            r_read_txt.len()
+        );
+
+        let r_read_big = execute_request(&svc, &read_explicit);
+        assert!(r_read_big.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP);
+
+        let r_inspect = execute_request(&svc, &inspect_req);
+        assert!(
+            r_inspect.get_str("text").unwrap().len() <= AGY_CLI_DEFAULT_MAX_BYTES + 128,
+            "inspect len={}",
+            r_inspect.get_str("text").unwrap().len()
+        );
+
+        let r_sym = execute_request(&svc, &sym_req);
+        assert!(
+            r_sym.get_str("text").unwrap().len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "sym len={}",
+            r_sym.get_str("text").unwrap().len()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

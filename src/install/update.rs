@@ -22,7 +22,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub const CURRENT_VERSION: &str = "2.5.3";
+pub const CURRENT_VERSION: &str = "2.5.4";
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/be0hhh/ctx-mcp/releases/latest";
 const DEFAULT_RELEASE_URL: &str = "https://github.com/be0hhh/ctx-mcp/releases/latest";
 const DEFAULT_UPDATE_TTL_SECS: u64 = 1_800; // 30 min (conditional HTTP ETag 304 = 0 GitHub rate-limit cost)
