@@ -631,6 +631,7 @@ pub fn run_uninstall_cli(args: &[String]) -> i32 {
         let _ = fs::remove_file(&t_stamp);
         crate::base::mode::remove_persisted_mode_file();
         update::remove_update_state_file();
+        update::remove_update_config_files(&ctx_bin);
         if let Some(cache_dir) = default_snapshot_path().parent() {
             let _ = fs::remove_dir_all(cache_dir);
         }

@@ -251,7 +251,12 @@ fn plan_binary_bytes(
         }
     }
     plan.set(dest, source, Some(0o755))?;
-    plan.set(&stamp_path, new_stamp.into_bytes(), None)
+    plan.set(&stamp_path, new_stamp.into_bytes(), None)?;
+    plan.set(
+        &dest.with_file_name(".ctx.version"),
+        format!("{}\n", super::update::CURRENT_VERSION).into_bytes(),
+        None,
+    )
 }
 
 #[cfg(test)]

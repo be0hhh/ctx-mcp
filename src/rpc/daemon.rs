@@ -235,8 +235,9 @@ pub fn run_daemon_forever() -> Result<(), String> {
         });
     }
 
-    // Background periodic metadata-only snapshot saver & 4h idle reaper
+    // Background periodic metadata-only snapshot saver, 4h idle reaper, and ETag auto-patch updater
     let bg_svc = Arc::clone(&service);
+    let bg_queue = Arc::clone(&queue);
     let info_file = daemon_info_path();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(30));
@@ -245,6 +246,14 @@ pub fn run_daemon_forever() -> Result<(), String> {
         if idle > IDLE_SHUTDOWN_MS {
             let _ = bg_svc.store.save_snapshot_if_dirty(true);
             let _ = fs::remove_file(&info_file);
+            std::process::exit(0);
+        }
+        if crate::install::update::daemon_housekeeping_update_tick() {
+            bg_svc.shutting_down.store(true, Ordering::Release);
+            bg_queue.cv.notify_all();
+            let _ = bg_svc.store.save_snapshot_if_dirty(true);
+            let _ = fs::remove_file(&info_file);
+            thread::sleep(Duration::from_millis(250));
             std::process::exit(0);
         }
     });

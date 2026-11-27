@@ -48,6 +48,7 @@ struct SearchCollection<'a> {
     cap: usize,
     hits: Vec<SearchHit>,
     scan_truncated: bool,
+    incomplete_note: Option<&'static str>,
     match_mode: RgMatchMode,
 }
 
@@ -107,7 +108,18 @@ pub fn op_search(
         svc, query, roots, options.max_results, options.code_only, cwd, Instant::now() + SEARCH_TIMEOUT,
     )?;
     if hit_set.hits.is_empty() {
-        return Ok(render::cap_text(&format!("0 matches for `{}`.\n", query.trim()), options.max_bytes));
+        let msg = if hit_set.scan_truncated {
+            let why = hit_set
+                .incomplete_note
+                .unwrap_or("scan stopped early at budget limit");
+            format!(
+                "0 matches for `{}` (INCOMPLETE scan: {why}; scope with 'dir:pattern' or install ripgrep 'rg').\n",
+                query.trim()
+            )
+        } else {
+            format!("0 matches for `{}`.\n", query.trim())
+        };
+        return Ok(render::cap_text(&msg, options.max_bytes));
     }
     Ok(render::render(svc, vec![(Ok(hit_set), options)], false, options.max_bytes))
 }
@@ -340,7 +352,7 @@ fn collect_search_hits(
     };
     let mut collection = SearchCollection {
         svc, cwd, deadline, cap: collect_cap, hits: Vec::new(), scan_truncated: false,
-        match_mode: RgMatchMode::Regex,
+        incomplete_note: None, match_mode: RgMatchMode::Regex,
     };
     rg::run_rg_or_fallback(q, &search_roots, &mut collection)?;
     let mut grouped: Vec<Vec<SearchHit>> = Vec::new();
@@ -354,7 +366,9 @@ fn collect_search_hits(
     if code_only {
         ram::filter_grouped_hits_code_only(svc, q, collection.match_mode, &mut grouped);
     }
-    Ok(rank_and_select_hits(svc, grouped, cap, collection.scan_truncated))
+    let mut hit_set = rank_and_select_hits(svc, grouped, cap, collection.scan_truncated);
+    hit_set.incomplete_note = collection.incomplete_note;
+    Ok(hit_set)
 }
 
 pub fn op_search_batch(

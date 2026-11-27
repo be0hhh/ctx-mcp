@@ -143,13 +143,35 @@ impl Section {
         let mut text = number.map_or_else(String::new, |n| format!("[{n}]\n"));
         let (mut diagnostic, mut footer) = (None, None);
         let hits = match result {
-            Ok(set) if set.hits.is_empty() => { text.push_str("0 matches\n"); set.hits }
+            Ok(set) if set.hits.is_empty() => {
+                if set.scan_truncated {
+                    let why = set
+                        .incomplete_note
+                        .unwrap_or("scan stopped early at budget limit");
+                    let _ = writeln!(
+                        text,
+                        "0 matches (INCOMPLETE scan: {why}; scope with 'dir:pattern' or install ripgrep 'rg')"
+                    );
+                } else {
+                    text.push_str("0 matches\n");
+                }
+                set.hits
+            }
             Ok(set) => {
+                let inc_suffix = match set.incomplete_note {
+                    Some(why) => format!(" [INCOMPLETE: {why}]"),
+                    None => String::new(),
+                };
                 if set.total_found == set.hits.len() && !set.scan_truncated {
-                    let _ = writeln!(text, "Matches ({}):", set.hits.len());
+                    let _ = writeln!(text, "Matches ({}){inc_suffix}:", set.hits.len());
                 } else {
                     let plus = if set.scan_truncated { "+" } else { "" };
-                    let _ = writeln!(text, "Matches ({} of {}{plus}):", set.hits.len(), set.total_found);
+                    let _ = writeln!(
+                        text,
+                        "Matches ({} of {}{plus}){inc_suffix}:",
+                        set.hits.len(),
+                        set.total_found
+                    );
                 }
                 footer = format_omitted_footer(set.total_found.saturating_sub(set.hits.len()), &set.omitted_scopes);
                 set.hits
@@ -274,7 +296,7 @@ mod tests {
     }
 
     fn mk_set(hits: Vec<SearchHit>, total_found: usize, scan_truncated: bool, omitted_scopes: Vec<OmittedScope>) -> Result<SearchHitSet, SearchError> {
-        Ok(SearchHitSet { hits, total_found, scan_truncated, omitted_scopes })
+        Ok(SearchHitSet { hits, total_found, scan_truncated, incomplete_note: None, omitted_scopes })
     }
 
     #[test]
@@ -333,6 +355,18 @@ mod tests {
         let many: Vec<SearchHit> = (1..=8).map(mk_hit).collect();
         let dense = render(&svc_ws, vec![(mk_set(many, 8, false, Vec::new()), opts)], false, 4096);
         assert!(!dense.contains("-- ranked.cpp --"), "{dense}");
+
+        // Truncated 0-match result MUST emit an explicit INCOMPLETE scan warning (never silent `0 matches`).
+        let incomplete_zero = Ok(SearchHitSet {
+            hits: Vec::new(),
+            total_found: 0,
+            scan_truncated: true,
+            incomplete_note: Some("rg/git unavailable; fallback walker stopped at 8,000 files"),
+            omitted_scopes: Vec::new(),
+        });
+        let zero_out = render(&svc, vec![(incomplete_zero, opts)], true, 4096);
+        assert!(zero_out.contains("INCOMPLETE scan"), "{zero_out}");
+        assert!(zero_out.contains("8,000 files"), "{zero_out}");
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

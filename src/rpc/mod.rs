@@ -20,7 +20,7 @@ use crate::broker::{ClaimError, ContextBroker, WorkspaceMode};
 use crate::edit::{impact::op_impact_with_git, op_edit_with_session, op_git};
 use crate::engine::{
     cap_text, materialize_pack_for_workspace, op_elf_audit_with_baseline, op_inspect,
-    op_memo_full, op_outline, op_read_for_host, op_search, op_search_batch, op_status,
+    op_memo_full, op_outline_with_options, op_read_for_host, op_search, op_search_batch, op_status,
     op_symbols_with_options, parse_shorthand_search_spec, SearchError, SearchOptions,
     AGY_MCP_DEFAULT_MAX_BYTES, AGY_MCP_INLINE_CAP, DEFAULT_READ_MAX_BYTES,
 };
@@ -358,7 +358,8 @@ fn execute_request_inner(
                 || req.get_str("host") == Some("agy");
             let max_files = req.get_usize("max_files").unwrap_or(40);
             let max_bytes = effective_max_bytes(req, is_agy, 0);
-            match op_outline(svc, &paths, max_files, max_bytes, cwd.as_deref()) {
+            let max_symbols = req.get_usize("max_symbols").unwrap_or(0);
+            match op_outline_with_options(svc, &paths, max_files, max_bytes, max_symbols, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
                 Err(e) => Json::obj(vec![("ok", Json::Bool(false)), ("error", Json::Str(e))]),
             }

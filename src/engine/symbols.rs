@@ -2,10 +2,133 @@ use super::compact::{compact_lines_for_ext, is_doc_or_config_ext};
 use super::{is_safe_shorthand_candidate, DEFAULT_READ_MAX_BYTES};
 use crate::base::security::is_sensitive_path;
 use crate::base::simd::{decimal_digits, line_hash3, push_usize};
-use crate::parser::SymbolSpan;
+use crate::parser::{SymbolKind, SymbolSpan};
 use crate::rpc::BrokerService;
 use crate::store::{resolve_input_path, RamStore};
 use std::path::{Path, PathBuf};
+
+const COMPACT_SYMBOL_MAX_LINES: usize = 48;
+
+#[derive(Clone, Copy)]
+enum KindFilter {
+    Exact(SymbolKind),
+    Callable,
+}
+
+impl KindFilter {
+    fn matches(self, kind: SymbolKind) -> bool {
+        match self {
+            Self::Exact(k) => kind == k,
+            Self::Callable => matches!(
+                kind,
+                SymbolKind::Fn
+                    | SymbolKind::Func
+                    | SymbolKind::Function
+                    | SymbolKind::Def
+                    | SymbolKind::AsyncDef
+            ),
+        }
+    }
+}
+
+fn parse_kind_filter(raw: &str) -> (Option<KindFilter>, &str) {
+    let t = raw.trim();
+    if let Some((prefix, rest)) = t.split_once(':') {
+        if !rest.starts_with(':') && !rest.trim().is_empty() {
+            let filter = match prefix.trim().to_ascii_lowercase().as_str() {
+                "struct" => Some(KindFilter::Exact(SymbolKind::Struct)),
+                "class" => Some(KindFilter::Exact(SymbolKind::Class)),
+                "enum" => Some(KindFilter::Exact(SymbolKind::Enum)),
+                "trait" => Some(KindFilter::Exact(SymbolKind::Trait)),
+                "interface" => Some(KindFilter::Exact(SymbolKind::Interface)),
+                "record" => Some(KindFilter::Exact(SymbolKind::Record)),
+                "type" => Some(KindFilter::Exact(SymbolKind::Type)),
+                "impl" => Some(KindFilter::Exact(SymbolKind::Impl)),
+                "mod" => Some(KindFilter::Exact(SymbolKind::Mod)),
+                "macro" => Some(KindFilter::Exact(SymbolKind::Macro)),
+                "fn" | "func" | "function" | "def" => Some(KindFilter::Callable),
+                _ => None,
+            };
+            if filter.is_some() {
+                return (filter, rest.trim());
+            }
+        }
+    }
+    (None, t)
+}
+
+fn is_primary_type_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Type
+            | SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::Record
+    )
+}
+
+fn split_owner_member(query: &str) -> Option<(&str, &str)> {
+    let (owner, member) = match (query.rfind("::"), query.rfind('.')) {
+        (Some(ci), Some(di)) => {
+            if ci >= di {
+                (&query[..ci], &query[ci + 2..])
+            } else {
+                (&query[..di], &query[di + 1..])
+            }
+        }
+        (Some(ci), None) => (&query[..ci], &query[ci + 2..]),
+        (None, Some(di)) => (&query[..di], &query[di + 1..]),
+        (None, None) => return None,
+    };
+    let owner = owner.rsplit("::").next().unwrap_or(owner).trim();
+    let member = member.trim();
+    (!owner.is_empty() && !member.is_empty()).then_some((owner, member))
+}
+
+fn enclosing_owner<'a>(symbols: &'a [SymbolSpan], sym: &SymbolSpan) -> Option<&'a str> {
+    symbols
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.kind,
+                SymbolKind::Impl
+                    | SymbolKind::Struct
+                    | SymbolKind::Class
+                    | SymbolKind::Trait
+                    | SymbolKind::Interface
+            ) && c.start_line < sym.start_line
+                && c.end_line >= sym.end_line
+        })
+        .min_by_key(|c| c.end_line.saturating_sub(c.start_line))
+        .map(|c| c.name.as_ref())
+}
+
+fn symbol_matches_in_file(
+    symbols: &[SymbolSpan],
+    sym: &SymbolSpan,
+    query: &str,
+    kind_filter: Option<KindFilter>,
+) -> bool {
+    if let Some(kf) = kind_filter {
+        if !kf.matches(sym.kind) {
+            return false;
+        }
+    }
+    if symbol_matches_query(&sym.name, query) {
+        return true;
+    }
+    if let Some((owner, member)) = split_owner_member(query) {
+        if symbol_matches_query(&sym.name, member)
+            && enclosing_owner(symbols, sym).is_some_and(|enc| symbol_matches_query(enc, owner))
+        {
+            return true;
+        }
+    }
+    false
+}
 
 fn ext_lower_buf<'a>(path: &Path, buf: &'a mut [u8; 16]) -> &'a str {
     let Some(raw) = path.extension().and_then(|s| s.to_str()) else {
@@ -89,7 +212,7 @@ pub fn op_symbols_with_options(
             ));
             continue;
         };
-        let query = sym_query.trim();
+        let (kind_filter, query) = parse_kind_filter(sym_query);
         let mut resolved = resolve_input_path(raw_path, cwd);
         if !resolved.exists()
             && is_safe_shorthand_candidate(raw_path)
@@ -106,8 +229,9 @@ pub fn op_symbols_with_options(
                     for cand in &found {
                         if let Ok((cf, wr)) = svc.allowlist.admit_file(cand, cwd) {
                             if let Ok(entry) = svc.store.get_outline_entry(&cf, Some(&wr)) {
-                                let has_sym =
-                                    entry.symbols.iter().any(|s| symbol_matches_query(&s.name, query));
+                                let has_sym = entry.symbols.iter().any(|s| {
+                                    symbol_matches_in_file(&entry.symbols, s, query, kind_filter)
+                                });
                                 if has_sym {
                                     let is_impl = cf
                                         .extension()
@@ -143,20 +267,34 @@ pub fn op_symbols_with_options(
                 let mut ext_buf = [0u8; 16];
                 let ext = ext_lower_buf(&canon, &mut ext_buf);
                 let compact_doc = !hashes && !raw && is_doc_or_config_ext(ext);
-                let matches: Vec<&SymbolSpan> = entry
+                let raw_matches: Vec<&SymbolSpan> = entry
                     .symbols
                     .iter()
-                    .filter(|s| symbol_matches_query(&s.name, query))
+                    .filter(|s| symbol_matches_in_file(&entry.symbols, s, query, kind_filter))
                     .collect();
 
-                if matches.is_empty() {
+                if raw_matches.is_empty() {
                     let avail = RamStore::format_outline_compact(&entry, 15);
                     out.push_str(&format!(
                         "=== {}#{} [NOT FOUND] ===\nAvailable: {}\n\n",
-                        entry.rel_path, query, avail
+                        entry.rel_path, sym_query.trim(), avail
                     ));
                     continue;
                 }
+
+                // When an unqualified query matches BOTH a type definition (`struct`/`enum`/`trait`)
+                // and Rust `impl` block(s) of the same name, emit the type definition only and list
+                // the `impl` blocks in a compact 1-line summary (fetch via `#impl:Type` / `#Type::method`).
+                let split_impls = kind_filter.is_none()
+                    && raw_matches.iter().any(|s| is_primary_type_kind(s.kind))
+                    && raw_matches.iter().any(|s| s.kind == SymbolKind::Impl);
+                let (matches, omitted_impls): (Vec<&SymbolSpan>, Vec<&SymbolSpan>) = if split_impls {
+                    raw_matches
+                        .into_iter()
+                        .partition(|s| s.kind != SymbolKind::Impl)
+                } else {
+                    (raw_matches, Vec::new())
+                };
 
                 let total_lines = entry.line_count as usize;
                 let mut spans_to_record = Vec::new();
@@ -166,7 +304,7 @@ pub fn op_symbols_with_options(
                     let s = (sym.start_line as usize).max(1);
                     let end = (sym.end_line as usize).min(total_lines);
                     let requested_end = if compact {
-                        end.min(s.saturating_add(23))
+                        end.min(s.saturating_add(COMPACT_SYMBOL_MAX_LINES - 1))
                     } else {
                         end
                     };
@@ -249,6 +387,38 @@ pub fn op_symbols_with_options(
                         out.push_str(cap_note);
                         clipped = true;
                         break;
+                    }
+                }
+
+                if !clipped && !omitted_impls.is_empty() {
+                    let mut parts: Vec<String> = Vec::with_capacity(omitted_impls.len());
+                    for imp in &omitted_impls {
+                        let fn_cnt = entry
+                            .symbols
+                            .iter()
+                            .filter(|m| {
+                                m.start_line > imp.start_line
+                                    && m.end_line <= imp.end_line
+                                    && KindFilter::Callable.matches(m.kind)
+                            })
+                            .count();
+                        if fn_cnt > 0 {
+                            parts.push(format!("L{}-L{} ({} fns)", imp.start_line, imp.end_line, fn_cnt));
+                        } else {
+                            parts.push(format!("L{}-L{}", imp.start_line, imp.end_line));
+                        }
+                    }
+                    let summary = format!(
+                        "[impl blocks for {}: {}; fetch via {}#impl:{} or {}#{}::<method>]\n\n",
+                        query,
+                        parts.join(", "),
+                        entry.rel_path,
+                        query,
+                        entry.rel_path,
+                        query
+                    );
+                    if out.len() + summary.len() <= limit {
+                        out.push_str(&summary);
                     }
                 }
 
@@ -337,5 +507,59 @@ mod tests {
         );
         assert!(hashed.contains(&expected));
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn rust_type_separates_impl_blocks_supports_qualified_methods_and_48l_compact() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ctx-sym-rust-impl-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        fs::create_dir(&workspace).unwrap();
+        let mut src = String::from(
+            "pub struct AccountReconciler {\n    pub equity: i64,\n    pub lots: i64,\n}\n\n\
+             impl AccountReconciler {\n    pub fn reconcile(&mut self) -> i64 {\n        self.equity + self.lots\n    }\n    pub fn reset(&mut self) {\n        self.lots = 0;\n    }\n}\n\n\
+             impl Default for AccountReconciler {\n    fn default() -> Self {\n        Self { equity: 0, lots: 0 }\n    }\n}\n\n\
+             pub fn quantize_budget_lots_down(budget: i64) -> i64 {\n",
+        );
+        for i in 1..=35 {
+            src.push_str(&format!("    let _s{i} = budget + {i};\n"));
+        }
+        src.push_str("    budget\n}\n\npub fn very_long_fn(x: i64) -> i64 {\n");
+        for i in 1..=58 {
+            src.push_str(&format!("    let _v{i} = x + {i};\n"));
+        }
+        src.push_str("    x\n}\n");
+        fs::write(workspace.join("reconciler.rs"), &src).unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(workspace.join("snapshot"));
+        svc.allowlist.register_hint(&workspace, true).unwrap();
+
+        // 1. `#AccountReconciler` returns ONLY the struct body + compact impl summary (not the impl bodies).
+        let ty = op_symbols(&svc, &["reconciler.rs#AccountReconciler".into()], 16_384, false, None, Some(&workspace), false).unwrap();
+        assert!(ty.contains("pub struct AccountReconciler"), "{ty}");
+        assert!(ty.contains("pub lots: i64,"), "{ty}");
+        assert!(!ty.contains("self.equity + self.lots"), "impl body should be omitted: {ty}");
+        assert!(ty.contains("[impl blocks for AccountReconciler:"), "{ty}");
+        assert!(ty.contains("#impl:AccountReconciler"), "{ty}");
+
+        // 2. `#impl:AccountReconciler` returns the impl blocks explicitly.
+        let im = op_symbols(&svc, &["reconciler.rs#impl:AccountReconciler".into()], 16_384, false, None, Some(&workspace), false).unwrap();
+        assert!(im.contains("impl AccountReconciler {") && im.contains("impl Default for AccountReconciler"), "{im}");
+        assert!(!im.contains("pub struct AccountReconciler"), "{im}");
+
+        // 3. `#AccountReconciler::reconcile` resolves method via enclosing `impl` owner.
+        let m = op_symbols(&svc, &["reconciler.rs#AccountReconciler::reconcile".into()], 16_384, false, None, Some(&workspace), false).unwrap();
+        assert!(m.contains("pub fn reconcile") && m.contains("self.equity + self.lots"), "{m}");
+        assert!(!m.contains("pub fn reset"), "{m}");
+
+        // 4. `compact=true` allows up to 48 lines (37-line fn completes in 1 call; 60-line fn cuts at 48L).
+        let q37 = op_symbols(&svc, &["reconciler.rs#quantize_budget_lots_down".into()], 16_384, true, None, Some(&workspace), false).unwrap();
+        assert!(q37.contains("let _s35 = budget + 35;") && !q37.contains("continue with"), "{q37}");
+        let q60 = op_symbols(&svc, &["reconciler.rs#very_long_fn".into()], 16_384, true, None, Some(&workspace), false).unwrap();
+        assert!(q60.contains("continue with reconciler.rs:"), "{q60}");
+
+        let _ = fs::remove_dir_all(&workspace);
     }
 }

@@ -4,7 +4,7 @@ use super::startup::startup_reply;
 use super::{
     apply_launch_receipt, build_scoped_session_key, codex_deny, extract_cwd, host_context,
     is_workspace_mutating_shell, mcp_context_rewrite, parse_tool_input_field,
-    register_payload_workspaces,
+    register_payload_workspaces, workspace_grep_redirect_reason,
 };
 use crate::base::json::Json;
 use crate::broker::key_in_assignment;
@@ -47,7 +47,15 @@ pub(super) fn handle_claude(svc: &BrokerService, payload: &Json) -> Json {
             }
         }
 
-        if tool_name == "Read" {
+        if tool_name == "Bash" {
+            if let Some(cmd) = tool_input.get_str("command") {
+                if let Some(reason) =
+                    workspace_grep_redirect_reason(svc, "claude", &sess_key, cmd, cwd.as_deref())
+                {
+                    return codex_deny(&reason);
+                }
+            }
+        } else if tool_name == "Read" {
             if let Some(fp) = tool_input.get_str("file_path") {
                 let p = resolve_input_path(fp, cwd.as_deref());
                 if let Ok((canon, root)) = svc.allowlist.admit_file(&p, cwd.as_deref()) {

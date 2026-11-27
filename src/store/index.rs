@@ -3,16 +3,23 @@
 
 use super::paths::{is_multimodal_or_binary_ext, should_skip_dir};
 use super::{now_ms, RamStore};
-use crate::base::security::is_sensitive_path_lexical;
+use crate::base::platform::{hidden_command, probe_tool_available, resolve_tool};
+use crate::base::security::{find_superproject_root, is_sensitive_path_lexical};
 use crate::base::simd::{
     fast_hash64_ascii_lower, trigram_bloom64_ascii_lower, FastHashMap, IdentityHashMap,
 };
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::process::{Child, Stdio};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const WORKSPACE_INDEX_TTL_MS: u64 = 5_000;
 const MAX_INDEXED_WORKSPACE_FILES: usize = 25_000;
+const GIT_LS_FILES_TIMEOUT: Duration = Duration::from_millis(1_500);
+const GIT_LS_FILES_STDOUT_CAP: usize = 4 << 20;
 
 #[derive(Clone, Debug)]
 pub enum MissingResolution {
@@ -180,10 +187,157 @@ fn parent_segments_compact_match(rel: &str, q_compact: &[u8]) -> bool {
     false
 }
 
+struct LsFilesChild(Child);
+impl Drop for LsFilesChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn run_git_ls_files_raw(dir: &Path, deadline: Instant) -> Option<Vec<u8>> {
+    let left = deadline.checked_duration_since(Instant::now())?;
+    if left.is_zero() {
+        return None;
+    }
+    let child = hidden_command(resolve_tool("git"))
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "--no-pager",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut guard = LsFilesChild(child);
+    let mut stdout = guard.0.stdout.take()?;
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    thread::Builder::new()
+        .name("ctx-git-ls".into())
+        .spawn(move || {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let keep = n.min(GIT_LS_FILES_STDOUT_CAP.saturating_sub(out.len()));
+                if keep > 0 {
+                    out.extend_from_slice(&buf[..keep]);
+                }
+                if out.len() >= GIT_LS_FILES_STDOUT_CAP {
+                    break;
+                }
+            }
+            let _ = tx.send(out);
+        })
+        .ok()?;
+    let bytes = rx
+        .recv_timeout(deadline.checked_duration_since(Instant::now())?)
+        .ok()?;
+    let status = loop {
+        let rem = deadline.checked_duration_since(Instant::now())?;
+        match guard.0.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => thread::sleep(rem.min(Duration::from_millis(5))),
+            Err(_) => return None,
+        }
+    };
+    status.success().then_some(bytes)
+}
+
+fn collect_git_workspace_rel_paths(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    depth: u8,
+    deadline: Instant,
+    out: &mut Vec<String>,
+) -> bool {
+    let Some(bytes) = run_git_ls_files_raw(dir, deadline) else {
+        return false;
+    };
+    for raw in bytes.split(|&b| b == 0) {
+        if out.len() >= MAX_INDEXED_WORKSPACE_FILES {
+            break;
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(entry_str) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        // Untracked nested git checkouts appear with a trailing `/` — skip them cleanly.
+        if entry_str.ends_with('/') {
+            continue;
+        }
+        let norm_entry = if entry_str.contains('\\') {
+            entry_str.replace('\\', "/")
+        } else {
+            entry_str.to_string()
+        };
+        let rel = if prefix.is_empty() {
+            norm_entry
+        } else {
+            format!("{prefix}/{norm_entry}")
+        };
+        if rel.split('/').any(should_skip_dir) {
+            continue;
+        }
+        let abs = root.join(&rel);
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            // Tracked git submodule gitlink (no trailing slash) — recurse one level cleanly.
+            if depth == 0 && abs.join(".git").exists() {
+                let _ = collect_git_workspace_rel_paths(root, &abs, &rel, 1, deadline, out);
+            }
+            continue;
+        }
+        if meta.is_file()
+            && !is_sensitive_path_lexical(&abs)
+            && !is_multimodal_or_binary_ext(&abs)
+        {
+            out.push(rel);
+        }
+    }
+    true
+}
+
 fn build_workspace_index(canon_root: &Path) -> WorkspaceFiles {
     let mut rel_list: Vec<String> = Vec::with_capacity(2048);
-    walk_workspace_rel_paths(canon_root, canon_root, &mut rel_list);
+    let in_git = canon_root.join(".git").exists() || find_superproject_root(canon_root).is_some();
+    let git_ok = in_git
+        && probe_tool_available("git").is_some()
+        && collect_git_workspace_rel_paths(
+            canon_root,
+            canon_root,
+            "",
+            0,
+            Instant::now() + GIT_LS_FILES_TIMEOUT,
+            &mut rel_list,
+        );
+    if !git_ok {
+        rel_list.clear();
+        walk_workspace_rel_paths(canon_root, canon_root, &mut rel_list);
+    }
     rel_list.sort_unstable();
+    rel_list.dedup();
 
     let total_bytes: usize = rel_list.iter().map(|s| s.len()).sum();
     let mut arena = Vec::with_capacity(total_bytes);
@@ -259,7 +413,8 @@ fn walk_workspace_rel_paths(root: &Path, dir: &Path, out: &mut Vec<String>) {
         }
         if meta.is_dir() {
             let dname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !should_skip_dir(dname) {
+            // Skip nested git repositories (e.g. vendored checkouts like `ccxt-rs/`) on FS walk.
+            if !should_skip_dir(dname) && !path.join(".git").exists() {
                 walk_workspace_rel_paths(root, &path, out);
             }
         } else if meta.is_file()
@@ -680,5 +835,54 @@ impl RamStore {
         });
         pool.truncate(8);
         MissingResolution::Ambiguous(pool)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_index_respects_gitignore_and_skips_nested_git_checkouts() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-ws-idx-git-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(dir.join("ccxt-rs/.git")).unwrap();
+        fs::create_dir_all(dir.join("ignored_dir")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "ignored_dir/\n").unwrap();
+        fs::write(dir.join("ccxt-rs/nested.rs"), "fn nested() {}\n").unwrap();
+        fs::write(dir.join("ignored_dir/skip.rs"), "fn skip() {}\n").unwrap();
+        fs::write(dir.join("src/live.rs"), "fn live() {}\n").unwrap();
+
+        let canon = fs::canonicalize(&dir).unwrap();
+        // 1. Non-git workspace still skips nested `.git` checkout (`ccxt-rs/`).
+        let non_git = build_workspace_index(&canon);
+        let non_git_rels: Vec<&str> = non_git.entries.iter().map(|e| non_git.rel_str(e)).collect();
+        assert!(non_git_rels.contains(&"src/live.rs"), "{non_git_rels:?}");
+        assert!(!non_git_rels.iter().any(|r| r.starts_with("ccxt-rs/")), "{non_git_rels:?}");
+
+        // 2. Git workspace respects `.gitignore` AND skips untracked nested `.git` checkout.
+        let git_ok = hidden_command(resolve_tool("git"))
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if git_ok {
+            let _ = hidden_command(resolve_tool("git"))
+                .arg("-C")
+                .arg(dir.join("ccxt-rs"))
+                .args(["init", "-q"])
+                .status();
+            let git_idx = build_workspace_index(&canon);
+            let rels: Vec<&str> = git_idx.entries.iter().map(|e| git_idx.rel_str(e)).collect();
+            assert!(rels.contains(&"src/live.rs"), "{rels:?}");
+            assert!(!rels.iter().any(|r| r.starts_with("ignored_dir/")), "{rels:?}");
+            assert!(!rels.iter().any(|r| r.starts_with("ccxt-rs/")), "{rels:?}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

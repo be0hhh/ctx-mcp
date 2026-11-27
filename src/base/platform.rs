@@ -14,23 +14,44 @@ const MIN_AUTO_RAM_BYTES: usize = 128 << 20;
 const MAX_DYNAMIC_TOOLS: usize = 16;
 
 /// Resolves an external CLI tool (`"rg"`, `"git"`, etc.) from `PATH` first, then
-/// OS-standard fallback directories, caching the result for the process lifetime.
+/// OS-standard and bundled IDE/CLI fallback directories. Caches only positive hits so
+/// newly installed binaries (e.g. `brew install ripgrep`) are discovered immediately
+/// without restarting a running daemon.
 pub fn resolve_tool(name: &str) -> &'static Path {
     match name {
         "rg" => {
             static P: OnceLock<PathBuf> = OnceLock::new();
-            P.get_or_init(|| resolve_tool_uncached("rg")).as_path()
+            resolve_cached(&P, "rg")
         }
         "git" => {
             static P: OnceLock<PathBuf> = OnceLock::new();
-            P.get_or_init(|| resolve_tool_uncached("git")).as_path()
+            resolve_cached(&P, "git")
         }
         "curl" => {
             static P: OnceLock<PathBuf> = OnceLock::new();
-            P.get_or_init(|| resolve_tool_uncached("curl")).as_path()
+            resolve_cached(&P, "curl")
         }
         other => resolve_dynamic_tool(other),
     }
+}
+
+fn resolve_cached(slot: &'static OnceLock<PathBuf>, name: &'static str) -> &'static Path {
+    if let Some(cached) = slot.get() {
+        return cached.as_path();
+    }
+    if let Some(found) = probe_tool_available(name) {
+        return slot.get_or_init(|| found).as_path();
+    }
+    Path::new(name)
+}
+
+/// Probes whether an external CLI tool resolves to a real executable file on disk
+/// (`PATH`, OS standard directories, and bundled IDE/Claude `rg` locations).
+pub fn probe_tool_available(name: &str) -> Option<PathBuf> {
+    let exe = tool_exe_name(name);
+    resolve_tool_in_path_var(std::env::var_os("PATH").as_deref(), &exe)
+        .or_else(|| resolve_tool_in_os_fallbacks(&exe))
+        .or_else(|| probe_bundled_rg(&exe))
 }
 
 fn resolve_dynamic_tool(name: &str) -> &'static Path {
@@ -41,7 +62,9 @@ fn resolve_dynamic_tool(name: &str) -> &'static Path {
             return cached;
         }
         if map.len() < MAX_DYNAMIC_TOOLS {
-            let leaked: &'static Path = Box::leak(resolve_tool_uncached(name).into_boxed_path());
+            let resolved = probe_tool_available(name)
+                .unwrap_or_else(|| PathBuf::from(tool_exe_name(name).as_ref()));
+            let leaked: &'static Path = Box::leak(resolved.into_boxed_path());
             map.insert(Box::from(name), leaked);
             return leaked;
         }
@@ -61,9 +84,108 @@ fn tool_exe_name(name: &str) -> Cow<'_, str> {
 }
 
 #[inline]
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[inline]
 fn probe_dir(dir: &Path, exe: &str) -> Option<PathBuf> {
     let cand = dir.join(exe);
-    cand.is_file().then_some(cand)
+    is_executable_file(&cand).then_some(cand)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[inline]
+fn probe_exact_file(path: &Path) -> Option<PathBuf> {
+    is_executable_file(path).then(|| path.to_path_buf())
+}
+
+fn probe_bundled_rg(exe: &str) -> Option<PathBuf> {
+    if !(exe.eq_ignore_ascii_case("rg") || exe.eq_ignore_ascii_case("rg.exe")) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for app_rg in [
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
+            "/Applications/Cursor.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
+            "/Applications/Antigravity.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
+        ] {
+            if let Some(found) = probe_exact_file(Path::new(app_rg)) {
+                return Some(found);
+            }
+        }
+        let arch_dir = if cfg!(target_arch = "aarch64") { "arm64-darwin" } else { "x64-darwin" };
+        for prefix in ["/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules"] {
+            let p = Path::new(prefix)
+                .join("@anthropic-ai/claude-code/vendor/ripgrep")
+                .join(arch_dir)
+                .join("rg");
+            if let Some(found) = probe_exact_file(&p) {
+                return Some(found);
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from) {
+            for rel in [
+                ".claude/local/node_modules/@anthropic-ai/claude-code/vendor/ripgrep",
+                ".npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep",
+            ] {
+                let p = home.join(rel).join(arch_dir).join("rg");
+                if let Some(found) = probe_exact_file(&p) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for app_rg in [
+            "/usr/share/code/resources/app/node_modules/@vscode/ripgrep/bin/rg",
+            "/usr/share/cursor/resources/app/node_modules/@vscode/ripgrep/bin/rg",
+        ] {
+            if let Some(found) = probe_exact_file(Path::new(app_rg)) {
+                return Some(found);
+            }
+        }
+        let arch_dir = if cfg!(target_arch = "aarch64") { "arm64-linux" } else { "x64-linux" };
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from) {
+            for rel in [
+                ".claude/local/node_modules/@anthropic-ai/claude-code/vendor/ripgrep",
+                ".npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep",
+            ] {
+                let p = home.join(rel).join(arch_dir).join("rg");
+                if let Some(found) = probe_exact_file(&p) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        probe_env_sub("LOCALAPPDATA", &["Programs", "Microsoft VS Code", "resources", "app", "node_modules", "@vscode", "ripgrep", "bin"], exe)
+            .or_else(|| probe_env_sub("LOCALAPPDATA", &["Programs", "cursor", "resources", "app", "node_modules", "@vscode", "ripgrep", "bin"], exe))
+            .or_else(|| probe_env_sub("APPDATA", &["npm", "node_modules", "@anthropic-ai", "claude-code", "vendor", "ripgrep", "x64-win32"], exe))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -111,13 +233,6 @@ fn resolve_tool_in_os_fallbacks(exe: &str) -> Option<PathBuf> {
 
     #[cfg(not(any(unix, windows)))]
     { let _ = exe; None }
-}
-
-fn resolve_tool_uncached(name: &str) -> PathBuf {
-    let exe = tool_exe_name(name);
-    resolve_tool_in_path_var(std::env::var_os("PATH").as_deref(), &exe)
-        .or_else(|| resolve_tool_in_os_fallbacks(&exe))
-        .unwrap_or_else(|| PathBuf::from(exe.as_ref()))
 }
 
 /// Constructs a `Command` that suppresses console windows on Windows (`CREATE_NO_WINDOW`).
@@ -253,7 +368,25 @@ mod tests {
         let fake = dir.join(exe.as_ref());
         std::fs::write(&fake, b"dummy").unwrap();
         let pv = std::env::join_paths([&dir]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(resolve_tool_in_path_var(Some(pv.as_os_str()), &exe), None);
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         assert_eq!(resolve_tool_in_path_var(Some(pv.as_os_str()), &exe), Some(fake));
+        // Directories with the tool name must never match as executables.
+        let dir_cand = dir.join(tool_exe_name("ctx_dir_tool").as_ref());
+        let _ = std::fs::create_dir_all(&dir_cand);
+        assert_eq!(
+            resolve_tool_in_path_var(Some(pv.as_os_str()), &tool_exe_name("ctx_dir_tool")),
+            None
+        );
+        // Misses are never permanently cached in `OnceLock`.
+        static MISS_SLOT: OnceLock<PathBuf> = OnceLock::new();
+        assert_eq!(resolve_cached(&MISS_SLOT, "ctx_nonexistent_tool_999"), Path::new("ctx_nonexistent_tool_999"));
+        assert!(MISS_SLOT.get().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

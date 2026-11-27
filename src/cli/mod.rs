@@ -170,6 +170,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "outline" => {
             let mut max_files: i64 = 40;
             let mut max_bytes: i64 = 0;
+            let mut max_symbols: i64 = 0;
             let mut paths = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -183,6 +184,11 @@ pub fn dispatch(args: &[String]) -> i32 {
                     if let Ok(v) = args[i].parse::<i64>() {
                         max_bytes = v;
                     }
+                } else if args[i] == "--max-symbols" && i + 1 < args.len() {
+                    i += 1;
+                    if let Ok(v) = args[i].parse::<i64>() {
+                        max_symbols = v;
+                    }
                 } else {
                     paths.push(Json::Str(args[i].clone()));
                 }
@@ -193,6 +199,7 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("max_files", Json::Int(max_files)),
                 ("max_bytes", Json::Int(max_bytes)),
+                ("max_symbols", Json::Int(max_symbols)),
                 ("paths", Json::Arr(paths)),
             ]));
             print_reply(&reply)
@@ -768,10 +775,10 @@ fn print_usage() {
          \x20 ctx uninstall [--targets agy,claude,codex] [--all] [--keep-binary] [--no-wsl-bridge]\n\
          \x20 ctx doctor [--json]\n\
          \x20 ctx mode [write|read-only]\n\
-         \x20 ctx update [--check] [--rebuild] [--force] [--json]\n\
+         \x20 ctx update [--check] [--rebuild] [--force] [--auto [off|patch|all]] [--json]\n\
          \x20 ctx inspect <file_or_dir...> [--max-files 80] [--max-bytes 1048576] [--warn-lines 600]\n\
          \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--force] [--hashes]\n\
-         \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-bytes N]\n\
+         \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-symbols N] [--max-bytes N]\n\
          \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--max-bytes 1048576]\n\
          \x20 ctx search -q <ModOrDir:query> [-q ...] [--code-only] [--max-bytes 8192]\n\
          \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--code-only] [--max-bytes 8192]\n\

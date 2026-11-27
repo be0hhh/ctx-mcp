@@ -9,8 +9,8 @@ use super::startup::{classify_agy_startup, prewarm_and_build_startup_capsule, Ag
 use super::{
     capsule_auto_stage_enabled, delivery_notice, detect_shell_file_slicing, extract_cwd,
     host_context, is_internal_ide_path, is_workspace_mutating_shell, mcp_context_rewrite,
-    passthrough, register_payload_workspaces, replace_field, AGY_NATIVE_DELIVERY_BYTE_CAP,
-    AGY_NATIVE_LINE_CAP, AGY_WIDEN_MAX_BYTES,
+    passthrough, register_payload_workspaces, replace_field, workspace_grep_redirect_reason,
+    AGY_NATIVE_DELIVERY_BYTE_CAP, AGY_NATIVE_LINE_CAP, AGY_WIDEN_MAX_BYTES,
 };
 use crate::base::json::{Json, JsonKey};
 use crate::base::security::is_sensitive_path;
@@ -522,6 +522,14 @@ pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                             ("reason", Json::Str(reason)),
                         ]);
                     }
+                }
+                if let Some(reason) =
+                    workspace_grep_redirect_reason(svc, "agy", &sess_key, cmd, cwd.as_deref())
+                {
+                    return Json::obj(vec![
+                        ("decision", Json::Str("deny".to_string())),
+                        ("reason", Json::Str(reason)),
+                    ]);
                 }
                 if let Some(hit) = detect_shell_file_slicing(svc, cmd, cwd.as_deref()) {
                     let outline = svc

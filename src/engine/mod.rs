@@ -17,7 +17,9 @@ pub mod symbols;
 #[allow(unused_imports)]
 pub use elf_audit::op_elf_audit;
 pub use elf_audit::op_elf_audit_with_baseline;
-pub use outline::{op_inspect, op_outline};
+#[allow(unused_imports)]
+pub use outline::op_outline;
+pub use outline::{op_inspect, op_outline_with_options};
 pub use read::op_read_for_host;
 pub use search::{
     cap_text, op_search, op_search_batch, parse_shorthand_search_spec, SearchError, SearchOptions,

@@ -280,6 +280,10 @@ fn invoke_mcp_tool(
                 "max_bytes",
                 Json::Int(args.get_i64("max_bytes").unwrap_or(0)),
             ),
+            (
+                "max_symbols",
+                Json::Int(args.get_i64("max_symbols").unwrap_or(0)),
+            ),
         ]),
         "ctx_inspect" => Json::obj(vec![
             ("op", Json::Str("inspect".to_string())),

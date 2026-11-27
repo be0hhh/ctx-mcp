@@ -15,10 +15,12 @@ mod startup;
 
 use crate::base::json::{self, Json};
 use crate::base::security::is_sensitive_path;
+use crate::base::simd::fast_hash64;
 use crate::broker::{HostContext, Recipient};
 use crate::rpc::BrokerService;
 use crate::store::{
-    is_multimodal_or_binary_ext, resolve_input_path, MAX_SINGLE_FILE_CACHE_BYTES,
+    display_workspace_path, is_multimodal_or_binary_ext, resolve_input_path,
+    MAX_SINGLE_FILE_CACHE_BYTES,
 };
 use agy::handle_agy;
 use claude::handle_claude;
@@ -33,7 +35,7 @@ const AGY_NATIVE_DELIVERY_BYTE_CAP: usize = 46_080;
 const AGY_WIDEN_MAX_BYTES: u32 = 44_000;
 const STARTUP_BUDGET_BYTES: usize = 2500;
 
-const SUBAGENT_STARTUP_DIGEST: &str = "Batch calls: ctx_inspect (dirs), ctx_search (`q`: 1-4 `Mod:pat`), ctx_symbols (`compact=true`), ctx_read (slices >800L in AGY or full files <=1MiB in Codex); use CLI `ctx inspect|search|outline|sym` if MCP is absent. Finish from search/symbols when sufficient.";
+const SUBAGENT_STARTUP_DIGEST: &str = "Batch calls: ctx_inspect (dirs), ctx_search (`q`: 1-6 `Mod:pat`), ctx_symbols (full body; `compact=true` <=48L), ctx_read (slices >800L in AGY or full files <=1MiB in Codex); use CLI `ctx inspect|search|outline|sym` if MCP is absent. Finish from search/symbols when sufficient.";
 
 const AGY_LAZY_MCP_SIGNATURES: &str = "In Antigravity: call eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`) and prefer parallel native `read_file` (<=800L/46KB inline) for full files; use `call_mcp_tool` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) or CLI `ctx` when MCP is absent.";
 
@@ -516,6 +518,306 @@ fn detect_shell_file_slicing(
     None
 }
 
+fn split_shell_tokens(raw: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == '\\' && q == '"' {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            } else if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                in_token = true;
+            }
+            c if c.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            '\\' => {
+                in_token = true;
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            c => {
+                cur.push(c);
+                in_token = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_token {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+fn has_single_colon(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b':' {
+            if b.get(i + 1) == Some(&b':') {
+                while i < b.len() && b[i] == b':' {
+                    i += 1;
+                }
+                continue;
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn detect_workspace_shell_grep(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<(String, String)> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\n')
+        || trimmed.contains('|')
+        || trimmed.contains("&&")
+        || trimmed.contains(';')
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+    {
+        return None;
+    }
+    let tokens = split_shell_tokens(trimmed)?;
+    if tokens.len() < 2 {
+        return None;
+    }
+    let prog = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tokens[0].as_str());
+    if !matches!(prog, "grep" | "egrep" | "fgrep" | "rg") {
+        return None;
+    }
+
+    let mut pattern: Option<String> = None;
+    let mut targets: Vec<String> = Vec::new();
+    let mut after_dd = false;
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if !after_dd && tok == "--" {
+            after_dd = true;
+            i += 1;
+            continue;
+        }
+        if !after_dd && tok.starts_with("--") {
+            let flag = tok.split_once('=').map_or(tok, |(f, _)| f);
+            if matches!(
+                flag,
+                "--files"
+                    | "--count"
+                    | "--files-with-matches"
+                    | "--files-without-match"
+                    | "--only-matching"
+                    | "--invert-match"
+                    | "--json"
+                    | "--vimgrep"
+                    | "--stats"
+                    | "--version"
+                    | "--help"
+                    | "--replace"
+                    | "--file"
+                    | "--null"
+                    | "--null-data"
+                    | "--passthru"
+                    | "--type-list"
+            ) {
+                return None;
+            }
+            if flag == "--regexp" {
+                let val = if let Some((_, v)) = tok.split_once('=') {
+                    v.to_string()
+                } else {
+                    i += 1;
+                    tokens.get(i)?.clone()
+                };
+                if pattern.is_none() {
+                    pattern = Some(val);
+                }
+            } else if !tok.contains('=')
+                && matches!(
+                    flag,
+                    "--max-count"
+                        | "--context"
+                        | "--after-context"
+                        | "--before-context"
+                        | "--glob"
+                        | "--type"
+                        | "--type-not"
+                        | "--include"
+                        | "--exclude"
+                        | "--exclude-dir"
+                        | "--max-depth"
+                        | "--color"
+                        | "--colors"
+                        | "--threads"
+                )
+            {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if !after_dd && tok.starts_with('-') && tok.len() > 1 {
+            if let Some(rest) = tok.strip_prefix("-e") {
+                let val = if rest.is_empty() {
+                    i += 1;
+                    tokens.get(i)?.clone()
+                } else {
+                    rest.to_string()
+                };
+                if pattern.is_none() {
+                    pattern = Some(val);
+                }
+                i += 1;
+                continue;
+            }
+            if matches!(tok, "-m" | "-A" | "-B" | "-C" | "-g" | "-t" | "-T" | "-j") {
+                i += 2;
+                continue;
+            }
+            let flags = &tok[1..];
+            if flags.bytes().any(|b| {
+                matches!(
+                    b,
+                    b'c' | b'e' | b'l' | b'L' | b'o' | b'v' | b'f' | b'q' | b'z' | b'h' | b'V'
+                )
+            }) {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(tok.to_string());
+        } else {
+            targets.push(tok.to_string());
+        }
+        i += 1;
+    }
+
+    let pat = pattern.filter(|p| !p.trim().is_empty())?;
+    let scope_rel = if targets.is_empty() {
+        let base = cwd?;
+        if is_internal_ide_path(base) || is_sensitive_path(base) {
+            return None;
+        }
+        let (canon, ws_root) = svc.allowlist.admit_dir(base, Some(base)).ok()?;
+        if canon == ws_root {
+            String::new()
+        } else {
+            display_workspace_path(&canon, Some(&ws_root))
+        }
+    } else {
+        let mut first_rel: Option<String> = None;
+        for raw_t in &targets {
+            if raw_t.contains('*') || raw_t.contains('?') || raw_t.contains('[') {
+                return None;
+            }
+            let p = resolve_input_path(raw_t, cwd);
+            if is_sensitive_path(&p) || is_internal_ide_path(&p) || is_multimodal_or_binary_ext(&p) {
+                return None;
+            }
+            let (canon, ws_root) = if p.is_dir() {
+                svc.allowlist.admit_dir(&p, cwd).ok()?
+            } else if p.is_file() {
+                svc.allowlist.admit_file(&p, cwd).ok()?
+            } else {
+                return None;
+            };
+            if first_rel.is_none() {
+                first_rel = Some(if canon == ws_root {
+                    String::new()
+                } else {
+                    display_workspace_path(&canon, Some(&ws_root))
+                });
+            }
+        }
+        if targets.len() == 1 {
+            first_rel.unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+
+    Some((scope_rel, pat))
+}
+
+pub(super) fn workspace_grep_redirect_reason(
+    svc: &BrokerService,
+    host: &str,
+    sess_key: &str,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    let (scope_rel, pat) = detect_workspace_shell_grep(svc, cmd, cwd)?;
+    let strike_key = format!(
+        "{}:{}:ShellGrep:{:016x}",
+        host,
+        sess_key,
+        fast_hash64(cmd.trim().as_bytes())
+    );
+    if svc.store.check_and_mark_dedup(&strike_key) {
+        return None;
+    }
+    let use_query_form = scope_rel.is_empty() && has_single_colon(&pat);
+    let (mcp_args, cli_cmd) = if use_query_form {
+        let escaped = pat.replace('\\', "\\\\").replace('"', "\\\"");
+        (
+            format!("{{\"query\": \"{escaped}\"}}"),
+            format!("ctx search \"{escaped}\""),
+        )
+    } else {
+        let q_arg = if scope_rel.is_empty() {
+            pat
+        } else {
+            format!("{scope_rel}:{pat}")
+        };
+        let escaped = q_arg.replace('\\', "\\\\").replace('"', "\\\"");
+        (
+            format!("{{\"q\": [\"{escaped}\"]}}"),
+            format!("ctx search -q \"{escaped}\""),
+        )
+    };
+    if host == "agy" {
+        Some(format!(
+            "[RAM-Ctx] Use `ctx_search` for workspace search instead of shell `grep`/`rg`: `mcp_agent_ctx_ctx_search({mcp_args})` (or `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_search\", Arguments={mcp_args})` / CLI `{cli_cmd}`). (Repeat this exact command once if raw grep/rg output is strictly required.)"
+        ))
+    } else {
+        Some(format!(
+            "[RAM-Ctx] Use `ctx_search` for workspace search instead of shell `grep`/`rg`: `ctx_search({mcp_args})` (CLI `{cli_cmd}`). (Repeat this exact command once if raw grep/rg output is strictly required.)"
+        ))
+    }
+}
+
 fn parse_tool_input_field(payload: &Json) -> Json {
     match payload.get("tool_input") {
         Some(Json::Str(s)) => json::parse(s).unwrap_or_else(|_| Json::Str(s.clone())),
@@ -729,5 +1031,52 @@ mod tests {
         assert_eq!(found, vec![root.join("packages").join("Core").join("Math")]);
 
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn workspace_grep_redirect_is_one_strike_and_allows_external_pipes_and_count_flags() {
+        let base = std::env::temp_dir().join(format!(
+            "ctx-hooks-grep-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        let ws = base.join("repo");
+        let outside = base.join("outside.log");
+        fs::create_dir_all(ws.join("backend")).unwrap();
+        fs::write(ws.join("backend/views.py"), "LEGAL_DOCUMENT_VERSION = 2\n").unwrap();
+        fs::write(&outside, "LEGAL_DOCUMENT_VERSION = 9\n").unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(base.join("snap.bin"));
+        svc.allowlist.register_hint(&ws, true).unwrap();
+
+        // 1. Simple workspace grep/rg is redirected once, then allowed on repeat (1-strike escape).
+        let cmd = "grep -n \"LEGAL_DOCUMENT_VERSION\" backend/views.py";
+        let r1 = workspace_grep_redirect_reason(&svc, "agy", "agy:old-chat", cmd, Some(&ws))
+            .expect("first workspace grep should redirect");
+        assert!(r1.contains("backend/views.py:LEGAL_DOCUMENT_VERSION"), "{r1}");
+        assert!(r1.contains("call_mcp_tool"), "{r1}");
+        assert!(
+            workspace_grep_redirect_reason(&svc, "agy", "agy:old-chat", cmd, Some(&ws)).is_none(),
+            "repeat of exact grep must pass through"
+        );
+
+        // 2. External file outside workspace is NEVER blocked.
+        let ext_cmd = format!("grep -n \"LEGAL_DOCUMENT_VERSION\" {}", outside.display());
+        assert!(workspace_grep_redirect_reason(&svc, "claude", "claude:s1", &ext_cmd, Some(&ws)).is_none());
+
+        // 3. Pipelines, count/list flags, and `rg --files` pass straight through.
+        for ok_cmd in [
+            "grep -c LEGAL_DOCUMENT_VERSION backend/views.py",
+            "grep -n LEGAL_DOCUMENT_VERSION backend/views.py | head -n 5",
+            "rg --files backend",
+            "rg -l LEGAL_DOCUMENT_VERSION backend",
+        ] {
+            assert!(
+                workspace_grep_redirect_reason(&svc, "codex", "codex:s1", ok_cmd, Some(&ws)).is_none(),
+                "should not redirect `{ok_cmd}`"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

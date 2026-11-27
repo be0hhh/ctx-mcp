@@ -30,6 +30,7 @@ pub(super) struct SearchHitSet {
     pub hits: Vec<SearchHit>,
     pub total_found: usize,
     pub scan_truncated: bool,
+    pub incomplete_note: Option<&'static str>,
     pub omitted_scopes: Vec<OmittedScope>,
 }
 
@@ -286,6 +287,7 @@ pub(super) fn rank_and_select_hits(
             hits: Vec::new(),
             total_found: 0,
             scan_truncated,
+            incomplete_note: None,
             omitted_scopes: Vec::new(),
         };
     }
@@ -372,6 +374,7 @@ pub(super) fn rank_and_select_hits(
             hits: out,
             total_found,
             scan_truncated,
+            incomplete_note: None,
             omitted_scopes: Vec::new(),
         };
     }
@@ -435,7 +438,7 @@ pub(super) fn rank_and_select_hits(
             }
         }
     }
-    SearchHitSet { hits: out, total_found, scan_truncated, omitted_scopes }
+    SearchHitSet { hits: out, total_found, scan_truncated, incomplete_note: None, omitted_scopes }
 }
 
 #[cfg(test)]

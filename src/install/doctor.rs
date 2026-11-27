@@ -70,36 +70,71 @@ pub fn run_doctor_cli(args: &[String]) -> i32 {
             write_mode.source.as_str()
         ),
     );
+    let auto_mode = update_status.get_str("auto_update").unwrap_or("off");
     let update_detail = if update_status.get_bool("update_available") == Some(true) {
         let latest = update_status.get_str("latest").unwrap_or("unknown");
         let url = update_status.get_str("url").unwrap_or("");
         if flavor == "upstream" {
             format!(
-                "update available: v{} -> {} ({}) — run `ctx update`",
+                "update available: v{} -> {} ({}, auto={}) — run `ctx update`",
                 update::CURRENT_VERSION,
                 latest,
-                url
+                url,
+                auto_mode
             )
         } else {
             let hint = ext::policy().update_hint().unwrap_or("local rebuild");
             format!(
-                "upstream {} released ({}); local {} build active — {}",
-                latest, url, flavor, hint
+                "upstream {} released ({}, auto={}); local {} build active — {}",
+                latest, url, auto_mode, flavor, hint
             )
         }
     } else if let Some(latest) = update_status.get_str("latest").filter(|s| !s.is_empty()) {
         format!(
-            "up to date (current=v{}, latest={})",
+            "up to date (current=v{}, latest={}, auto={})",
             update::CURRENT_VERSION,
-            latest
+            latest,
+            auto_mode
         )
     } else {
         format!(
-            "no cached release check (current=v{}, run `ctx update --check`)",
-            update::CURRENT_VERSION
+            "no cached release check (current=v{}, auto={}, run `ctx update --check`)",
+            update::CURRENT_VERSION,
+            auto_mode
         )
     };
     record("update_check", true, update_detail);
+
+    // 1b. Search backend (`rg` primary -> `git grep` fallback -> bounded FS walker)
+    match (
+        crate::base::platform::probe_tool_available("rg"),
+        crate::base::platform::probe_tool_available("git"),
+    ) {
+        (Some(rg), Some(git)) => record(
+            "search_backend",
+            true,
+            format!("rg at {} (git fallback at {})", rg.display(), git.display()),
+        ),
+        (Some(rg), None) => record(
+            "search_backend",
+            true,
+            format!("rg at {} (git not found)", rg.display()),
+        ),
+        (None, Some(git)) => record(
+            "search_backend",
+            true,
+            format!(
+                "git grep fallback at {} (rg not found — install ripgrep for fastest regex/non-git search)",
+                git.display()
+            ),
+        ),
+        (None, None) => record(
+            "search_backend",
+            false,
+            "neither rg nor git found; repo-wide search uses bounded FS walker (install ripgrep)"
+                .to_string(),
+        ),
+    }
 
     // 2. Daemon IPC + `0600` `daemon.json`
     let status_reply =

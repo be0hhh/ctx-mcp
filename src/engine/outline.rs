@@ -6,11 +6,23 @@ use crate::store::{display_workspace_path, CachedFile};
 use std::path::Path;
 use std::sync::Arc;
 
+#[allow(dead_code)]
 pub fn op_outline(
     svc: &BrokerService,
     targets: &[String],
     max_files: usize,
     max_bytes: usize,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
+    op_outline_with_options(svc, targets, max_files, max_bytes, 0, cwd)
+}
+
+pub fn op_outline_with_options(
+    svc: &BrokerService,
+    targets: &[String],
+    max_files: usize,
+    max_bytes: usize,
+    max_symbols: usize,
     cwd: Option<&Path>,
 ) -> Result<String, String> {
     if targets.is_empty() {
@@ -22,6 +34,7 @@ pub fn op_outline(
         return Ok("No matching readable text source files found.".to_string());
     }
 
+    let single_file = files.len() == 1;
     let many_files = files.len() > 10;
     let budget = if max_bytes > 0 {
         max_bytes.clamp(1024, DEFAULT_READ_MAX_BYTES)
@@ -30,12 +43,21 @@ pub fn op_outline(
     } else {
         65_536
     };
-    let sym_cap = if many_files { 12 } else { 80 };
+    let sym_cap = if max_symbols > 0 {
+        max_symbols.clamp(1, 2_000)
+    } else if single_file {
+        usize::MAX
+    } else if many_files {
+        12
+    } else {
+        80
+    };
 
     let mut out = String::with_capacity(budget.min(8192));
     let total_files = files.len();
     for (idx, (file, ws_root)) in files.into_iter().enumerate() {
         let mut block = String::with_capacity(256);
+        let mut budget_hit = false;
         match svc.store.get_outline_entry(&file, Some(&ws_root)) {
             Ok(entry) => {
                 block.push_str("## ");
@@ -48,25 +70,40 @@ pub fn op_outline(
                 if entry.symbols.is_empty() {
                     block.push_str("  (no structural symbols extracted)\n");
                 } else {
+                    let mut emitted = 0usize;
+                    let mut row = String::with_capacity(160);
                     for sym in entry.symbols.iter().take(sym_cap) {
-                        block.push_str("  [L");
-                        push_u32(&mut block, sym.start_line);
-                        block.push_str("-L");
-                        push_u32(&mut block, sym.end_line);
-                        block.push_str("] ");
-                        block.push_str(sym.kind.as_str());
-                        block.push(' ');
-                        block.push_str(&sym.name);
+                        row.clear();
+                        row.push_str("  [L");
+                        push_u32(&mut row, sym.start_line);
+                        row.push_str("-L");
+                        push_u32(&mut row, sym.end_line);
+                        row.push_str("] ");
+                        row.push_str(sym.kind.as_str());
+                        row.push(' ');
+                        row.push_str(&sym.name);
                         if !many_files && !sym.signature.is_empty() {
-                            block.push_str(" — ");
-                            block.push_str(&sym.signature);
+                            row.push_str(" — ");
+                            row.push_str(&sym.signature);
                         }
-                        block.push('\n');
+                        row.push('\n');
+                        if out.len() + block.len() + row.len() + 96 > budget && emitted > 0 {
+                            budget_hit = true;
+                            break;
+                        }
+                        block.push_str(&row);
+                        emitted += 1;
                     }
-                    if entry.symbols.len() > sym_cap {
+                    if budget_hit && entry.symbols.len() > emitted {
+                        block.push_str("  ... +");
+                        push_usize(&mut block, entry.symbols.len() - emitted);
+                        block.push_str(" more symbols omitted at ");
+                        push_usize(&mut block, budget);
+                        block.push_str("B budget; pass larger max_bytes\n");
+                    } else if entry.symbols.len() > sym_cap {
                         block.push_str("  ... +");
                         push_usize(&mut block, entry.symbols.len() - sym_cap);
-                        block.push_str(" more symbols\n");
+                        block.push_str(" more symbols (pass max_symbols to raise)\n");
                     }
                 }
             }
@@ -87,6 +124,16 @@ pub fn op_outline(
             break;
         }
         out.push_str(&block);
+        if budget_hit {
+            if idx + 1 < total_files {
+                out.push_str(&format!(
+                    "... (+{} more files omitted at {}B budget; use `ctx_inspect` for multi-folder triage)\n",
+                    total_files - idx - 1,
+                    budget
+                ));
+            }
+            break;
+        }
     }
     Ok(out)
 }
@@ -422,4 +469,44 @@ pub fn op_inspect(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn single_file_outline_lists_over_80_symbols_and_honors_max_symbols_and_budget() {
+        let ws = std::env::temp_dir().join(format!(
+            "ctx-outline-cap-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        fs::create_dir(&ws).unwrap();
+        let src: String = (1..=144)
+            .map(|i| format!("pub fn sym_{i:03}(x: u64) -> u64 {{ x + {i} }}\n"))
+            .collect();
+        fs::write(ws.join("exit.rs"), src).unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(ws.join("snap.bin"));
+        svc.allowlist.register_hint(&ws, true).unwrap();
+
+        // Single file with default max_symbols=0 emits all 144 symbols up to budget.
+        let full = op_outline_with_options(&svc, &["exit.rs".into()], 40, 0, 0, Some(&ws)).unwrap();
+        assert!(full.contains("sym_001") && full.contains("sym_144"), "{full}");
+        assert!(!full.contains("more symbols"), "{full}");
+
+        // Explicit max_symbols=10 caps cleanly with hint.
+        let limited = op_outline_with_options(&svc, &["exit.rs".into()], 40, 0, 10, Some(&ws)).unwrap();
+        assert!(limited.contains("sym_010") && !limited.contains("sym_011"));
+        assert!(limited.contains("+134 more symbols"), "{limited}");
+
+        // Tight max_bytes caps per-symbol cleanly with continuation guidance.
+        let budgeted = op_outline_with_options(&svc, &["exit.rs".into()], 40, 1024, 0, Some(&ws)).unwrap();
+        assert!(budgeted.len() <= 1024 + 128, "len={}", budgeted.len());
+        assert!(budgeted.contains("omitted at 1024B budget"), "{budgeted}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
 }

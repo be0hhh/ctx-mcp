@@ -1,7 +1,12 @@
-use super::{search_snippet, search_time_left, RgMatchMode, SearchCollection, SearchError, SearchHit};
+use super::{
+    parse_literal_alternation, search_snippet, search_time_left, RgMatchMode, SearchCollection,
+    SearchError, SearchHit,
+};
+use crate::base::platform::{hidden_command, probe_tool_available, resolve_tool};
 use crate::base::simd::search_lines_literals;
 use crate::engine::is_searchable_source_file;
 use crate::store::should_skip_dir;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -15,8 +20,11 @@ use std::time::{Duration, Instant};
 const RG_RECORD_LIMIT: usize = 16 * 1024;
 const RG_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const RG_MAX_COUNT_PER_FILE: usize = 25;
-const FALLBACK_SEARCH_FILE_LIMIT: usize = 3_000;
+const FALLBACK_SEARCH_FILE_LIMIT: usize = 8_000;
+const FALLBACK_INCOMPLETE_NOTE: &str =
+    "rg/git unavailable; fallback walker stopped at 8,000 files";
 
+#[cfg_attr(test, derive(Debug))]
 enum RgError {
     Busy,
     Missing,
@@ -71,7 +79,7 @@ fn run_rg_once(
                 RgError::Process(format!("cannot run rg: {}", e))
             }
         })?;
-    collect_rg_output(SearchProcess(child), collection, fixed_strings)
+    collect_rg_output(SearchProcess(child), collection, fixed_strings, None, false)
 }
 
 enum RgOutput {
@@ -84,6 +92,8 @@ fn collect_rg_output(
     mut process: SearchProcess,
     collection: &mut SearchCollection<'_>,
     fixed_strings: bool,
+    base_dir: Option<&Path>,
+    git_mode: bool,
 ) -> Result<(), RgError> {
     let stdout = process
         .0
@@ -125,11 +135,15 @@ fn collect_rg_output(
         })?;
         match output {
             RgOutput::Record(record) => {
-                let Some((path, line, snippet)) = parse_grep_line(&record) else {
+                let Some((raw_path, line, snippet)) = parse_grep_line(&record) else {
                     continue;
                 };
+                let candidate = match base_dir {
+                    Some(base) if raw_path.is_relative() => base.join(&raw_path),
+                    _ => raw_path,
+                };
                 let Ok((path, workspace)) =
-                    collection.svc.allowlist.admit_file(&path, collection.cwd)
+                    collection.svc.allowlist.admit_file(&candidate, collection.cwd)
                 else {
                     continue;
                 };
@@ -140,7 +154,11 @@ fn collect_rg_output(
                     last_path = Some(path.clone());
                     file_hit_count = 1;
                 }
-                if file_hit_count >= RG_MAX_COUNT_PER_FILE {
+                if file_hit_count > RG_MAX_COUNT_PER_FILE {
+                    collection.scan_truncated = true;
+                    continue;
+                }
+                if file_hit_count == RG_MAX_COUNT_PER_FILE {
                     collection.scan_truncated = true;
                 }
                 collection.hits.push(SearchHit {
@@ -173,7 +191,12 @@ fn collect_rg_output(
             Err(error) => return Err(RgError::Process(format!("cannot wait for rg: {error}"))),
         }
     };
-    check_rg_status(status, &diagnostic.unwrap_or_default(), fixed_strings)
+    let diag = diagnostic.unwrap_or_default();
+    if git_mode {
+        check_git_grep_status(status, &diag, fixed_strings)
+    } else {
+        check_rg_status(status, &diag, fixed_strings)
+    }
 }
 
 fn rg_pipe_error(stream: &str, error: io::Error) -> RgError {
@@ -256,6 +279,137 @@ fn check_rg_status(status: ExitStatus, stderr: &[u8], fixed_strings: bool) -> Re
     }))
 }
 
+fn check_git_grep_status(
+    status: ExitStatus,
+    stderr: &[u8],
+    fixed_strings: bool,
+) -> Result<(), RgError> {
+    if matches!(status.code(), Some(0 | 1)) {
+        return Ok(());
+    }
+    let diag = String::from_utf8_lossy(stderr);
+    let low = diag.to_ascii_lowercase();
+    if !fixed_strings
+        && (low.contains("regex")
+            || low.contains("invalid")
+            || low.contains("unmatched")
+            || low.contains("parenthes")
+            || low.contains("bracket")
+            || low.contains("repetition"))
+    {
+        return Err(RgError::RegexSyntax(diag.trim().to_string()));
+    }
+    Err(RgError::Missing)
+}
+
+fn find_git_worktree_root(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_file() { path.parent()? } else { path };
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn resolve_git_grep_scope(roots: &[PathBuf]) -> Option<(PathBuf, Vec<PathBuf>)> {
+    if roots.is_empty() || probe_tool_available("git").is_none() {
+        return None;
+    }
+    let git_root = find_git_worktree_root(&roots[0])?;
+    let mut rel_roots: Vec<PathBuf> = Vec::with_capacity(roots.len());
+    let mut whole_tree = false;
+    for r in roots {
+        let rel = r.strip_prefix(&git_root).ok()?;
+        if rel.as_os_str().is_empty() {
+            whole_tree = true;
+        } else {
+            rel_roots.push(rel.to_path_buf());
+        }
+    }
+    if whole_tree {
+        rel_roots.clear();
+    }
+    Some((git_root, rel_roots))
+}
+
+fn run_git_grep_once(
+    query: &str,
+    git_root: &Path,
+    rel_roots: &[PathBuf],
+    collection: &mut SearchCollection<'_>,
+    fixed_strings: bool,
+) -> Result<(), RgError> {
+    search_time_left(collection.deadline).map_err(|_| RgError::Timeout)?;
+    let mut cmd = hidden_command(resolve_tool("git"));
+    cmd.arg("-C").arg(git_root).args([
+        "-c",
+        "core.quotePath=false",
+        "--no-pager",
+        "grep",
+        "-n",
+        "-I",
+        "-z",
+        "--untracked",
+    ]);
+    if !query.chars().any(char::is_uppercase) {
+        cmd.arg("-i");
+    }
+    cmd.arg(if fixed_strings { "-F" } else { "-E" });
+    cmd.arg("-e").arg(query);
+    if !rel_roots.is_empty() {
+        cmd.arg("--").args(rel_roots);
+    }
+    let _permit = collection
+        .svc
+        .subproc_sem
+        .acquire_until(collection.deadline)
+        .map_err(RgError::Process)?
+        .ok_or(RgError::Busy)?;
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                RgError::Missing
+            } else {
+                RgError::Process(format!("cannot run git grep: {}", e))
+            }
+        })?;
+    collect_rg_output(SearchProcess(child), collection, fixed_strings, Some(git_root), true)
+}
+
+fn run_git_grep(
+    query: &str,
+    roots: &[PathBuf],
+    collection: &mut SearchCollection<'_>,
+) -> Result<(), RgError> {
+    let (git_root, rel_roots) = resolve_git_grep_scope(roots).ok_or(RgError::Missing)?;
+    let has_regex_meta = query.chars().any(|c| {
+        matches!(
+            c,
+            '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+        )
+    });
+    match run_git_grep_once(query, &git_root, &rel_roots, collection, false) {
+        Ok(()) if collection.hits.is_empty() && has_regex_meta => {
+            collection.match_mode = RgMatchMode::FixedSmartCase;
+            run_git_grep_once(query, &git_root, &rel_roots, collection, true)
+        }
+        Err(RgError::RegexSyntax(_)) => {
+            collection.hits.clear();
+            collection.scan_truncated = false;
+            collection.match_mode = RgMatchMode::FixedSmartCase;
+            run_git_grep_once(query, &git_root, &rel_roots, collection, true)
+        }
+        other => other,
+    }
+}
+
 pub(super) fn run_rg_or_fallback(
     query: &str,
     roots: &[PathBuf],
@@ -282,7 +436,15 @@ pub(super) fn run_rg_or_fallback(
     };
     match result {
         Ok(()) => Ok(()),
-        Err(RgError::Missing) => search_without_rg(query, roots, collection),
+        Err(RgError::Missing) => match run_git_grep(query, roots, collection) {
+            Ok(()) => Ok(()),
+            Err(RgError::Missing) => search_without_rg(query, roots, collection),
+            Err(RgError::Busy) => Err(SearchError::Busy),
+            Err(RgError::Timeout) => Err(SearchError::Timeout),
+            Err(RgError::Process(error) | RgError::RegexSyntax(error)) => {
+                Err(SearchError::Failed(error))
+            }
+        },
         Err(RgError::Busy) => Err(SearchError::Busy),
         Err(RgError::Timeout) => Err(SearchError::Timeout),
         Err(RgError::Process(error) | RgError::RegexSyntax(error)) => {
@@ -297,32 +459,25 @@ fn visit_fallback_files(
     mut visit: impl FnMut(&Path) -> Result<bool, SearchError>,
 ) -> Result<bool, SearchError> {
     let mut files_left = FALLBACK_SEARCH_FILE_LIMIT;
-    let mut roots = roots.iter().cloned();
-    let mut dirs: Vec<fs::ReadDir> = Vec::new();
-    loop {
+    let mut queue: VecDeque<(PathBuf, bool)> = roots.iter().cloned().map(|p| (p, true)).collect();
+    while let Some((path, explicit)) = queue.pop_front() {
         search_time_left(deadline)?;
-        let (path, explicit) = match dirs.last_mut() {
-            Some(dir) => match dir.next() {
-                Some(Ok(entry)) => (entry.path(), false),
-                Some(Err(_)) => continue,
-                None => {
-                    dirs.pop();
-                    continue;
-                }
-            },
-            None => match roots.next() {
-                Some(path) => (path, true),
-                None => return Ok(false),
-            },
-        };
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
         if meta.is_dir() {
             let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-            if explicit || !should_skip_dir(name) {
-                if let Ok(entries) = fs::read_dir(&path) {
-                    dirs.push(entries);
+            if !explicit && (should_skip_dir(name) || path.join(".git").exists()) {
+                continue;
+            }
+            if let Ok(entries) = fs::read_dir(&path) {
+                let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                children.sort();
+                for child in children {
+                    queue.push_back((child, false));
                 }
             }
         } else if is_searchable_source_file(&path, &meta) {
@@ -334,6 +489,7 @@ fn visit_fallback_files(
             }
         }
     }
+    Ok(false)
 }
 
 fn search_without_rg(
@@ -343,6 +499,7 @@ fn search_without_rg(
 ) -> Result<(), SearchError> {
     collection.match_mode = RgMatchMode::FixedCi;
     let deadline = collection.deadline;
+    let needles = parse_literal_alternation(query).unwrap_or_else(|| vec![query]);
     let hit_file_limit = visit_fallback_files(roots, deadline, |path| {
         let Ok((path, workspace)) = collection.svc.allowlist.admit_file(path, collection.cwd)
         else {
@@ -359,7 +516,7 @@ fn search_without_rg(
             collection.scan_truncated = true;
             return Ok(true);
         }
-        let line_nums = search_lines_literals(text, &entry.line_offsets, &[query], false, remaining);
+        let line_nums = search_lines_literals(text, &entry.line_offsets, &needles, false, remaining);
         for ln in line_nums {
             collection.hits.push(SearchHit {
                 path: path.clone(),
@@ -376,6 +533,7 @@ fn search_without_rg(
     })?;
     if hit_file_limit {
         collection.scan_truncated = true;
+        collection.incomplete_note = Some(FALLBACK_INCOMPLETE_NOTE);
     }
     Ok(())
 }
@@ -383,9 +541,11 @@ fn search_without_rg(
 fn parse_grep_line(record: &[u8]) -> Option<(PathBuf, usize, String)> {
     let mut fields = record.splitn(2, |&byte| byte == 0);
     let path = fields.next()?;
-    let mut fields = fields.next()?.splitn(2, |&byte| byte == b':');
-    let number = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
-    let text = fields.next()?;
+    let rest = fields.next()?;
+    // `rg --null --line-number` emits `path\0line:text`; `git grep -n -z` emits `path\0line\0text`.
+    let sep = rest.iter().position(|&byte| byte == b':' || byte == 0)?;
+    let number = std::str::from_utf8(&rest[..sep]).ok()?.parse().ok()?;
+    let text = &rest[sep + 1..];
     #[cfg(unix)]
     let path = {
         use std::os::unix::ffi::OsStrExt;
@@ -421,7 +581,10 @@ mod tests {
         deadline: Instant,
         cap: usize,
     ) -> SearchCollection<'a> {
-        SearchCollection { svc, cwd, deadline, cap, hits: Vec::new(), scan_truncated: false, match_mode: RgMatchMode::Regex }
+        SearchCollection {
+            svc, cwd, deadline, cap, hits: Vec::new(), scan_truncated: false,
+            incomplete_note: None, match_mode: RgMatchMode::Regex,
+        }
     }
 
     #[test]
@@ -440,6 +603,8 @@ mod tests {
     fn rg_match_has_an_unambiguous_path_separator() {
         let hit = parse_grep_line(b"a:b.rs\x0017:example: value").unwrap();
         assert_eq!(hit, (PathBuf::from("a:b.rs"), 17, "example: value".to_string()));
+        let git_hit = parse_grep_line(b"a:b.rs\x0017\x00example: value").unwrap();
+        assert_eq!(git_hit, (PathBuf::from("a:b.rs"), 17, "example: value".to_string()));
     }
 
     #[test]
@@ -525,7 +690,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut collection = new_collection(&svc, Some(&dir), Instant::now() + SEARCH_TIMEOUT, 1);
-        let result = collect_rg_output(SearchProcess(child), &mut collection, false);
+        let result = collect_rg_output(SearchProcess(child), &mut collection, false, None, false);
         fs::remove_dir_all(&dir).unwrap();
         assert!(result.is_ok());
         assert!(collection.scan_truncated);
@@ -545,8 +710,44 @@ mod tests {
             .unwrap();
         let mut collection = new_collection(&svc, None, Instant::now() + Duration::from_millis(25), 1);
         assert!(matches!(
-            collect_rg_output(SearchProcess(child), &mut collection, false),
+            collect_rg_output(SearchProcess(child), &mut collection, false, None, false),
             Err(RgError::Timeout)
         ));
+    }
+
+    #[test]
+    fn git_grep_and_bfs_fallback_skip_nested_git_and_ignored_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-search-gitgrep-{}-{}", std::process::id(), crate::store::now_ms_u64()
+        ));
+        fs::create_dir_all(dir.join("ccxt-rs/.git")).unwrap();
+        fs::create_dir_all(dir.join("ignored_vendor")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join(".gitignore"), "ignored_vendor/\n").unwrap();
+        fs::write(dir.join("ccxt-rs/junk.rs"), "struct OwnedCycleLedger;\n").unwrap();
+        fs::write(dir.join("ignored_vendor/ign.rs"), "struct OwnedCycleLedger;\n").unwrap();
+        fs::write(dir.join("src/ledger.rs"), "pub struct OwnedCycleLedger { id: u64 }\n").unwrap();
+
+        // 1. BFS walker skips nested `.git` repo (`ccxt-rs/`) and supports `a|b` alternation.
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap"));
+        let ws = svc.allowlist.register_hint(&dir, true).unwrap();
+        let mut col = new_collection(&svc, Some(&dir), Instant::now() + SEARCH_TIMEOUT, 20);
+        search_without_rg("OwnedCycleLedger|other_probe", &[ws.clone()], &mut col).unwrap();
+        assert!(col.hits.iter().any(|h| h.path == ws.join("src/ledger.rs")));
+        assert!(col.hits.iter().all(|h| !h.path.starts_with(ws.join("ccxt-rs"))));
+
+        // 2. `git grep` fallback respects `.gitignore`, skips nested `.git`, and searches untracked files.
+        let git_ok = hidden_command(resolve_tool("git"))
+            .arg("-C").arg(&dir).args(["init", "-q"]).status().is_ok_and(|s| s.success());
+        if git_ok {
+            let _ = hidden_command(resolve_tool("git"))
+                .arg("-C").arg(dir.join("ccxt-rs")).args(["init", "-q"]).status();
+            let mut gcol = new_collection(&svc, Some(&dir), Instant::now() + SEARCH_TIMEOUT, 20);
+            run_git_grep("OwnedCycleLedger", &[ws.clone()], &mut gcol).unwrap();
+            assert_eq!(gcol.hits.len(), 1, "expected only src/ledger.rs, got {:?}", gcol.hits.len());
+            assert_eq!(gcol.hits[0].path, ws.join("src/ledger.rs"));
+            assert!(!gcol.scan_truncated);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

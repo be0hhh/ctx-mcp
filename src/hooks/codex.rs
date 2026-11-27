@@ -5,7 +5,7 @@ use super::{
     apply_launch_receipt, build_scoped_session_key, capsule_auto_stage_enabled, codex_deny,
     delivery_notice, detect_shell_file_slicing, extract_cwd, host_context,
     is_workspace_mutating_shell, mcp_context_rewrite, parse_tool_input_field,
-    register_payload_workspaces, replace_field, rewrite_input,
+    register_payload_workspaces, replace_field, rewrite_input, workspace_grep_redirect_reason,
 };
 use crate::base::json::{self, Json};
 use crate::broker::{HostContext, WorkspaceMode};
@@ -192,6 +192,11 @@ pub(super) fn handle_codex(svc: &BrokerService, payload: &Json) -> Json {
 
         let cmds = extract_codex_exec_commands(tool_name, &tool_input);
         for cmd in cmds {
+            if let Some(reason) =
+                workspace_grep_redirect_reason(svc, "codex", &sess_key, &cmd, cwd.as_deref())
+            {
+                return codex_deny(&reason);
+            }
             if let Some(hit) = detect_shell_file_slicing(svc, &cmd, cwd.as_deref()) {
                 if let Some(dup) = svc.store.check_duplicate_read(
                     &sess_key,

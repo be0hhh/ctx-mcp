@@ -102,6 +102,24 @@ Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor ta
 | **Codex · GPT-6.2 Astra (XHigh)** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s | baseline |
 | **Codex · GPT-6.2 Astra (XHigh)** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%, 2.1×)** | **2,678 (−78.1%, 4.6×)** | **164 (−16.3%)** | **11.9 s (−16.2%)** | **−60%…−66%** |
 
+## What's New in `v2.5.1` – `v2.5.2`
+
+- **Bulletproof search without system `rg` (zero silent false `0 matches`):** `ctx` resolves `PATH`, OS package directories, and bundled IDE/Claude `rg` binaries without permanently caching misses (installing `rg` works immediately without restarting the daemon), falls back to `.gitignore`-aware `git grep` and then a nested-`.git`-skipping BFS walker, and explicitly flags `(INCOMPLETE scan)` if a fallback file budget is ever hit. `WorkspaceIndex` (`ctx_impact`, shorthand paths) also uses `git ls-files` / nested-`.git` filtering, and `ctx doctor` reports `search_backend`.
+- **Unrestricted batch search (`1–6` unscoped or scoped), workspace `grep`/`rg` 1-strike redirect & resilient cold startup:** `ctx_search(q=[...])` accepts up to `6` unscoped, scoped, or mixed queries in one round-trip; `PreToolUse` hooks (`agy`, `codex`, `claude`) gently redirect bare workspace `grep`/`rg` commands (1-strike escape, leaving external paths like `~/.codex/`/`/tmp/` and pipelines untouched — helping even pre-upgrade chats switch to `ctx_search`); and cold daemon auto-spawn waits up to `1s` (`10ms` fast polls) so loaded hosts don't drop turn-0 hooks.
+- **Better `ctx_outline` & Rust `ctx_symbols`:** single-file `ctx_outline` is bounded only by `max_bytes` (no hardcoded 80-symbol cap; optional `max_symbols` for multi-file control). In Rust, `ctx_symbols("File.rs#Type")` returns the type definition plus a 1-line `impl` summary (`#impl:Type` and `#Type::method` fetch implementations directly), and `compact=true` raises its preview cap from `24L` to `48L` while full symbol body is now the recommended default.
+- **Fast ETag checks & verified auto-patch updates (`ctx update --auto`):** `ctx daemon` checks GitHub Releases every `30 min` using conditional HTTP `ETag` (`304 Not Modified`, zero rate-limit burn). Upstream builds default to `auto=patch` (auto-installing `X.Y.Z` patch releases only after pure-Rust FIPS 180-4 SHA-256 + pre-swap `mcp --protocol-check` + `ctx.bak` backup + graceful daemon hot-swap; minor/major remain notify-only; custom flavors like `ctx-cxet` are never overwritten). Notices are strictly user-only advisories; opt out anytime via `ctx update --auto off` or `AGENT_CTX_NO_UPDATE_CHECK=1`.
+
+## Where CTX Wins (and Honest Trade-Offs)
+
+- **Fixed session cost:** loading all 11 MCP tool definitions adds **~6.4 KB** once per conversation (in Antigravity, `--eager=core` loads 4 tools and `--eager=search` loads 1).
+- **Vs. an already-targeted native lookup (`git grep` + exact-line `Read`):** per-hit byte size is roughly even (`−20%` to `+5%`). CTX does not magically compress a line you already know the exact start and end of.
+- **Where CTX actually delivers large savings:**
+  - **Unknown symbol boundaries & whole-file reads:** agents natively guess line offsets or read whole files; `ctx_symbols` knows exact `[L_start-L_end]` spans (**−94% to −98%** vs. full-file reads, saving 1–2 tool calls per lookup).
+  - **Callers & impact (`ctx_impact`):** **−55%** vs. raw `git grep` + reads, with edit-ready line hashes and git badges in 1 call.
+  - **Repeated unchanged reads:** hooks block duplicate full-file re-reads (**−97%**) and emit session deltas on small edits.
+  - **Noisy command/log/JSON output (`ctx diag -- <cmd>`):** **128×** smaller (`−52%…−75%` live LLM input tokens).
+  - **Atomic edits & multi-agent packs (`ctx_edit`, `ctx_memo`):** zero blind full-file rewrites and `[UNCHANGED]` dedup across subagents.
+
 ## What's New in `v2.5.0`
 
 - **Universal `ctx diag` v2:** Clang/GCC/Rust/Python/TS/Go/MSVC/CMake/ld/lld/test runners + AVX2/SSE2 ANSI/CR scrubbing + template deduplication for Linux/server logs + large JSON/NDJSON schema & error compactor.

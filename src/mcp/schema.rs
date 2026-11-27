@@ -95,7 +95,10 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             ("name", Json::Str("ctx_outline".into())),
             (
                 "description",
-                Json::Str("Return structural [L_start-L_end] symbol outlines from RAM.".into()),
+                Json::Str(
+                    "Return structural [L_start-L_end] symbol outlines from RAM (single file uncapped by count; optional max_symbols/max_bytes)."
+                        .into(),
+                ),
             ),
             (
                 "inputSchema",
@@ -107,6 +110,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
                             ("paths", str_array.clone()),
                             ("max_files", int_t()),
                             ("max_bytes", int_t()),
+                            ("max_symbols", int_t()),
                         ]),
                     ),
                     ("required", Json::Arr(vec![Json::Str("paths".into())])),
@@ -118,7 +122,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             (
                 "description",
                 Json::Str(
-                    "Symbol/section bodies (`Mod#Sym`, `doc.md#Heading`, `cfg.json#a.b`). `compact=true` <=24L, `hashes=true` for anchors, `raw=true` disables doc compaction."
+                    "Symbol/section bodies (`Mod#Sym`, `Mod#Type::method`, `Mod#impl:Type`, `doc.md#Heading`, `cfg.json#a.b`). Full body by default; `compact=true` <=48L preview, `hashes=true` for anchors, `raw=true` disables doc compaction."
                         .into(),
                 ),
             ),
