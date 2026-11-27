@@ -1180,6 +1180,7 @@ mod tests {
         ));
         fs::create_dir_all(dir.join("wt1")).unwrap();
         fs::create_dir_all(dir.join("wt2")).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
 
         let code = "pub fn shared_fn(x: u64) -> u64 {\n    x + 42\n}\n";
         let p1 = dir.join("wt1/lib.rs");

@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(600);
 const MCP_TICKET_TTL: Duration = Duration::from_secs(30);
+#[allow(dead_code)]
 const CLI_LEASE_TTL: Duration = Duration::from_secs(300);
+#[allow(dead_code)]
 const MAX_CLI_LEASES: usize = 4096;
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
 const KEY_PREFIX: &str = "CTX_CAPSULE_KEY=";
@@ -337,6 +339,7 @@ impl CapsuleRegistry {
             .ok_or_else(|| "ctx host context expired or invalid".into())
     }
 
+    #[allow(dead_code)]
     pub fn issue_cli_lease(&self, session: String, workspace: PathBuf) -> Result<String, String> {
         let session = session.trim().to_string();
         if session.is_empty() || session.len() > 256 || session.chars().any(char::is_control) {

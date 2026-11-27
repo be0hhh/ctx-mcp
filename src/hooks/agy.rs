@@ -299,21 +299,13 @@ fn record_native_edit_change(
         let Some(clean_p) = lexical_clean_path(p) else {
             return;
         };
-        let canon_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let rel_path = if let Ok(r) = clean_p.strip_prefix(&canon_root) {
-            r
-        } else if let Ok(r) = clean_p.strip_prefix(root) {
-            r
-        } else {
+        let Ok(canon_root) = fs::canonicalize(root) else {
             return;
         };
-        if rel_path.as_os_str().is_empty()
-            || !rel_path
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
-        {
-            return;
-        }
+        // Walk up to the nearest existing ancestor and canonicalize it first so symlinked
+        // OS prefixes (e.g. macOS `/var` -> `/private/var`) resolve consistently while broken
+        // symlinks and out-of-workspace ancestors fail closed.
+        let mut canon_candidate: Option<PathBuf> = None;
         let mut anc = clean_p.parent();
         while let Some(dir) = anc {
             if fs::symlink_metadata(dir).is_ok() {
@@ -323,12 +315,29 @@ fn record_native_edit_change(
                 if !canon_anc.starts_with(&canon_root) {
                     return;
                 }
+                let Ok(tail) = clean_p.strip_prefix(dir) else {
+                    return;
+                };
+                canon_candidate = Some(canon_anc.join(tail));
                 break;
             }
             anc = dir.parent();
         }
-        let candidate_in_root = canon_root.join(rel_path);
-        if is_sensitive_path_with_ws(&candidate_in_root, Some(&canon_root), false)
+        let Some(candidate_in_root) = canon_candidate else {
+            return;
+        };
+        let Ok(rel_path) = candidate_in_root.strip_prefix(&canon_root) else {
+            return;
+        };
+        if rel_path.as_os_str().is_empty()
+            || !rel_path
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return;
+        }
+        if is_internal_ide_path(&candidate_in_root)
+            || is_sensitive_path_with_ws(&candidate_in_root, Some(&canon_root), false)
             || is_sensitive_path_with_ws(&clean_p, Some(&canon_root), false)
         {
             return;
