@@ -125,6 +125,7 @@ pub(super) fn changes_daemon_state(req: &Json) -> bool {
 
 fn requires_daemon(req: &Json) -> bool {
     req.get("ctx_context").is_some()
+        || req.get_str("cli_token").is_some_and(|s| !s.is_empty())
         || matches!(req.get_str("op"), Some("search" | "capsule" | "edit"))
 }
 

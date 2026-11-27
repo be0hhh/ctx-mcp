@@ -1,7 +1,7 @@
 //! Metadata-only `0600` reboot snapshot (`ACTXSNP2`, format_tag=5, zero raw source).
 
 use super::{
-    now_ms, shard_idx_for, CachedFile, RamStore, CLEANED_EVICTED_BIT, MAX_SINGLE_FILE_CACHE_BYTES,
+    now_ms, shard_idx_for, CachedFile, RamStore, MAX_SINGLE_FILE_CACHE_BYTES,
     SNAPSHOT_DISK_CAP_BYTES,
 };
 use crate::base::security::{ensure_private_dir, write_private_0600};
@@ -10,8 +10,8 @@ use crate::parser::{SymbolKind, SymbolSpan};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"ACTXSNP2";
 pub const SNAPSHOT_FORMAT_TAG: u32 = 5;
@@ -157,16 +157,11 @@ impl RamStore {
                         ctime_ns,
                         ino,
                         content_hash64,
-                        content_bloom: [0, 0],
                         path_id,
                         size_bytes,
                         line_count,
-                        ram_charge: 0,
-                        line_offsets: Box::new([]),
                         symbols: Arc::from(symbols),
-                        content: None,
-                        cleaned_code: OnceLock::new(),
-                        cleaned_charge: AtomicU32::new(CLEANED_EVICTED_BIT),
+                        body: None,
                         last_access: AtomicU64::new(tick),
                     }),
                 );

@@ -51,7 +51,7 @@ fn gate0_dry_run_commit_bom_crlf_conflict_and_syntax() {
     assert!(out.contains(&format!("{}| fn two() {{ let x = 1; }}", anc(2, "fn two() { let x = 1; }"))));
     assert_eq!(fs::read(&f_main).unwrap(), b"\xEF\xBB\xBFfn one() {}\r\nfn two() { let x = 1; }\r\n");
     assert_eq!(fs::read_to_string(&f_empty).unwrap(), "fn boot() {}\n");
-    assert!(svc.store.get_full_entry(&fs::canonicalize(&f_main).unwrap(), Some(&ws)).unwrap().content.as_deref().unwrap().contains("let x = 1;"));
+    assert!(svc.store.get_full_entry(&fs::canonicalize(&f_main).unwrap(), Some(&ws)).unwrap().content().unwrap().contains("let x = 1;"));
     let wrong = if line_hash3("fn two() { let x = 1; }") == *b"fff" { "2:000" } else { "2:fff" };
     let bad = Json::obj(vec![("edits", Json::Arr(vec![Json::obj(vec![("path", Json::Str("sample.rs".into())), ("ops", Json::Arr(vec![Json::obj(vec![
         ("op", Json::Str("replace_lines".into())), ("start", Json::Str(wrong.into())), ("content", Json::Str("x".into())),

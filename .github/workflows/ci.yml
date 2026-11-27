@@ -44,6 +44,7 @@ jobs:
           "$BIN" mcp --protocol-check
           "$BENCH" waves --ctx-bin "$BIN" --agents 1,10 --ops 6 --json
           "$BENCH" micro --iters 10 --json
+          "$BENCH" swarm --ctx-bin "$BIN" --repo . --agents 4 --worktrees 2 --json
           ROOT_DIR="$(pwd -W 2>/dev/null || pwd)"
           TMP_HOME="$ROOT_DIR/tmp-ci-home"
           mkdir -p "$TMP_HOME"

@@ -3,8 +3,14 @@
 
 pub use crate::base::mode::runtime_dir;
 use crate::base::security::find_superproject_root;
+use crate::base::simd::FastHashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+const SHARED_REPO_KEY_CACHE_MAX: usize = 256;
+static SHARED_REPO_KEY_CACHE: OnceLock<RwLock<FastHashMap<PathBuf, String>>> = OnceLock::new();
 
 /// Single canonical directory exclusion filter shared across workspace indexing, inspection,
 /// and search traversal.
@@ -74,6 +80,116 @@ pub fn norm_key_from_canon(canon: &Path) -> String {
         s = s.replace('\\', "/").to_ascii_lowercase();
     }
     s
+}
+
+pub(crate) fn git_admin_dir(root: &Path) -> Option<PathBuf> {
+    let marker = root.join(".git");
+    if marker.is_dir() {
+        return fs::canonicalize(marker).ok();
+    }
+    if !marker.is_file() {
+        return None;
+    }
+    let pointer = fs::read_to_string(&marker).ok()?;
+    let target = pointer.trim().strip_prefix("gitdir: ")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    fs::canonicalize(root.join(target)).ok()
+}
+
+pub(crate) fn git_common_dir(admin: &Path) -> Option<PathBuf> {
+    match fs::read_to_string(admin.join("commondir")) {
+        Ok(pointer) => {
+            let target = pointer.trim();
+            if target.is_empty() {
+                return None;
+            }
+            fs::canonicalize(admin.join(target)).ok()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(admin.to_owned()),
+        Err(_) => None,
+    }
+}
+
+/// Verifies a linked git worktree via bidirectional backlink:
+/// `admin_dir.parent() == common_dir/worktrees` AND `admin_dir/gitdir` canonicalizes to
+/// `ws_root/.git` (or `ws_root`). Returns `Some(common_dir)` only when both checks pass.
+pub(crate) fn verified_linked_worktree_common(canon_ws: &Path) -> Option<PathBuf> {
+    let marker = canon_ws.join(".git");
+    if !fs::symlink_metadata(&marker)
+        .ok()
+        .is_some_and(|meta| meta.file_type().is_file())
+    {
+        return None;
+    }
+    let admin = git_admin_dir(canon_ws)?;
+    let common = git_common_dir(&admin)?;
+    if !admin
+        .parent()
+        .is_some_and(|dir| dir == common.join("worktrees"))
+    {
+        return None;
+    }
+    let backlink = fs::read_to_string(admin.join("gitdir")).ok()?;
+    let target = backlink.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let actual = fs::canonicalize(admin.join(target)).ok()?;
+    if actual == marker || actual == canon_ws {
+        Some(common)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn is_linked_worktree(parent: &Path, child: &Path) -> bool {
+    let Some(parent_common) = git_admin_dir(parent).and_then(|a| git_common_dir(&a)) else {
+        return false;
+    };
+    let canon_child = fs::canonicalize(child).unwrap_or_else(|_| child.to_path_buf());
+    verified_linked_worktree_common(&canon_child)
+        .is_some_and(|child_common| child_common == parent_common)
+}
+
+fn resolve_shared_repo_key(ws_root: &Path) -> String {
+    let canon_ws = fs::canonicalize(ws_root).unwrap_or_else(|_| ws_root.to_path_buf());
+    let marker = canon_ws.join(".git");
+    if marker.is_dir() {
+        return norm_key_from_canon(&canon_ws);
+    }
+    if marker.is_file() {
+        if let Some(common_dir) = verified_linked_worktree_common(&canon_ws) {
+            if common_dir.file_name() == Some(OsStr::new(".git")) {
+                if let Some(parent) = common_dir.parent() {
+                    return norm_key_from_canon(parent);
+                }
+            }
+            return norm_key_from_canon(&common_dir);
+        }
+    }
+    norm_key_from_canon(&canon_ws)
+}
+
+/// Returns the canonical workspace key shared across a main git repository and its
+/// bidirectional-backlink-verified linked worktrees. Falls back fail-closed to
+/// `norm_key_from_canon(ws_root)` if `.git` is missing, malformed, or forged.
+pub fn shared_repo_key(ws_root: &Path) -> String {
+    let cache = SHARED_REPO_KEY_CACHE.get_or_init(|| RwLock::new(FastHashMap::default()));
+    if let Ok(guard) = cache.read() {
+        if let Some(hit) = guard.get(ws_root) {
+            return hit.clone();
+        }
+    }
+    let resolved = resolve_shared_repo_key(ws_root);
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= SHARED_REPO_KEY_CACHE_MAX && !guard.contains_key(ws_root) {
+            guard.clear();
+        }
+        guard.insert(ws_root.to_path_buf(), resolved.clone());
+    }
+    resolved
 }
 
 /// Formats `path` as an exact forward-slash path relative to `ws_root` (or its detected
@@ -284,4 +400,64 @@ pub fn is_multimodal_or_binary_ext(path: &Path) -> bool {
             | "db"
             | "pb"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::security::generate_csprng_token;
+
+    #[test]
+    fn shared_repo_key_unifies_verified_worktree_and_rejects_forged_git_file() {
+        let root = std::env::temp_dir().join(format!(
+            "ctx-shared-key-{}",
+            generate_csprng_token().unwrap()
+        ));
+        let main_repo = root.join("repo");
+        let linked = root.join("wt-valid");
+        let forged = root.join("wt-forged");
+        let plain = root.join("plain");
+        let admin = main_repo.join(".git/worktrees/wt-valid");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&forged).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+
+        fs::write(linked.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        fs::write(forged.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            linked.join(".git").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let canon_main = fs::canonicalize(&main_repo).unwrap();
+        let canon_linked = fs::canonicalize(&linked).unwrap();
+        let canon_forged = fs::canonicalize(&forged).unwrap();
+        let canon_plain = fs::canonicalize(&plain).unwrap();
+
+        let main_key = shared_repo_key(&canon_main);
+        assert_eq!(main_key, norm_key_from_canon(&canon_main));
+        assert_eq!(shared_repo_key(&canon_linked), main_key);
+        assert_eq!(shared_repo_key(&canon_forged), norm_key_from_canon(&canon_forged));
+        assert_ne!(shared_repo_key(&canon_forged), main_key);
+        assert_eq!(shared_repo_key(&canon_plain), norm_key_from_canon(&canon_plain));
+
+        assert!(is_linked_worktree(&canon_main, &canon_linked));
+        assert!(!is_linked_worktree(&canon_main, &canon_forged));
+
+        #[cfg(unix)]
+        {
+            let symlink_evil = root.join("wt-symlink-evil");
+            fs::create_dir_all(&symlink_evil).unwrap();
+            std::os::unix::fs::symlink(linked.join(".git"), symlink_evil.join(".git")).unwrap();
+            let canon_evil = fs::canonicalize(&symlink_evil).unwrap();
+            assert_eq!(shared_repo_key(&canon_evil), norm_key_from_canon(&canon_evil));
+            assert_ne!(shared_repo_key(&canon_evil), main_key);
+            assert!(!is_linked_worktree(&canon_main, &canon_evil));
+        }
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

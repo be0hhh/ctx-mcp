@@ -1,3 +1,4 @@
+pub mod cache;
 mod ram;
 mod rank;
 mod render;
@@ -11,8 +12,10 @@ use crate::base::security::is_sensitive_path;
 use crate::engine::is_safe_shorthand_candidate;
 use crate::rpc::BrokerService;
 use crate::store::resolve_input_path;
+use cache::SearchCacheKey;
 use rank::{rank_and_select_hits, SearchHitSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,8 +28,11 @@ pub enum SearchError {
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SEARCH_RESPONSE_BYTES: usize = 8 * 1024;
+pub const CLI_BATCH_SEARCH_BYTES: usize = 12 * 1024;
+pub const MAX_CLI_SEARCH_RESPONSE_BYTES: usize = 14 * 1024;
 const SEARCH_SNIPPET_CHARS: usize = 200;
 
+#[derive(Clone)]
 struct SearchHit {
     path: PathBuf,
     workspace: PathBuf,
@@ -73,15 +79,34 @@ pub struct SearchOptions {
 }
 
 impl SearchOptions {
+    #[allow(dead_code)]
     pub fn from_request(request: &Json, default_results: usize) -> Self {
+        Self::from_request_with_cap(
+            request,
+            default_results,
+            SEARCH_RESPONSE_BYTES,
+            SEARCH_RESPONSE_BYTES,
+        )
+    }
+
+    pub fn from_request_with_cap(
+        request: &Json,
+        default_results: usize,
+        default_bytes: usize,
+        max_cap: usize,
+    ) -> Self {
+        let cap = max_cap.max(1);
+        let def = default_bytes.clamp(1, cap);
+        let max_bytes = request
+            .get_i64("max_bytes")
+            .filter(|&v| v > 0)
+            .map(|v| (v as usize).min(cap))
+            .unwrap_or(def);
         Self {
             max_results: request.get_usize("max_results").unwrap_or(default_results),
             with_scopes: request.get_str("detail") == Some("scopes"),
             context_lines: request.get_usize("context_lines").unwrap_or(0).min(4),
-            max_bytes: request
-                .get_i64("max_bytes")
-                .unwrap_or(SEARCH_RESPONSE_BYTES as i64)
-                .clamp(1, SEARCH_RESPONSE_BYTES as i64) as usize,
+            max_bytes,
             code_only: request.get_bool("code_only").unwrap_or(false),
         }
     }
@@ -296,7 +321,7 @@ fn collect_search_hits(
     code_only: bool,
     cwd: Option<&Path>,
     deadline: Instant,
-) -> Result<SearchHitSet, SearchError> {
+) -> Result<Arc<SearchHitSet>, SearchError> {
     search_time_left(deadline)?;
     let q = query.trim();
     if q.is_empty() {
@@ -304,6 +329,7 @@ fn collect_search_hits(
     }
     let cap = max_results.clamp(1, 120);
 
+    // Allowlist admission & sensitive-path filtering run strictly BEFORE cache lookup.
     let mut admitted_roots: Vec<(PathBuf, PathBuf, bool)> = Vec::with_capacity(roots.len().max(1));
     if roots.is_empty() {
         let base = cwd.map(Path::to_path_buf).unwrap_or_else(|| {
@@ -336,15 +362,59 @@ fn collect_search_hits(
         }
     }
 
+    let start_epoch = svc.store.mutation_epoch();
+    let ws_root = admitted_roots[0].1.clone();
+    let canon_cwd = cwd.map(|c| {
+        if c == ws_root.as_path() {
+            ws_root.clone()
+        } else {
+            std::fs::canonicalize(c).unwrap_or_else(|_| c.to_path_buf())
+        }
+    });
+    let mut key_roots: Vec<(PathBuf, bool)> = admitted_roots
+        .iter()
+        .map(|(p, _, is_dir)| (p.clone(), *is_dir))
+        .collect();
+    key_roots.sort();
+    key_roots.dedup();
+    let cache_key = SearchCacheKey {
+        ws_root,
+        canon_cwd,
+        admitted_roots: key_roots,
+        query: q.to_string(),
+        cap,
+        code_only,
+        mutation_epoch: start_epoch,
+    };
+
+    svc.search_cache.get_or_compute(
+        cache_key,
+        deadline,
+        || svc.store.mutation_epoch() == start_epoch,
+        |eff_deadline| {
+            compute_search_hits_uncached(svc, q, &admitted_roots, cap, code_only, cwd, eff_deadline)
+        },
+    )
+}
+
+fn compute_search_hits_uncached(
+    svc: &BrokerService,
+    q: &str,
+    admitted_roots: &[(PathBuf, PathBuf, bool)],
+    cap: usize,
+    code_only: bool,
+    cwd: Option<&Path>,
+    deadline: Instant,
+) -> Result<SearchHitSet, SearchError> {
     if let Some(needles) = parse_literal_alternation(q) {
         if let Some(hit_set) =
-            ram::try_in_ram_simd_search(svc, &needles, &admitted_roots, cap, code_only, deadline)?
+            ram::try_in_ram_simd_search(svc, &needles, admitted_roots, cap, code_only, deadline)?
         {
             return Ok(hit_set);
         }
     }
 
-    let search_roots: Vec<PathBuf> = admitted_roots.into_iter().map(|(p, _, _)| p).collect();
+    let search_roots: Vec<PathBuf> = admitted_roots.iter().map(|(p, _, _)| p.clone()).collect();
     let collect_cap = if code_only {
         cap.saturating_mul(4).clamp(cap, 400)
     } else {
@@ -411,7 +481,7 @@ fn run_batch_item(
     code_only: bool,
     cwd: Option<&Path>,
     deadline: Instant,
-) -> Result<SearchHitSet, SearchError> {
+) -> Result<Arc<SearchHitSet>, SearchError> {
     if let Some(spec) = item.as_str().or_else(|| item.get_str("q")) {
         let (query, roots) = parse_shorthand_search_spec(spec, false)?;
         return collect_search_hits(svc, &query, &roots, max_results, code_only, cwd, deadline);
@@ -530,6 +600,50 @@ mod tests {
             op_search_batch(&svc, &seven, options, Some(&workspace)),
             Err(SearchError::Failed(msg)) if msg.contains("1–6")
         ));
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn search_options_with_cap_distinguishes_cli_12k_from_agy_9000b_and_cache_invalidates_on_edit() {
+        let cli_opts = SearchOptions::from_request_with_cap(
+            &Json::Null,
+            32,
+            CLI_BATCH_SEARCH_BYTES,
+            MAX_CLI_SEARCH_RESPONSE_BYTES,
+        );
+        assert_eq!(cli_opts.max_bytes, CLI_BATCH_SEARCH_BYTES);
+
+        let cli_clamped = SearchOptions::from_request_with_cap(
+            &Json::obj(vec![("max_bytes", Json::Int(32_000))]),
+            32,
+            CLI_BATCH_SEARCH_BYTES,
+            MAX_CLI_SEARCH_RESPONSE_BYTES,
+        );
+        assert_eq!(cli_clamped.max_bytes, MAX_CLI_SEARCH_RESPONSE_BYTES);
+
+        let agy_clamped = SearchOptions::from_request_with_cap(
+            &Json::obj(vec![("max_bytes", Json::Int(14_000))]),
+            32,
+            crate::engine::AGY_MCP_DEFAULT_MAX_BYTES,
+            crate::engine::AGY_MCP_DEFAULT_MAX_BYTES,
+        );
+        assert_eq!(agy_clamped.max_bytes, crate::engine::AGY_MCP_DEFAULT_MAX_BYTES);
+
+        // Cache serves identical query and invalidates immediately after file mutation.
+        let workspace = temp_ws("cache-inv");
+        let file = workspace.join("live.rs");
+        fs::write(&file, "fn before_edit() {}\n").unwrap();
+        let svc = BrokerService::new_ephemeral_inproc(workspace.join("snapshot"));
+        svc.allowlist.register_hint(&workspace, true).unwrap();
+
+        let out1 = op_search(&svc, "before_edit", &[], cli_opts, Some(&workspace)).unwrap();
+        assert!(out1.contains("before_edit"));
+        fs::write(&file, "fn after_edit() {}\n").unwrap();
+        svc.store.invalidate_path(&file);
+        let out2 = op_search(&svc, "before_edit", &[], cli_opts, Some(&workspace)).unwrap();
+        assert!(out2.contains("0 matches"), "{out2}");
+        let out3 = op_search(&svc, "after_edit", &[], cli_opts, Some(&workspace)).unwrap();
+        assert!(out3.contains("after_edit"), "{out3}");
         fs::remove_dir_all(&workspace).unwrap();
     }
 }

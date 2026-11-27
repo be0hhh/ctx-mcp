@@ -142,7 +142,7 @@ fn scan_dirty_conflict_markers(svc: &BrokerService, ws_root: &Path, porcelain: &
         if !canon.is_file() { continue; }
         checked += 1;
         let Ok(entry) = svc.store.get_full_entry(&canon, Some(&wr)) else { continue; };
-        let Some(text) = entry.content.as_deref() else { continue; };
+        let Some(text) = entry.content() else { continue; };
         for (idx, l) in text.lines().enumerate() {
             if l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") {
                 hits.push(format!("{}:{}: {}", entry.rel_path, idx + 1, l.trim()));
@@ -422,7 +422,7 @@ fn render_file_diff(svc: &BrokerService, ws_root: &Path, lines: &[&str], hashes:
             out.push_str(&syms.join(", "));
             out.push('\n');
         }
-        if let Some(content) = e.content.as_deref() {
+        if let Some(content) = e.content() {
             let df = count_dir_files(&canon);
             for w in crate::base::ext::policy().post_edit_lint(&e.rel_path, &wr, content, df) {
                 out.push_str("Warning: ");

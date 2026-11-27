@@ -456,6 +456,7 @@ impl RamStore {
         if let Ok(mut wi) = self.ws_cache.indices.write() {
             wi.clear();
         }
+        self.bump_mutation_epoch();
     }
 
     pub fn prewarm_workspace_index_async(&self, ws_root: &Path) {

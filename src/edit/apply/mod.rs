@@ -395,7 +395,7 @@ fn run_verify_absent(svc: &BrokerService, ws_roots: &[PathBuf], plans: &[FilePla
         seen.insert(canon.clone(), ());
         if !dry_run {
             if let Ok(fe) = svc.store.get_full_entry(canon, Some(ws)) {
-                if let Some(t) = fe.content.as_deref() { scan_text(canon, rel, t); continue; }
+                if let Some(t) = fe.content() { scan_text(canon, rel, t); continue; }
             }
         }
         if let Ok(t) = std::str::from_utf8(bytes) { scan_text(canon, rel, t); }
@@ -409,7 +409,7 @@ fn run_verify_absent(svc: &BrokerService, ws_roots: &[PathBuf], plans: &[FilePla
             if seen.contains_key(&abs) || is_sensitive_path_with_ws(&abs, Some(ws), false) { continue; }
             ws_scanned += 1;
             if let Ok(fe) = svc.store.get_full_entry(&abs, Some(ws)) {
-                if let Some(t) = fe.content.as_deref() { scan_text(&abs, &fe.rel_path, t); }
+                if let Some(t) = fe.content() { scan_text(&abs, &fe.rel_path, t); }
             }
         }
     }
@@ -452,7 +452,7 @@ fn render_report(
             std::str::from_utf8(&p.new_bytes).map(|t| collect_overlapping_symbol_spans(&crate::parser::extract_symbols(&p.canon, t, &line_offsets_for_text(t)), &p.edited_ranges)).unwrap_or_default()
         } else if let Some(svc) = sync_svc {
             let s = svc.store.refresh_file_content(&p.canon, Some(&p.ws_root)).map(|e| collect_overlapping_symbols(&e, &p.edited_ranges)).unwrap_or_default();
-            let _ = svc.broker.changes.record_change(&crate::store::norm_key_from_canon(&p.ws_root), &p.rel_path, s.clone(), session_key.unwrap_or(""), crate::store::now_ms_u64());
+            let _ = svc.broker.changes.record_change(&crate::store::shared_repo_key(&p.ws_root), &p.rel_path, s.clone(), session_key.unwrap_or(""), crate::store::now_ms_u64());
             s
         } else { Vec::new() };
         if !syms.is_empty() { out.push_str("Symbols: "); out.push_str(&syms.join(", ")); out.push('\n'); }
@@ -464,7 +464,7 @@ fn render_report(
             std::str::from_utf8(&cp.new_bytes).map(|t| collect_created_symbols(&crate::parser::extract_symbols(&cp.canon, t, &line_offsets_for_text(t)))).unwrap_or_default()
         } else if let Some(svc) = sync_svc {
             let s = svc.store.refresh_file_content(&cp.canon, Some(&cp.ws_root)).map(|e| collect_created_symbols(&e.symbols)).unwrap_or_default();
-            let _ = svc.broker.changes.record_change(&crate::store::norm_key_from_canon(&cp.ws_root), &cp.rel_path, s.clone(), session_key.unwrap_or(""), crate::store::now_ms_u64());
+            let _ = svc.broker.changes.record_change(&crate::store::shared_repo_key(&cp.ws_root), &cp.rel_path, s.clone(), session_key.unwrap_or(""), crate::store::now_ms_u64());
             s
         } else { Vec::new() };
         render_create_line(&mut out, cp, &syms);

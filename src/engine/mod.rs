@@ -21,9 +21,10 @@ pub use elf_audit::op_elf_audit_with_baseline;
 pub use outline::op_outline;
 pub use outline::{op_inspect, op_outline_with_options};
 pub use read::op_read_for_host;
+#[allow(unused_imports)]
 pub use search::{
     cap_text, op_search, op_search_batch, parse_shorthand_search_spec, SearchError, SearchOptions,
-    SEARCH_RESPONSE_BYTES,
+    CLI_BATCH_SEARCH_BYTES, MAX_CLI_SEARCH_RESPONSE_BYTES, SEARCH_RESPONSE_BYTES,
 };
 #[allow(unused_imports)]
 pub use symbols::{op_symbols, op_symbols_with_options};
@@ -33,7 +34,7 @@ use crate::base::security::{admit_file_in_workspace, is_sensitive_path};
 use crate::broker::{contains_known_secret, MemoFileLink};
 use crate::rpc::BrokerService;
 use crate::store::{
-    is_multimodal_or_binary_ext, norm_key_from_canon, resolve_input_path, should_skip_dir,
+    is_multimodal_or_binary_ext, resolve_input_path, shared_repo_key, should_skip_dir,
     MAX_SINGLE_FILE_CACHE_BYTES,
 };
 use std::fs;
@@ -259,7 +260,7 @@ pub fn op_memo_full(
         .allowlist
         .register_hint(&base, false)
         .ok_or_else(|| "cannot resolve workspace root for memo".to_string())?;
-    let ws_norm = norm_key_from_canon(&ws_root);
+    let ws_norm = shared_repo_key(&ws_root);
 
     match action {
         "put" => {
@@ -286,7 +287,7 @@ pub fn op_memo_full(
                     .current_file_hash64(&canon, Some(&ws_root))
                     .ok_or_else(|| "cannot hash memo linked file".to_string())?;
                 links.push(MemoFileLink {
-                    rel_path: rel.to_string(),
+                    rel_path: rel.replace('\\', "/"),
                     abs_path: canon,
                     hash64_at_put: Some(hash),
                 });
@@ -396,7 +397,7 @@ pub fn materialize_pack_for_workspace(
     if pack_name.is_empty() {
         return Err("pack_get requires a non-empty `topic` pack name".to_string());
     }
-    let ws_norm = norm_key_from_canon(ws_root);
+    let ws_norm = shared_repo_key(ws_root);
     let budget = max_bytes.clamp(1024, DEFAULT_READ_MAX_BYTES);
     let pol = crate::base::ext::policy();
     let (is_virtual, summary, selectors): (bool, Option<String>, Vec<String>) =
@@ -459,7 +460,7 @@ pub fn materialize_pack_for_workspace(
             body.push_str(&format!("=== {sel} [ERROR: unreadable] ===\n"));
             continue;
         };
-        let Some(full_text) = entry.content.as_deref() else {
+        let Some(full_text) = entry.content() else {
             continue;
         };
         if contains_known_secret(full_text) {
@@ -598,7 +599,7 @@ fn parse_pack_selector(sel: &str) -> Option<(&str, PackAnchor<'_>)> {
 
 pub fn op_status(svc: &BrokerService) -> Json {
     let capsules = svc.broker.capsules.status();
-    let used = svc.store.used_ram_bytes.load(Ordering::Relaxed);
+    let used = svc.store.used_ram_bytes();
     let wmode = crate::base::mode::current_write_mode(None);
     Json::obj(vec![
         (

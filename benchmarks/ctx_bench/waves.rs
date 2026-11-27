@@ -39,39 +39,78 @@ impl Drop for BenchGuard {
     }
 }
 
-fn send_bench_rpc(port: u16, token: &str, req: &Json) -> Result<Json, String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    for attempt in 0..4 {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-            Ok(mut stream) => {
-                let _ = stream.set_nodelay(true);
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                let mut fields = match req {
-                    Json::Obj(items) => items.clone(),
-                    _ => Vec::new(),
-                };
-                fields.push((Cow::Borrowed("token"), Json::Str(token.to_string())));
-                let mut line = Json::Obj(fields).to_json_string();
-                line.push('\n');
-                stream
-                    .write_all(line.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                stream.flush().map_err(|e| e.to_string())?;
-                let mut reader = BufReader::new(stream);
+struct BenchConn {
+    port: u16,
+    stream: Option<TcpStream>,
+}
+
+impl BenchConn {
+    fn new(port: u16) -> Self {
+        Self { port, stream: None }
+    }
+
+    fn send(&mut self, token: &str, req: &Json) -> Result<Json, String> {
+        let mut fields = match req {
+            Json::Obj(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        fields.push((Cow::Borrowed("token"), Json::Str(token.to_string())));
+        let mut line = Json::Obj(fields).to_json_string();
+        line.push('\n');
+
+        // Attempt keep-alive reuse first; fall back once on EOF/reset to a fresh socket.
+        if let Some(mut stream) = self.stream.take() {
+            if stream.write_all(line.as_bytes()).is_ok() && stream.flush().is_ok() {
+                let mut reader = BufReader::new(&mut stream);
                 let mut resp = String::new();
-                reader.read_line(&mut resp).map_err(|e| e.to_string())?;
-                return json::parse(resp.trim());
-            }
-            Err(e) => {
-                if attempt == 3 {
-                    return Err(e.to_string());
+                if let Ok(n) = reader.read_line(&mut resp) {
+                    if n > 0 {
+                        self.stream = Some(stream);
+                        return json::parse(resp.trim());
+                    }
                 }
-                thread::sleep(Duration::from_millis(8));
             }
         }
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
+        for attempt in 0..6 {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                Ok(mut stream) => {
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    stream
+                        .write_all(line.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    stream.flush().map_err(|e| e.to_string())?;
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut resp = String::new();
+                    let n = reader.read_line(&mut resp).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        if attempt < 5 {
+                            thread::sleep(Duration::from_millis(8));
+                            continue;
+                        }
+                        return Err("empty reply on fresh socket".to_string());
+                    }
+                    self.stream = Some(stream);
+                    return json::parse(resp.trim());
+                }
+                Err(e) => {
+                    if attempt == 5 {
+                        return Err(e.to_string());
+                    }
+                    thread::sleep(Duration::from_millis(8 + (attempt as u64) * 4));
+                }
+            }
+        }
+        Err("bench RPC exhausted retries".to_string())
     }
-    Err("bench RPC exhausted retries".to_string())
+}
+
+fn send_bench_rpc(port: u16, token: &str, req: &Json) -> Result<Json, String> {
+    let mut conn = BenchConn::new(port);
+    conn.send(token, req)
 }
 
 enum CapsuleOutcome {
@@ -416,7 +455,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
 
     if !as_json {
         println!(
-            "ctx-bench waves (32 worker threads, 64 cache shards, {} ops/agent, competing same-role capsules):",
+            "ctx-bench waves (64 worker threads, 1024 accept queue, 64 cache shards, {} ops/agent, competing same-role capsules):",
             ops_per_agent
         );
         println!(
@@ -454,6 +493,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
             handles.push(thread::spawn(move || {
                 let mut lats = Vec::with_capacity(ops_per_agent);
                 let mut errs = 0usize;
+                let mut first_err: Option<String> = None;
                 let mut iso_errs = 0usize;
                 let mut search_busy = 0usize;
                 let mut capsule_outcome = CapsuleOutcome::Miss;
@@ -462,6 +502,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
                 let parent_sess = format!("cx-parent-w{wave_id}");
                 let my_file_idx = agent_id & 15;
                 let my_file = &f_list[my_file_idx];
+                let mut conn = BenchConn::new(port);
 
                 bar.wait();
 
@@ -592,7 +633,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
                         }
                     };
 
-                    match send_bench_rpc(port, &tok, &req) {
+                    match conn.send(&tok, &req) {
                         Ok(rep) => {
                             let search_busy_reply =
                                 matches!(rep.get_str("code"), Some("search_busy" | "daemon_busy"))
@@ -608,6 +649,9 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
                                 || rep.get_bool("degraded_inproc") == Some(true)
                             {
                                 errs += 1;
+                                if first_err.is_none() {
+                                    first_err = Some(format!("step={step} rep={}", rep.to_json_string()));
+                                }
                             } else if step == 2 {
                                 if let Some(hr) = rep.get("hook_reply") {
                                     if hr.get_str("decision") == Some("deny") {
@@ -616,11 +660,16 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
                                 }
                             }
                         }
-                        Err(_) => errs += 1,
+                        Err(err) => {
+                            errs += 1;
+                            if first_err.is_none() {
+                                first_err = Some(format!("step={step} err={err}"));
+                            }
+                        }
                     }
                     lats.push(t0.elapsed().as_micros() as u64);
                 }
-                (lats, errs, iso_errs, capsule_outcome, search_busy)
+                (lats, errs, iso_errs, capsule_outcome, search_busy, first_err)
             }));
         }
 
@@ -628,13 +677,17 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
         let mut wave_errs = 0usize;
         let mut wave_iso_errs = 0usize;
         let mut wave_search_busy = 0usize;
+        let mut sample_err: Option<String> = None;
         let mut capsules = CapsuleResults::default();
         for h in handles {
-            if let Ok((mut l, e, ie, capsule, search_busy)) = h.join() {
+            if let Ok((mut l, e, ie, capsule, search_busy, fe)) = h.join() {
                 all_lats.append(&mut l);
                 wave_errs += e;
                 wave_iso_errs += ie;
                 wave_search_busy += search_busy;
+                if sample_err.is_none() {
+                    sample_err = fe;
+                }
                 match capsule {
                     CapsuleOutcome::Success => capsules.success += 1,
                     CapsuleOutcome::Misdelivery => capsules.misdelivery += 1,
@@ -715,6 +768,13 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
             (
                 "peak_subprocs",
                 st.get("peak_subprocs").cloned().unwrap_or(Json::Int(0)),
+            ),
+            (
+                "sample_error",
+                match sample_err {
+                    Some(s) => Json::Str(s),
+                    None => Json::Null,
+                },
             ),
         ]));
     }

@@ -18,13 +18,13 @@ const GLOBAL_BLOCK_END: &str = "<!-- END AGENT_CTX GLOBAL RULES -->";
 const GLOBAL_RULES_SNIPPET: &str = "<!-- BEGIN AGENT_CTX GLOBAL RULES -->\n\
 ## In-RAM Context Broker (`ctx` / MCP `agent_ctx`)\n\
 \n\
-- In Antigravity, call eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` for lazy tools (`ctx_outline`, `ctx_impact`, `ctx_git`, `ctx_edit`, `ctx_memo`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
-  - Parallel search (`1-6` queries in `q`, `8 KiB` cap; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
-  - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols, `9 KB` inline default): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
-  - Exact struct/function bodies: `ctx_symbols` with `{\"requests\": [\"ModOrPath#Symbol\"]}` (full body by default; optional `\"compact\": true` `<=48L` preview; Rust `#Type::method` / `#impl:Type`; CLI: `ctx sym \"Mod#Sym\"`).\n\
-  - Full files / slices: in Antigravity prefer parallel native `read_file` (`<=800L` / `46 KB` inline, zero MCP truncation) for full files, and `ctx_read` for `>800L` slices (`path:start-end`) or small batches (`<=9 KB`); in Codex/CLI batch full files in `ctx_read` / `ctx read` up to `1 MiB`.\n\
-  - Impact & read-only Git: `ctx_impact` (`targets`) for callers/importers/tests; `ctx_git` (`diff` with optional `stat: true` | `status` with conflict-marker check | `log` | `show`) instead of chained `git diff | head` shell commands. When writing/creating scripts, use `ctx_edit` (`edits`/`renames`/`creates` + `verify_absent`).\n\
-  - Shared context & findings board: `ctx_memo` (`list` | `put` | `get` | `changes` | Shared Context Packs `pack`/`pack_get`/`packs` for MD/JSON rules shared across subagents).\n\
+- **CTX-first & symbol-first**: in Antigravity, call the 8 eager `mcp_agent_ctx_*` tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_impact`, `ctx_memo`, `ctx_git`, `ctx_edit`); use `call_mcp_tool(ServerName=\"agent_ctx\", ...)` only for lazy tools (`ctx_outline`, `ctx_elf_audit`) without reading `mcp/agent_ctx/*.json` schema files:\n\
+  - Parallel search (`1-6` queries in `q`, `9 KB` AGY MCP cap / `12-14 KiB` CLI batch; bare module stem matches all extensions; lowercase = smart-case; `a|b` alternation): `ctx_search` with `{\"q\": [\"ModOrDir:pattern\", ...]}` (CLI: `ctx search -q \"Mod:pat\"`).\n\
+  - Directory/file triage (`<=80` files, exact line counts, `[>=600L]`/`[OVER 800L]`, `#include`, `[L_start-L_end]` symbols): `ctx_inspect` with `{\"paths\": [\"dir1\", \"dir2\"], \"max_files\": 80}` (CLI: `ctx inspect <paths...>`).\n\
+  - Symbol-first for `>=350L` code files: fetch exact struct/function bodies via `ctx_symbols` (`{\"requests\": [\"ModOrPath#Symbol\"]}`; full body by default, `\"compact\": true` `<=48L` preview, Rust `#Type::method` / `#impl:Type`; CLI: `ctx sym \"Mod#Sym\"`) before full-file reads.\n\
+  - Slices & small files: use `read_file` with `StartLine`/`EndLine` (or full `read_file` for `<350L` files / docs / configs), and `ctx_read` for `>800L` slices (`path:start-end`) or Codex/CLI batches up to `1 MiB`.\n\
+  - Impact, read-only Git & edits: call `ctx_impact` (`targets`) for callers/importers/tests before editing; use `ctx_git` (`diff` with optional `stat: true` | `status` with conflict-marker check | `log` | `show`) instead of raw `git status`/`git diff`; use `ctx_edit` (`edits`/`renames`/`creates` + `verify_absent`) for atomic multi-file changes and new scripts.\n\
+  - Shared context, packs & ChangeFeed (worktree-shared): use `ctx_memo` (`list` | `put` | `get` | `changes` | Shared Context Packs `pack`/`pack_get`/`packs`) and tag `pack:<slug>` in subagent briefs to share scope without redundant re-reads.\n\
   - Verbose CLI builds/tests/logs/JSON: wrap with `ctx diag -- <cmd>` to deduplicate compiler/test/syslog noise and compact large JSON.\n\
 - Reuse `[RAM-Ctx Startup]` when provided. Finish directly from grouped search hits or exact symbols (`Mod#Sym`, `doc.md#Heading`, `cfg.json#a.b`) when sufficient; in Antigravity swarm workers without MCP use the `ctx` CLI directly. For workspace search, use `ctx_search` (`ctx search` without MCP) instead of shell `grep`/`rg`/`find`; reserve shell `grep` for files outside the workspace root (`~/.codex/`, `/tmp/`, logs). Never slice files in `100-400` line shell loops (`sed`/`head`/`nl`), run ad-hoc `python3 -c` file/conflict scans, or re-read unchanged files already in context.\n\
 <!-- END AGENT_CTX GLOBAL RULES -->";
@@ -34,6 +34,10 @@ pub const AGY_CORE_EAGER_TOOLS: &[&str] = &[
     "ctx_inspect",
     "ctx_read",
     "ctx_symbols",
+    "ctx_impact",
+    "ctx_memo",
+    "ctx_git",
+    "ctx_edit",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -829,5 +833,47 @@ mod tests {
             ("args", Json::Arr(vec![Json::Str("custom_mcp.py".into())])),
         ]);
         assert!(!is_owned_agent_ctx_mcp_entry(&foreign));
+    }
+
+    #[test]
+    fn agy_core_eager_has_eight_tools_and_upgrade_preserves_explicit_false() {
+        assert_eq!(AGY_CORE_EAGER_TOOLS.len(), 8);
+        for name in [
+            "ctx_search",
+            "ctx_inspect",
+            "ctx_read",
+            "ctx_symbols",
+            "ctx_impact",
+            "ctx_memo",
+            "ctx_git",
+            "ctx_edit",
+        ] {
+            assert!(AGY_CORE_EAGER_TOOLS.contains(&name), "missing {name}");
+        }
+        let mut entry = vec![(
+            Cow::Borrowed("tools"),
+            Json::obj(vec![
+                ("ctx_search", Json::obj(vec![("eager", Json::Bool(true))])),
+                ("ctx_edit", Json::obj(vec![("eager", Json::Bool(false))])),
+            ]),
+        )];
+        apply_agy_eager_tools(&mut entry, EagerMode::Core, false, Path::new("mcp_config.json"))
+            .unwrap();
+        let tools = entry
+            .iter()
+            .find(|(k, _)| k.as_ref() == "tools")
+            .and_then(|(_, v)| v.as_obj())
+            .unwrap();
+        assert_eq!(tools.len(), 8);
+        let edit_eager = tools
+            .iter()
+            .find(|(k, _)| k.as_ref() == "ctx_edit")
+            .and_then(|(_, v)| v.get_bool("eager"));
+        assert_eq!(edit_eager, Some(false));
+        let impact_eager = tools
+            .iter()
+            .find(|(k, _)| k.as_ref() == "ctx_impact")
+            .and_then(|(_, v)| v.get_bool("eager"));
+        assert_eq!(impact_eager, Some(true));
     }
 }

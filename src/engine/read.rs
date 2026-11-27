@@ -230,7 +230,7 @@ pub fn op_read_for_host(
 fn format_cap_note(budget: usize, unread: usize, is_agy: bool, later: bool) -> String {
     let qual = if later { "later paths" } else { "paths" };
     if is_agy {
-        format!("... [AGY inline cap {budget}B reached; {unread} {qual} unread — prefer parallel native read_file (<=800L/46KB inline) for full files, or ctx_read path:start-end slices for >800L]\n")
+        format!("... [AGY inline cap {budget}B reached; {unread} {qual} unread — prefer ctx_symbols / ctx_read path:start-end slices, or parallel native read_file (<=800L/46KB inline) for full files]\n")
     } else {
         format!("... [output capped at {budget} bytes; {unread} {qual} left unread]\n")
     }
@@ -240,7 +240,7 @@ fn format_other_actor_note(
     svc: &BrokerService, session_key: Option<&str>, ws_root: &Path, rel_path: &str,
 ) -> Option<String> {
     let sk = session_key?;
-    let ws_norm = crate::store::norm_key_from_canon(ws_root);
+    let ws_norm = crate::store::shared_repo_key(ws_root);
     let ev = svc.broker.changes.latest_other_actor_change(&ws_norm, rel_path, sk)?;
     let mut note = String::from("[changed by another session: seq #");
     push_usize(&mut note, ev.seq as usize);

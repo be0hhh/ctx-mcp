@@ -177,8 +177,10 @@ fn handle_mcp_message_scoped(
                     (
                         "instructions",
                         Json::Str(
-                            "Search with ctx_search(q=[\"Mod:pat\", ...]) (auto +-1 context on small hit sets — answer directly once lines are clear). \
-                             Before editing, call ctx_impact (1-6 targets + git status), then ctx_edit (edits + renames in 1 call; returns diff + fresh hashes)."
+                            "CTX-first & symbol-first (8 eager tools: ctx_search, ctx_inspect, ctx_read, ctx_symbols, ctx_impact, ctx_memo, ctx_git, ctx_edit). \
+                             Search with ctx_search(q=[\"Mod:pat\", ...]) (auto +-1 context on small hit sets — finish directly once clear). \
+                             For >=350L code files use ctx_symbols (`Mod#Sym`) first; before editing call ctx_impact (1-6 targets + git status), then ctx_edit (edits + renames in 1 call; returns diff + fresh hashes). \
+                             Use ctx_git for read-only diff/status/log/show and ctx_memo (`put`/`list`/`changes`/`pack`/`pack_get`/`packs`) for Shared Context Packs."
                                 .to_string(),
                         ),
                     ),

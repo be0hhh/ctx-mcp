@@ -144,12 +144,14 @@ pub(super) fn append_anchor_windows(
 mod tests {
     use super::*;
     use crate::base::simd::scan_source_bytes;
-    use crate::store::PathId;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
-    use std::sync::{Arc, OnceLock};
+    use crate::store::{ParsedBody, PathId};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     fn mock_entry(text: &str) -> CachedFile {
         let scanned = scan_source_bytes(text.as_bytes().to_vec()).unwrap();
+        let line_count = scanned.line_count;
+        let body = ParsedBody::for_test(scanned.text, scanned.line_offsets, line_count);
         CachedFile {
             norm_path: Arc::from("sample.rs"),
             rel_path: Box::from("sample.rs"),
@@ -157,16 +159,11 @@ mod tests {
             ctime_ns: 0,
             ino: 0,
             content_hash64: 0,
-            content_bloom: [0, 0],
             path_id: PathId(0),
             size_bytes: text.len() as u32,
-            line_count: scanned.line_count,
-            ram_charge: 0,
-            line_offsets: scanned.line_offsets,
+            line_count,
             symbols: Arc::from([]),
-            content: Some(Arc::from(scanned.text)),
-            cleaned_code: OnceLock::new(),
-            cleaned_charge: AtomicU32::new(0),
+            body: Some(body),
             last_access: AtomicU64::new(0),
         }
     }

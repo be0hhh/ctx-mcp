@@ -79,20 +79,22 @@ pub(super) fn try_in_ram_simd_search(
             continue;
         };
         if let Some(ref blooms) = needle_blooms {
-            if entry.content_bloom != [0, 0]
+            let entry_bloom = entry.content_bloom();
+            if entry_bloom != [0, 0]
                 && !blooms
                     .iter()
-                    .any(|&nb| bloom128_may_contain(entry.content_bloom, nb))
+                    .any(|&nb| bloom128_may_contain(entry_bloom, nb))
             {
                 continue;
             }
         }
-        let Some(text) = entry.content.as_deref() else {
+        let Some(text) = entry.content() else {
             continue;
         };
+        let offsets = entry.line_offsets();
         let mut line_nums = search_lines_literals(
             text,
-            &entry.line_offsets,
+            offsets,
             needles,
             case_sensitive,
             per_file_scan_cap,
@@ -110,7 +112,7 @@ pub(super) fn try_in_ram_simd_search(
                 continue;
             };
             line_nums.retain(|&ln| {
-                let clean = line_slice_at(&cleaned, &entry.line_offsets, ln);
+                let clean = line_slice_at(&cleaned, offsets, ln);
                 line_contains_any_needle(clean, needles, case_sensitive)
             });
             if line_nums.is_empty() {
@@ -171,8 +173,9 @@ pub(super) fn filter_grouped_hits_code_only(
         let Some(cleaned) = entry.cleaned_code_for_ext(ext, &svc.store) else {
             continue;
         };
+        let offsets = entry.line_offsets();
         hits.retain(|hit| {
-            let clean = line_slice_at(&cleaned, &entry.line_offsets, hit.line as u32);
+            let clean = line_slice_at(&cleaned, offsets, hit.line as u32);
             if clean.trim().is_empty() {
                 return false;
             }

@@ -14,6 +14,33 @@ use std::borrow::Cow;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
+pub(super) fn cli_session_fields(explicit_session: Option<&str>) -> Vec<(&'static str, Json)> {
+    let mut out = Vec::new();
+    let env_session = std::env::var("AGENT_CTX_SESSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit = explicit_session.map(str::trim).filter(|s| !s.is_empty());
+    let session = explicit.map(str::to_owned).or_else(|| env_session.clone());
+    if let Some(s) = session {
+        out.push(("session", Json::Str(s)));
+    }
+    let attach_token = match (explicit, env_session.as_deref()) {
+        (None, _) => true,
+        (Some(exp), Some(env_s)) => exp == env_s,
+        (Some(_), None) => false,
+    };
+    if attach_token {
+        if let Ok(tok) = std::env::var("AGENT_CTX_CLI_TOKEN") {
+            let trimmed = tok.trim();
+            if !trimmed.is_empty() {
+                out.push(("cli_token", Json::Str(trimmed.to_string())));
+            }
+        }
+    }
+    out
+}
+
 pub fn dispatch(args: &[String]) -> i32 {
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
         print_usage();
@@ -135,7 +162,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
             let mut force = false;
             let mut hashes = false;
-            let mut session = std::env::var("AGENT_CTX_SESSION").ok().unwrap_or_default();
+            let mut session: Option<String> = None;
             let mut paths = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -150,21 +177,22 @@ pub fn dispatch(args: &[String]) -> i32 {
                     }
                     "--session" if i + 1 < args.len() => {
                         i += 1;
-                        session = args[i].clone();
+                        session = Some(args[i].clone());
                     }
                     other => paths.push(Json::Str(other.to_string())),
                 }
                 i += 1;
             }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("read".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("session", Json::Str(session)),
                 ("force", Json::Bool(force)),
                 ("hashes", Json::Bool(hashes)),
                 ("max_bytes", Json::Int(max_bytes)),
                 ("paths", Json::Arr(paths)),
-            ]));
+            ];
+            fields.extend(cli_session_fields(session.as_deref()));
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "outline" => {
@@ -316,6 +344,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut compact = false;
             let mut hashes = false;
             let mut raw = false;
+            let mut session: Option<String> = None;
             let mut reqs = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -324,6 +353,9 @@ pub fn dispatch(args: &[String]) -> i32 {
                     if let Ok(v) = args[i].parse::<i64>() {
                         max_bytes = v;
                     }
+                } else if args[i] == "--session" && i + 1 < args.len() {
+                    i += 1;
+                    session = Some(args[i].clone());
                 } else if args[i] == "--compact" {
                     compact = true;
                 } else if args[i] == "--hashes" {
@@ -335,7 +367,7 @@ pub fn dispatch(args: &[String]) -> i32 {
                 }
                 i += 1;
             }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("symbols".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("max_bytes", Json::Int(max_bytes)),
@@ -343,7 +375,9 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("hashes", Json::Bool(hashes)),
                 ("raw", Json::Bool(raw)),
                 ("requests", Json::Arr(reqs)),
-            ]));
+            ];
+            fields.extend(cli_session_fields(session.as_deref()));
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "impact" => {
@@ -351,6 +385,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut max_bytes = DEFAULT_READ_MAX_BYTES as i64;
             let mut include_tests = true;
             let mut include_git_status = true;
+            let mut session: Option<String> = None;
             let mut targets = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -367,13 +402,17 @@ pub fn dispatch(args: &[String]) -> i32 {
                             max_bytes = v;
                         }
                     }
+                    "--session" if i + 1 < args.len() => {
+                        i += 1;
+                        session = Some(args[i].clone());
+                    }
                     "--no-tests" => include_tests = false,
                     "--no-git" => include_git_status = false,
                     other => targets.push(Json::Str(other.to_string())),
                 }
                 i += 1;
             }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("impact".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("targets", Json::Arr(targets)),
@@ -381,12 +420,15 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("include_tests", Json::Bool(include_tests)),
                 ("include_git_status", Json::Bool(include_git_status)),
                 ("max_bytes", Json::Int(max_bytes)),
-            ]));
+            ];
+            fields.extend(cli_session_fields(session.as_deref()));
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "edit" => {
             let mut raw_json: Option<String> = None;
             let mut dry_run_flag = false;
+            let mut session: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -394,6 +436,10 @@ pub fn dispatch(args: &[String]) -> i32 {
                     "--json" if i + 1 < args.len() => {
                         i += 1;
                         raw_json = Some(args[i].clone());
+                    }
+                    "--session" if i + 1 < args.len() => {
+                        i += 1;
+                        session = Some(args[i].clone());
                     }
                     _ => {}
                 }
@@ -435,6 +481,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             } else if let Some(dr) = parsed.get_bool("dry_run") {
                 fields.push(("dry_run", Json::Bool(dr)));
             }
+            fields.extend(cli_session_fields(session.as_deref()));
             let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
@@ -442,12 +489,17 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut old_name = String::new();
             let mut new_name = String::new();
             let mut dry_run = true;
+            let mut session: Option<String> = None;
             let mut paths = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--apply" => dry_run = false,
                     "--dry-run" => dry_run = true,
+                    "--session" if i + 1 < args.len() => {
+                        i += 1;
+                        session = Some(args[i].clone());
+                    }
                     other if old_name.is_empty() => old_name = other.to_string(),
                     other if new_name.is_empty() => new_name = other.to_string(),
                     other => paths.push(Json::Str(other.to_string())),
@@ -459,12 +511,14 @@ pub fn dispatch(args: &[String]) -> i32 {
                 ("new_name", Json::Str(new_name)),
                 ("paths", Json::Arr(paths)),
             ]);
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("edit".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("renames", Json::Arr(vec![rename_spec])),
                 ("dry_run", Json::Bool(dry_run)),
-            ]));
+            ];
+            fields.extend(cli_session_fields(session.as_deref()));
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "git" => {
@@ -476,6 +530,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut limit: i64 = 10;
             let mut max_bytes: i64 = 8192;
             let mut symbol: Option<String> = None;
+            let mut session: Option<String> = None;
             let mut paths = Vec::new();
             let mut i = 1;
             if let Some(first) = args.get(1) {
@@ -510,6 +565,10 @@ pub fn dispatch(args: &[String]) -> i32 {
                             max_bytes = v;
                         }
                     }
+                    "--session" if i + 1 < args.len() => {
+                        i += 1;
+                        session = Some(args[i].clone());
+                    }
                     other => {
                         if action == "show" && rev.is_none() {
                             rev = Some(other.to_string());
@@ -537,6 +596,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             if let Some(s) = symbol {
                 fields.push(("symbol", Json::Str(s)));
             }
+            fields.extend(cli_session_fields(session.as_deref()));
             let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
@@ -569,6 +629,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             let mut force = false;
             let mut raw = false;
             let mut max_bytes: Option<i64> = None;
+            let mut session: Option<String> = None;
             let mut paths = Vec::new();
             let mut i = 2;
             while i < args.len() {
@@ -596,6 +657,10 @@ pub fn dispatch(args: &[String]) -> i32 {
                         if let Ok(v) = args[i].parse::<i64>() {
                             max_bytes = Some(v);
                         }
+                    }
+                    "--session" if i + 1 < args.len() => {
+                        i += 1;
+                        session = Some(args[i].clone());
                     }
                     "--force" => force = true,
                     "--raw" => raw = true,
@@ -630,6 +695,7 @@ pub fn dispatch(args: &[String]) -> i32 {
             if let Some(mb) = max_bytes {
                 fields.push(("max_bytes", Json::Int(mb)));
             }
+            fields.extend(cli_session_fields(session.as_deref()));
             let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
@@ -777,18 +843,18 @@ fn print_usage() {
          \x20 ctx mode [write|read-only]\n\
          \x20 ctx update [--check] [--rebuild] [--force] [--auto [off|patch|all]] [--json]\n\
          \x20 ctx inspect <file_or_dir...> [--max-files 80] [--max-bytes 1048576] [--warn-lines 600]\n\
-         \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--force] [--hashes]\n\
+         \x20 ctx read <path[:start-end]> [...] [--max-bytes 1048576] [--session ID] [--force] [--hashes]\n\
          \x20 ctx outline <file_or_dir...> [--max-files 40] [--max-symbols N] [--max-bytes N]\n\
-         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--max-bytes 1048576]\n\
-         \x20 ctx search -q <ModOrDir:query> [-q ...] [--code-only] [--max-bytes 8192]\n\
-         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--code-only] [--max-bytes 8192]\n\
-         \x20 ctx search --batch-json '<array>' [--code-only] [--max-bytes 8192]\n\
-         \x20 ctx impact <Mod#Symbol...> [--max-callers 20] [--no-tests] [--no-git] [--max-bytes N]\n\
-         \x20 ctx edit [--dry-run] --json '<payload>'\n\
-         \x20 ctx refactor <old_name> <new_name> <paths...> [--apply]\n\
-         \x20 ctx git [diff|status|log|show] [--staged] [--rev R] [--symbol S] [--no-hashes] [paths...]\n\
+         \x20 ctx sym <ModOrPath#Symbol> [...] [--compact] [--hashes] [--session ID] [--max-bytes 1048576]\n\
+         \x20 ctx search -q <ModOrDir:query> [-q ...] [--code-only] [--session ID] [--max-bytes 14336]  (8 KiB default, 12 KiB for 3-6 queries, 14 KiB cap)\n\
+         \x20 ctx search <query> [roots...] [--max-results 40] [--context-lines 0] [--detail compact|scopes] [--code-only] [--session ID] [--max-bytes 14336]\n\
+         \x20 ctx search --batch-json '<array>' [--code-only] [--session ID] [--max-bytes 14336]\n\
+         \x20 ctx impact <Mod#Symbol...> [--max-callers 20] [--no-tests] [--no-git] [--session ID] [--max-bytes N]\n\
+         \x20 ctx edit [--dry-run] [--session ID] --json '<payload>'\n\
+         \x20 ctx refactor <old_name> <new_name> <paths...> [--session ID] [--apply]\n\
+         \x20 ctx git [diff|status|log|show] [--staged] [--stat] [--rev R] [--symbol S] [--no-hashes] [--session ID] [paths...]\n\
          \x20 ctx diag [--file PATH] [--hashes] [--max-errors 15] [--context 2] [-- <cmd> [args...]]\n\
-         \x20 ctx memo <put|get|list|clear|changes|pack|pack-get|packs> [--topic K] [--summary S] [--since-seq N] [paths...]\n\
+         \x20 ctx memo <put|get|list|clear|changes|pack|pack-get|packs> [--topic K] [--summary S] [--since-seq N] [--session ID] [paths...]\n\
          \x20 ctx capsule <claim|prepare> [key] [--assignment TEXT] [--workspace inherit|branch|share]\n\
          \x20 ctx elf <--elf path> [--asm path] [--baseline-elf path] [--baseline-asm path]\n\
          \x20 ctx status | clear | save-snapshot | shutdown | --version\n\

@@ -2,7 +2,7 @@
 
 use super::{is_write_tool, MEMO_ACTIONS};
 use crate::base::json::Json;
-use crate::engine::SEARCH_RESPONSE_BYTES;
+use crate::engine::search::MAX_CLI_SEARCH_RESPONSE_BYTES;
 use std::borrow::Cow;
 
 pub(super) fn tool_schemas(write_enabled: bool) -> Json {
@@ -47,7 +47,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             (
                 "description",
                 Json::Str(
-                    "Read files/slices (`path:s-e`) from RAM (auto-delta on small session edits). `hashes=true` adds `ln:h3|` anchors."
+                    "Read slices (`path:s-e`) or small files from RAM (auto-delta on small session edits; prefer ctx_symbols first for >=350L code files). `hashes=true` adds `ln:h3|` anchors."
                         .into(),
                 ),
             ),
@@ -122,7 +122,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             (
                 "description",
                 Json::Str(
-                    "Symbol/section bodies (`Mod#Sym`, `Mod#Type::method`, `Mod#impl:Type`, `doc.md#Heading`, `cfg.json#a.b`). Full body by default; `compact=true` <=48L preview, `hashes=true` for anchors, `raw=true` disables doc compaction."
+                    "Symbol-first for >=350L code files: exact bodies (`Mod#Sym`, `Mod#Type::method`, `Mod#impl:Type`, `doc.md#Heading`, `cfg.json#a.b`). Full body by default; `compact=true` <=48L preview, `hashes=true` for anchors, `raw=true` disables doc compaction."
                         .into(),
                 ),
             ),
@@ -149,7 +149,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             (
                 "description",
                 Json::Str(
-                    "Ranked search: 1-6 `Mod:pat` in `q` (smart-case, auto +-1 context on <=6 hits, `code_only=true` skips comments/strings)."
+                    "Ranked search: 1-6 `Mod:pat` in `q` (smart-case, auto +-1 context on <=6 hits, `code_only=true` skips comments/strings; up to 9 KB in AGY MCP or 12-14 KiB in CLI/Codex/Claude)."
                         .into(),
                 ),
             ),
@@ -171,7 +171,10 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
                                 Json::obj(vec![
                                     ("type", Json::Str("integer".into())),
                                     ("minimum", Json::Int(1)),
-                                    ("maximum", Json::Int(SEARCH_RESPONSE_BYTES as i64)),
+                                    (
+                                        "maximum",
+                                        Json::Int(MAX_CLI_SEARCH_RESPONSE_BYTES as i64),
+                                    ),
                                 ]),
                             ),
                             (
@@ -410,7 +413,7 @@ pub(super) fn tool_schemas(write_enabled: bool) -> Json {
             (
                 "description",
                 Json::Str(
-                    "Shared in-RAM memo, change-feed & Shared Context Packs (`put`|`get`|`list`|`changes`|`pack`|`pack_get`|`packs`), auto-deduped per session."
+                    "Worktree-shared in-RAM memo, ChangeFeed & Shared Context Packs (`put`|`get`|`list`|`changes`|`pack`|`pack_get`|`packs`; tag `pack:<slug>` in subagent briefs), auto-deduped per session."
                         .into(),
                 ),
             ),

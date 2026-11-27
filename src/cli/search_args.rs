@@ -1,5 +1,6 @@
 //! Argument parser for `ctx search` (positional, `-q` shorthand, and `--batch-json`).
 
+use super::cli_session_fields;
 use crate::base::json::{self, Json, JsonKey};
 use crate::rpc::workspace_cwd_str;
 use std::borrow::Cow;
@@ -15,6 +16,7 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
     let mut positional = Vec::new();
     let mut has_detail = false;
     let mut wants_context = false;
+    let mut session: Option<String> = None;
     while let Some(arg) = args.next() {
         let option = arg.as_str();
         let value = |args: &mut std::slice::Iter<'_, String>| {
@@ -57,6 +59,9 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
                 fields.retain(|(name, _)| name.as_ref() != "code_only");
                 fields.push((Cow::Borrowed("code_only"), Json::Bool(true)));
             }
+            "--session" => {
+                session = Some(value(&mut args)?);
+            }
             "--" => {
                 positional.extend(args.map(|value| Json::Str(value.clone())));
                 break;
@@ -86,6 +91,9 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
         }
         fields.push((Cow::Borrowed("roots"), Json::Arr(items.collect())));
     }
+    for (k, v) in cli_session_fields(session.as_deref()) {
+        fields.push((Cow::Borrowed(k), v));
+    }
     Ok(Json::Obj(fields))
 }
 
@@ -99,10 +107,18 @@ mod tests {
 
     #[test]
     fn parse_search_cli_handles_all_three_forms_and_rejects_mixing() {
-        let q = parse_search_cli(&svec(&["-q", "Mod:needle", "--max-bytes", "4096"]))
-            .expect("shorthand");
+        let q = parse_search_cli(&svec(&[
+            "-q",
+            "Mod:needle",
+            "--max-bytes",
+            "4096",
+            "--session",
+            "agy:s1",
+        ]))
+        .expect("shorthand");
         assert_eq!(q.get_str("op"), Some("search"));
         assert_eq!(q.get_i64("max_bytes"), Some(4096));
+        assert_eq!(q.get_str("session"), Some("agy:s1"));
         assert_eq!(
             q.get("q").and_then(Json::as_arr).map(|a| a.len()),
             Some(1)

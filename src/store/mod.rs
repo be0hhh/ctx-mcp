@@ -2,7 +2,7 @@
 //! per-session read state, and metadata-only reboot snapshots.
 
 mod index;
-mod paths;
+pub(crate) mod paths;
 mod session;
 mod snapshot;
 pub mod warm;
@@ -11,7 +11,7 @@ pub use index::MissingResolution;
 pub use paths::{
     default_snapshot_path, display_workspace_path, is_multimodal_or_binary_ext,
     norm_key_from_canon, norm_path, resolve_input_path, restore_caller_path_style, runtime_dir,
-    should_skip_dir,
+    shared_repo_key, should_skip_dir,
 };
 #[allow(unused_imports)]
 pub use session::{DeltaHit, DuplicateHit, SessionReadStatus};
@@ -23,14 +23,17 @@ use crate::base::simd::{
     fast_hash64, line_slice_at, push_u32, push_usize, scan_source_bytes,
     trigram_bloom128_ascii_lower, CachePadded, FastHashMap, ScanError,
 };
-use crate::parser::{build_cleaned_code_buffer_for_ext, extract_symbols, SymbolSpan};
+use crate::parser::{
+    build_cleaned_code_buffer_for_ext, clean_lang_tag, extract_symbols, file_parser_kind,
+    SymbolSpan,
+};
 use index::WorkspaceIndexCache;
 use session::{DedupRing, DeltaSnapshotRing, SessionShardMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_SINGLE_FILE_CACHE_BYTES: usize = 1_048_576; // 1 MiB full-file read/cache ceiling
@@ -38,7 +41,7 @@ pub const HARD_RAM_CAP_BYTES: usize = 4usize << 30; // 4 GiB ceiling
 pub const SNAPSHOT_DISK_CAP_BYTES: usize = 64 << 20; // 64 MiB max metadata-only snapshot
 const SHARD_COUNT: usize = 64;
 const SHARD_MASK: usize = SHARD_COUNT - 1;
-pub(super) const CLEANED_EVICTED_BIT: u32 = 1u32 << 31;
+const MAX_BODY_DEDUP_ENTRIES: usize = 4096;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +70,139 @@ impl PathInterner {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BodyDedupKey {
+    content_hash64: u64,
+    size_bytes: u32,
+    parser_kind: u8,
+    clean_lang: u8,
+}
+
+fn sub_atomic_saturating(counter: &AtomicUsize, freed: usize) {
+    if freed == 0 {
+        return;
+    }
+    let mut cur = counter.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(freed);
+        match counter.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ParsedBody {
+    pub content: Arc<str>,
+    pub line_offsets: Box<[u32]>,
+    pub symbols: Arc<[SymbolSpan]>,
+    pub content_bloom: [u64; 2],
+    pub cleaned_code: OnceLock<Arc<str>>,
+    pub cleaned_charge: AtomicU32,
+    pub base_charge: u32,
+    pub cache_owners: AtomicU32,
+    pub line_count: u32,
+    #[allow(dead_code)]
+    pub size_bytes: u32,
+    #[allow(dead_code)]
+    pub content_hash64: u64,
+    ram_counter: Arc<AtomicUsize>,
+    acct_lock: Mutex<()>,
+}
+
+impl ParsedBody {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        content: Arc<str>,
+        line_offsets: Box<[u32]>,
+        symbols: Arc<[SymbolSpan]>,
+        content_bloom: [u64; 2],
+        base_charge: u32,
+        line_count: u32,
+        size_bytes: u32,
+        content_hash64: u64,
+        ram_counter: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            content,
+            line_offsets,
+            symbols,
+            content_bloom,
+            cleaned_code: OnceLock::new(),
+            cleaned_charge: AtomicU32::new(0),
+            base_charge,
+            cache_owners: AtomicU32::new(0),
+            line_count,
+            size_bytes,
+            content_hash64,
+            ram_counter,
+            acct_lock: Mutex::new(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(text: String, line_offsets: Box<[u32]>, line_count: u32) -> Arc<Self> {
+        let size_bytes = text.len() as u32;
+        Arc::new(Self::new(
+            Arc::from(text),
+            line_offsets,
+            Arc::from([]),
+            [0, 0],
+            0,
+            line_count,
+            size_bytes,
+            0,
+            Arc::new(AtomicUsize::new(0)),
+        ))
+    }
+
+    fn attach_cache_owner(&self) {
+        let Ok(_g) = self.acct_lock.lock() else {
+            return;
+        };
+        let prev = self.cache_owners.fetch_add(1, Ordering::AcqRel);
+        if prev == 0 {
+            let cleaned = self.cleaned_charge.load(Ordering::Acquire) as usize;
+            let total = (self.base_charge as usize).saturating_add(cleaned);
+            self.ram_counter.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+
+    fn detach_cache_owner(&self) {
+        let Ok(_g) = self.acct_lock.lock() else {
+            return;
+        };
+        let prev = self.cache_owners.load(Ordering::Acquire);
+        if prev == 0 {
+            return;
+        }
+        let next = prev - 1;
+        self.cache_owners.store(next, Ordering::Release);
+        if next == 0 {
+            let cleaned = self.cleaned_charge.load(Ordering::Acquire) as usize;
+            let total = (self.base_charge as usize).saturating_add(cleaned);
+            sub_atomic_saturating(&self.ram_counter, total);
+        }
+    }
+
+    fn record_cleaned_charge(&self, len: u32) {
+        if len == 0 {
+            return;
+        }
+        let Ok(_g) = self.acct_lock.lock() else {
+            return;
+        };
+        if self.cleaned_charge.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        self.cleaned_charge.store(len, Ordering::Release);
+        if self.cache_owners.load(Ordering::Acquire) > 0 {
+            self.ram_counter.fetch_add(len as usize, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CachedFile {
     pub norm_path: Arc<str>,
@@ -75,16 +211,11 @@ pub struct CachedFile {
     pub ctime_ns: u64,
     pub ino: u64,
     pub content_hash64: u64,
-    pub content_bloom: [u64; 2],
     pub path_id: PathId,
     pub size_bytes: u32,
     pub line_count: u32,
-    pub ram_charge: u32,
-    pub line_offsets: Box<[u32]>,
     pub symbols: Arc<[SymbolSpan]>,
-    pub content: Option<Arc<str>>,
-    pub(super) cleaned_code: OnceLock<Arc<str>>,
-    pub(super) cleaned_charge: AtomicU32,
+    pub body: Option<Arc<ParsedBody>>,
     pub last_access: AtomicU64,
 }
 
@@ -97,64 +228,59 @@ impl CachedFile {
             ctime_ns: self.ctime_ns,
             ino: self.ino,
             content_hash64: self.content_hash64,
-            content_bloom: [0, 0],
             path_id: self.path_id,
             size_bytes: self.size_bytes,
             line_count: self.line_count,
-            ram_charge: 0,
-            line_offsets: Box::new([]),
             symbols: Arc::clone(&self.symbols),
-            content: None,
-            cleaned_code: OnceLock::new(),
-            cleaned_charge: AtomicU32::new(CLEANED_EVICTED_BIT),
+            body: None,
             last_access: AtomicU64::new(self.last_access.load(Ordering::Relaxed)),
         }
     }
 
-    /// Lazily builds and caches the comment/string-blanked buffer once per file version in RAM.
-    /// Uses `cleaned_charge` with `CLEANED_EVICTED_BIT` so evicted entries never leak RAM accounting.
-    pub fn cleaned_code_for_ext(&self, ext: &str, store: &RamStore) -> Option<Arc<str>> {
-        if let Some(existing) = self.cleaned_code.get() {
-            return Some(Arc::clone(existing));
-        }
-        let text = self.content.as_deref()?;
-        let built: Arc<str> = Arc::from(build_cleaned_code_buffer_for_ext(text, ext));
-        if self.cleaned_code.set(Arc::clone(&built)).is_ok() {
-            let max_charge = (CLEANED_EVICTED_BIT - 1) as usize;
-            let len = built.len().min(max_charge) as u32;
-            if len > 0
-                && self
-                    .cleaned_charge
-                    .compare_exchange(0, len, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                store.used_ram_bytes.fetch_add(len as usize, Ordering::Relaxed);
-            }
-        }
-        Some(Arc::clone(self.cleaned_code.get().unwrap_or(&built)))
+    #[inline]
+    pub fn has_body(&self) -> bool {
+        self.body.is_some()
     }
 
-    pub(super) fn release_total_charge(&self) -> usize {
-        let base = if self.content.is_some() {
-            self.ram_charge as usize
-        } else {
-            0
-        };
-        let prev = self
-            .cleaned_charge
-            .swap(CLEANED_EVICTED_BIT, Ordering::AcqRel);
-        let cleaned = if prev & CLEANED_EVICTED_BIT != 0 {
-            0
-        } else {
-            prev as usize
-        };
-        base.saturating_add(cleaned)
+    #[inline]
+    pub fn content(&self) -> Option<&str> {
+        self.body.as_deref().map(|b| b.content.as_ref())
+    }
+
+    #[inline]
+    pub fn content_arc(&self) -> Option<&Arc<str>> {
+        self.body.as_deref().map(|b| &b.content)
+    }
+
+    #[inline]
+    pub fn line_offsets(&self) -> &[u32] {
+        self.body.as_deref().map_or(&[], |b| b.line_offsets.as_ref())
+    }
+
+    #[inline]
+    pub fn content_bloom(&self) -> [u64; 2] {
+        self.body.as_deref().map_or([0, 0], |b| b.content_bloom)
+    }
+
+    /// Lazily builds and caches the comment/string-blanked buffer once per shared `ParsedBody`.
+    /// Charges RAM strictly while `cache_owners > 0` so evicted entries never leak accounting.
+    pub fn cleaned_code_for_ext(&self, ext: &str, _store: &RamStore) -> Option<Arc<str>> {
+        let body = self.body.as_deref()?;
+        if let Some(existing) = body.cleaned_code.get() {
+            return Some(Arc::clone(existing));
+        }
+        let built: Arc<str> = Arc::from(build_cleaned_code_buffer_for_ext(&body.content, ext));
+        if body.cleaned_code.set(Arc::clone(&built)).is_ok() {
+            let len = built.len().min(u32::MAX as usize) as u32;
+            body.record_cleaned_charge(len);
+        }
+        Some(Arc::clone(body.cleaned_code.get().unwrap_or(&built)))
     }
 
     #[inline]
     pub fn line_slice(&self, line_1based: u32) -> &str {
-        match self.content.as_deref() {
-            Some(text) => line_slice_at(text, &self.line_offsets, line_1based),
+        match self.body.as_deref() {
+            Some(body) => line_slice_at(&body.content, &body.line_offsets, line_1based),
             None => "",
         }
     }
@@ -187,7 +313,8 @@ type FileShardMap = FastHashMap<Arc<str>, Arc<CachedFile>>;
 
 pub struct RamStore {
     pub max_ram_bytes: usize,
-    pub used_ram_bytes: CachePadded<AtomicUsize>,
+    used_ram_bytes: RwLock<Arc<AtomicUsize>>,
+    pub mutation_epoch: CachePadded<AtomicU64>,
     pub access_clock: CachePadded<AtomicU64>,
     pub cache_hits: CachePadded<AtomicU64>,
     pub cache_misses: CachePadded<AtomicU64>,
@@ -195,6 +322,7 @@ pub struct RamStore {
     pub last_save_ms: AtomicU64,
     paths: RwLock<PathInterner>,
     shards: Box<[CachePadded<RwLock<FileShardMap>>; SHARD_COUNT]>,
+    body_dedup: RwLock<FastHashMap<BodyDedupKey, Weak<ParsedBody>>>,
     inflight: Mutex<FastHashMap<Arc<str>, Arc<InflightSlot>>>,
     sessions: Box<[CachePadded<Mutex<SessionShardMap>>; SHARD_COUNT]>,
     dedup_ring: Mutex<DedupRing>,
@@ -289,7 +417,8 @@ impl RamStore {
         }));
         let store = Self {
             max_ram_bytes: detect_ram_budget(),
-            used_ram_bytes: CachePadded::new(AtomicUsize::new(0)),
+            used_ram_bytes: RwLock::new(Arc::new(AtomicUsize::new(0))),
+            mutation_epoch: CachePadded::new(AtomicU64::new(1)),
             access_clock: CachePadded::new(AtomicU64::new(1)),
             cache_hits: CachePadded::new(AtomicU64::new(0)),
             cache_misses: CachePadded::new(AtomicU64::new(0)),
@@ -297,6 +426,7 @@ impl RamStore {
             last_save_ms: AtomicU64::new(now_ms()),
             paths: RwLock::new(PathInterner::default()),
             shards,
+            body_dedup: RwLock::new(FastHashMap::default()),
             inflight: Mutex::new(FastHashMap::default()),
             sessions,
             dedup_ring: Mutex::new(DedupRing::default()),
@@ -306,6 +436,30 @@ impl RamStore {
         };
         let _ = store.load_snapshot();
         store
+    }
+
+    #[inline]
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn bump_mutation_epoch(&self) {
+        self.mutation_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn current_ram_counter(&self) -> Arc<AtomicUsize> {
+        let guard = self
+            .used_ram_bytes
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&guard)
+    }
+
+    #[inline]
+    pub fn used_ram_bytes(&self) -> usize {
+        self.current_ram_counter().load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -325,28 +479,9 @@ impl RamStore {
         w.intern(key)
     }
 
-    fn sub_ram_bytes(&self, freed: usize) {
-        let mut cur = self.used_ram_bytes.load(Ordering::Relaxed);
-        loop {
-            let next = cur.saturating_sub(freed);
-            match self.used_ram_bytes.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
     #[inline]
     pub fn ram_usage_and_budget(&self) -> (usize, usize) {
-        (
-            self.used_ram_bytes.load(Ordering::Relaxed),
-            self.max_ram_bytes,
-        )
+        (self.used_ram_bytes(), self.max_ram_bytes)
     }
 
     pub fn cached_file_count(&self) -> usize {
@@ -364,9 +499,19 @@ impl RamStore {
     }
 
     pub fn clear_all(&self) {
+        if let Ok(mut counter) = self.used_ram_bytes.write() {
+            *counter = Arc::new(AtomicUsize::new(0));
+        }
+        if let Ok(mut dedup) = self.body_dedup.write() {
+            dedup.clear();
+        }
         for sh in self.shards.iter() {
             if let Ok(mut g) = sh.write() {
-                g.clear();
+                for (_, entry) in g.drain() {
+                    if let Some(body) = entry.body.as_deref() {
+                        body.detach_cache_owner();
+                    }
+                }
             }
         }
         for ss in self.sessions.iter() {
@@ -384,17 +529,12 @@ impl RamStore {
             p.to_id.clear();
             p.from_id.clear();
         }
-        self.used_ram_bytes.store(0, Ordering::Relaxed);
+        self.bump_mutation_epoch();
         let _ = fs::remove_file(&self.snapshot_path);
     }
 
     fn evict_if_needed(&self, incoming_bytes: usize) {
-        if self
-            .used_ram_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(incoming_bytes)
-            <= self.max_ram_bytes
-        {
+        if self.used_ram_bytes().saturating_add(incoming_bytes) <= self.max_ram_bytes {
             return;
         }
         let target = self
@@ -407,7 +547,7 @@ impl RamStore {
         for (s_idx, sh) in self.shards.iter().enumerate() {
             if let Ok(guard) = sh.read() {
                 for v in guard.values() {
-                    if v.content.is_some() && v.ram_charge > 0 {
+                    if v.has_body() {
                         candidates.push((
                             v.last_access.load(Ordering::Relaxed),
                             s_idx as u8,
@@ -420,7 +560,7 @@ impl RamStore {
         candidates.sort_unstable_by_key(|&(acc, _, _)| acc);
 
         for (_, s_idx, path_id) in candidates {
-            if self.used_ram_bytes.load(Ordering::Relaxed) <= target {
+            if self.used_ram_bytes() <= target {
                 break;
             }
             let key_opt = self
@@ -432,14 +572,11 @@ impl RamStore {
                 continue;
             };
             if let Ok(mut guard) = self.shards[s_idx as usize].write() {
-                if let Some(existing) = guard.get(&key) {
-                    if existing.content.is_some() && existing.ram_charge > 0 {
-                        let freed = existing.release_total_charge();
+                if let Some(existing) = guard.get(&key).cloned() {
+                    if let Some(body) = existing.body.as_deref() {
                         let stripped = Arc::new(existing.without_body());
                         guard.insert(key, stripped);
-                        if freed > 0 {
-                            self.sub_ram_bytes(freed);
-                        }
+                        body.detach_cache_owner();
                     }
                 }
             }
@@ -451,13 +588,13 @@ impl RamStore {
         let s_idx = shard_idx_for(&key);
         if let Ok(mut guard) = self.shards[s_idx].write() {
             if let Some(old) = guard.remove(key.as_str()) {
-                let freed = old.release_total_charge();
-                if freed > 0 {
-                    self.sub_ram_bytes(freed);
+                if let Some(body) = old.body.as_deref() {
+                    body.detach_cache_owner();
                 }
                 self.dirty_since_save.store(true, Ordering::Relaxed);
             }
         }
+        self.bump_mutation_epoch();
         self.invalidate_workspace_indices();
     }
 
@@ -472,17 +609,17 @@ impl RamStore {
         let s_idx = shard_idx_for(&key);
         let old_entry = if let Ok(mut guard) = self.shards[s_idx].write() {
             guard.remove(key.as_str()).inspect(|old| {
-                let freed = old.release_total_charge();
-                if freed > 0 {
-                    self.sub_ram_bytes(freed);
+                if let Some(body) = old.body.as_deref() {
+                    body.detach_cache_owner();
                 }
                 self.dirty_since_save.store(true, Ordering::Relaxed);
             })
         } else {
             None
         };
+        self.bump_mutation_epoch();
         if let Some(old) = old_entry {
-            if let Some(ref content) = old.content {
+            if let Some(content) = old.content_arc() {
                 self.snapshot_delta(old.path_id, old.content_hash64, content);
             }
         }
@@ -543,7 +680,7 @@ impl RamStore {
             let entries = shard.read().map_err(|_| "shard lock poisoned".to_string())?;
             let entry = entries.get(key.as_str());
             let hit = entry
-                .filter(|entry| stamp.matches(entry) && (!require_content || entry.content.is_some()));
+                .filter(|entry| stamp.matches(entry) && (!require_content || entry.has_body()));
             if let Some(hit) = hit {
                 hit.last_access.store(self.next_tick(), Ordering::Relaxed);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -638,6 +775,7 @@ impl RamStore {
         (path_id, key_arc): (PathId, Arc<str>),
         previous: Option<&CachedFile>,
     ) -> Result<Option<Arc<CachedFile>>, String> {
+        let active_counter = self.current_ram_counter();
         let read_error = |error| format!("read {}: {error}", canon_path.display());
         let file = File::open(canon_path).map_err(read_error)?;
         if stamp_metadata(&file.metadata().map_err(read_error)?, canon_path)? != st {
@@ -651,41 +789,96 @@ impl RamStore {
         if raw_bytes.len() as u64 != st.size_bytes {
             return Ok(None);
         }
-        let scanned = scan_source_bytes(raw_bytes);
         if file_stat(canon_path)? != st {
             return Ok(None);
         }
-        let scanned = scanned.map_err(|err| match err {
-            ScanError::Binary => format!("binary file rejected: {}", canon_path.display()),
-            ScanError::NonUtf8 => format!("non-UTF8 text file: {}", canon_path.display()),
-        })?;
 
-        let content_hash64 = fast_hash64(scanned.text.as_bytes());
-        let symbols: Arc<[SymbolSpan]> = match previous {
-            Some(prev)
-                if prev.content_hash64 == content_hash64
-                    && !prev.symbols.is_empty()
-                    && prev.symbols.iter().all(|s| !s.signature.is_empty()) =>
-            {
-                Arc::clone(&prev.symbols)
-            }
-            _ => Arc::from(extract_symbols(
-                canon_path,
-                &scanned.text,
-                &scanned.line_offsets,
-            )),
+        let content_hash64 = fast_hash64(&raw_bytes);
+        let dedup_key = BodyDedupKey {
+            content_hash64,
+            size_bytes: st.size_bytes as u32,
+            parser_kind: file_parser_kind(canon_path),
+            clean_lang: clean_lang_tag(canon_path),
         };
 
-        let content_len = scanned.text.len();
-        let charge_bytes = content_len + (scanned.line_offsets.len() << 2);
-        self.evict_if_needed(charge_bytes);
+        let existing_body = self
+            .body_dedup
+            .read()
+            .ok()
+            .and_then(|map| map.get(&dedup_key).and_then(Weak::upgrade))
+            .filter(|cand| {
+                Arc::ptr_eq(&cand.ram_counter, &active_counter)
+                    && cand.content.as_bytes() == raw_bytes.as_slice()
+            });
+
+        let body = if let Some(shared) = existing_body {
+            shared
+        } else {
+            let scanned = scan_source_bytes(raw_bytes).map_err(|err| match err {
+                ScanError::Binary => format!("binary file rejected: {}", canon_path.display()),
+                ScanError::NonUtf8 => format!("non-UTF8 text file: {}", canon_path.display()),
+            })?;
+            let symbols: Arc<[SymbolSpan]> = match previous {
+                Some(prev)
+                    if prev.content_hash64 == content_hash64
+                        && !prev.symbols.is_empty()
+                        && prev.symbols.iter().all(|s| !s.signature.is_empty()) =>
+                {
+                    Arc::clone(&prev.symbols)
+                }
+                _ => Arc::from(extract_symbols(
+                    canon_path,
+                    &scanned.text,
+                    &scanned.line_offsets,
+                )),
+            };
+            let content_len = scanned.text.len();
+            let charge_bytes =
+                (content_len + (scanned.line_offsets.len() << 2)).min(u32::MAX as usize) as u32;
+            let content_bloom = trigram_bloom128_ascii_lower(scanned.text.as_bytes());
+            let built = Arc::new(ParsedBody::new(
+                Arc::from(scanned.text),
+                scanned.line_offsets,
+                symbols,
+                content_bloom,
+                charge_bytes,
+                scanned.line_count,
+                st.size_bytes as u32,
+                content_hash64,
+                Arc::clone(&active_counter),
+            ));
+            if let Ok(mut map) = self.body_dedup.write() {
+                if let Some(existing) = map.get(&dedup_key).and_then(Weak::upgrade).filter(|cand| {
+                    Arc::ptr_eq(&cand.ram_counter, &active_counter)
+                        && cand.content.as_bytes() == built.content.as_bytes()
+                }) {
+                    existing
+                } else {
+                    if map.len() >= MAX_BODY_DEDUP_ENTRIES && !map.contains_key(&dedup_key) {
+                        map.retain(|_, w| w.strong_count() > 0);
+                        if map.len() >= MAX_BODY_DEDUP_ENTRIES {
+                            map.clear();
+                        }
+                    }
+                    map.insert(dedup_key, Arc::downgrade(&built));
+                    built
+                }
+            } else {
+                built
+            }
+        };
+
+        if body.cache_owners.load(Ordering::Acquire) == 0 {
+            let incoming = (body.base_charge as usize)
+                .saturating_add(body.cleaned_charge.load(Ordering::Acquire) as usize);
+            self.evict_if_needed(incoming);
+        }
 
         let rel_path: Box<str> = match previous {
             Some(prev) if !prev.rel_path.is_empty() => prev.rel_path.clone(),
             _ => display_workspace_path(canon_path, ws_root).into_boxed_str(),
         };
 
-        let content_bloom = trigram_bloom128_ascii_lower(scanned.text.as_bytes());
         let new_entry = Arc::new(CachedFile {
             norm_path: Arc::clone(&key_arc),
             rel_path,
@@ -693,16 +886,11 @@ impl RamStore {
             ctime_ns: st.ctime_ns,
             ino: st.ino,
             content_hash64,
-            content_bloom,
             path_id,
             size_bytes: st.size_bytes as u32,
-            line_count: scanned.line_count,
-            ram_charge: charge_bytes as u32,
-            line_offsets: scanned.line_offsets,
-            symbols,
-            content: Some(Arc::from(scanned.text)),
-            cleaned_code: OnceLock::new(),
-            cleaned_charge: AtomicU32::new(0),
+            line_count: body.line_count,
+            symbols: Arc::clone(&body.symbols),
+            body: Some(Arc::clone(&body)),
             last_access: AtomicU64::new(self.next_tick()),
         });
 
@@ -713,21 +901,23 @@ impl RamStore {
             let mut guard = self.shards[shard_idx_for(&key_arc)]
                 .write()
                 .map_err(|_| "shard write poisoned".to_string())?;
+            if !Arc::ptr_eq(&body.ram_counter, &self.current_ram_counter()) {
+                return Ok(Some(new_entry));
+            }
+            body.attach_cache_owner();
             let old = guard.insert(key_arc, Arc::clone(&new_entry));
             if let Some(ref old_entry) = old {
-                let freed = old_entry.release_total_charge();
-                if freed > 0 {
-                    self.sub_ram_bytes(freed);
+                if let Some(old_body) = old_entry.body.as_deref() {
+                    old_body.detach_cache_owner();
                 }
             }
-            self.used_ram_bytes
-                .fetch_add(charge_bytes, Ordering::Relaxed);
             self.dirty_since_save.store(true, Ordering::Relaxed);
             old
         };
         if let Some(old) = replaced_old {
             if old.content_hash64 != content_hash64 {
-                if let Some(ref content) = old.content {
+                self.bump_mutation_epoch();
+                if let Some(content) = old.content_arc() {
                     self.snapshot_delta(old.path_id, old.content_hash64, content);
                 }
             }
@@ -865,11 +1055,8 @@ mod tests {
             drop(owner);
             assert!(joined_load, "reader did not enter the existing load");
             let loaded = read.join().unwrap();
-            assert_eq!(
-                loaded.content.as_deref(),
-                Some("int edited_a_second_time;\n")
-            );
-            assert_eq!(cached.content.as_deref(), Some("int cached;\n"));
+            assert_eq!(loaded.content(), Some("int edited_a_second_time;\n"));
+            assert_eq!(cached.content(), Some("int cached;\n"));
         });
         fs::remove_dir_all(dir).unwrap();
     }
@@ -894,11 +1081,7 @@ mod tests {
             .is_none());
         assert_eq!(store.cached_file_count(), 0);
         assert_eq!(
-            store
-                .get_outline_entry(&path, Some(&dir))
-                .unwrap()
-                .content
-                .as_deref(),
+            store.get_outline_entry(&path, Some(&dir)).unwrap().content(),
             Some("int after_first_write;\n")
         );
         fs::remove_dir_all(dir).unwrap();
@@ -984,6 +1167,95 @@ mod tests {
 
         // Generic single-segment directory ambiguous across >2 parents returns empty
         assert!(store.find_workspace_dirs("config", &dir, 8).is_empty());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parsed_body_dedup_shares_arc_separates_parser_kinds_evicts_and_clears_safely() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-body-dedup-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(dir.join("wt1")).unwrap();
+        fs::create_dir_all(dir.join("wt2")).unwrap();
+
+        let code = "pub fn shared_fn(x: u64) -> u64 {\n    x + 42\n}\n";
+        let p1 = dir.join("wt1/lib.rs");
+        let p2 = dir.join("wt2/lib.rs");
+        fs::write(&p1, code).unwrap();
+        fs::write(&p2, code).unwrap();
+
+        // Identical bytes under CMakeLists.txt vs notes.txt MUST NOT collide in dedup.
+        let cmake_txt = "add_library(demo STATIC a.cpp)\n";
+        let cm = dir.join("wt1/CMakeLists.txt");
+        let notes = dir.join("wt1/notes.txt");
+        fs::write(&cm, cmake_txt).unwrap();
+        fs::write(&notes, cmake_txt).unwrap();
+
+        let mut store = RamStore::new(dir.join("snap.bin"));
+        let e1 = store.get_full_entry(&p1, Some(&dir)).unwrap();
+        let ram_one = store.used_ram_bytes();
+        assert!(ram_one > 0);
+        let e2 = store.get_full_entry(&p2, Some(&dir)).unwrap();
+        assert_eq!(store.used_ram_bytes(), ram_one, "identical files must charge 1x RAM");
+        assert!(Arc::ptr_eq(
+            e1.body.as_ref().unwrap(),
+            e2.body.as_ref().unwrap()
+        ));
+        assert_eq!(e1.body.as_ref().unwrap().cache_owners.load(Ordering::Acquire), 2);
+
+        // Lazy cleaned_code charges once while cache_owners == 2
+        let _ = e1.cleaned_code_for_ext("rs", &store).unwrap();
+        let ram_with_clean = store.used_ram_bytes();
+        assert!(ram_with_clean > ram_one);
+        let _ = e2.cleaned_code_for_ext("rs", &store).unwrap();
+        assert_eq!(store.used_ram_bytes(), ram_with_clean);
+
+        // Evicting 1 of 2 keeps 1x charge; evicting 2 of 2 releases to 0
+        store.invalidate_path(&p1);
+        assert_eq!(store.used_ram_bytes(), ram_with_clean);
+        assert_eq!(e1.body.as_ref().unwrap().cache_owners.load(Ordering::Acquire), 1);
+        store.invalidate_path(&p2);
+        assert_eq!(store.used_ram_bytes(), 0);
+        assert_eq!(e1.body.as_ref().unwrap().cache_owners.load(Ordering::Acquire), 0);
+
+        // CMakeLists.txt vs notes.txt must have distinct ParsedBody & symbols
+        let e_cm = store.get_full_entry(&cm, Some(&dir)).unwrap();
+        let e_notes = store.get_full_entry(&notes, Some(&dir)).unwrap();
+        assert!(!Arc::ptr_eq(
+            e_cm.body.as_ref().unwrap(),
+            e_notes.body.as_ref().unwrap()
+        ));
+        assert!(!e_cm.symbols.is_empty());
+        assert!(e_notes.symbols.is_empty());
+
+        // Forced eviction path strips bodies and releases shared charge cleanly
+        store.clear_all();
+        let live_before_clear = store.get_full_entry(&p1, Some(&dir)).unwrap();
+        let _live2 = store.get_full_entry(&p2, Some(&dir)).unwrap();
+        assert!(store.used_ram_bytes() > 0);
+        store.max_ram_bytes = 1;
+        store.evict_if_needed(1);
+        assert_eq!(store.used_ram_bytes(), 0);
+        // clear_all while live Arc<CachedFile> exists causes zero underflow
+        store.max_ram_bytes = 1 << 20;
+        let held = store.get_full_entry(&p1, Some(&dir)).unwrap();
+        assert!(store.used_ram_bytes() > 0);
+        store.clear_all();
+        assert_eq!(store.used_ram_bytes(), 0);
+        assert_eq!(live_before_clear.content(), Some(code));
+        assert_eq!(held.content(), Some(code));
+        drop(held);
+        assert_eq!(store.used_ram_bytes(), 0);
+
+        // External disk mutation bumps mutation_epoch on load_full_entry
+        let ep0 = store.mutation_epoch();
+        let _ = store.get_full_entry(&p1, Some(&dir)).unwrap();
+        fs::write(&p1, "pub fn shared_fn(x: u64) -> u64 {\n    x + 99\n}\n").unwrap();
+        let _ = store.get_full_entry(&p1, Some(&dir)).unwrap();
+        assert!(store.mutation_epoch() > ep0);
 
         fs::remove_dir_all(dir).unwrap();
     }

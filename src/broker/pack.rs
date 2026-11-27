@@ -9,7 +9,7 @@ use std::sync::{Mutex, RwLock};
 pub const MAX_PACK_WORKSPACES: usize = 64;
 pub const MAX_PACKS_PER_WORKSPACE: usize = 64;
 pub const MAX_PACK_SELECTORS: usize = 16;
-pub const MAX_PACK_DEDUP_ENTRIES: usize = 256;
+pub const MAX_PACK_DEDUP_ENTRIES: usize = 2048;
 pub const MAX_PACK_NAME_BYTES: usize = 96;
 pub const MAX_PACK_SUMMARY_BYTES: usize = 4096;
 
@@ -180,6 +180,25 @@ impl PackStore {
         st.workspaces
             .get(ws_norm)
             .map(|list| list.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn list_active_pack_slugs(&self, shared_key: &str, max_items: usize) -> Vec<String> {
+        if max_items == 0 {
+            return Vec::new();
+        }
+        let Ok(st) = self.state.read() else {
+            return Vec::new();
+        };
+        st.workspaces
+            .get(shared_key)
+            .map(|list| {
+                list.iter()
+                    .rev()
+                    .take(max_items)
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

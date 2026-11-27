@@ -3,13 +3,15 @@
 use crate::base::json::Json;
 use crate::base::security::generate_csprng_token;
 use crate::base::simd::FastHashMap;
-use std::fs;
+use crate::store::paths::is_linked_worktree;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(600);
 const MCP_TICKET_TTL: Duration = Duration::from_secs(30);
+const CLI_LEASE_TTL: Duration = Duration::from_secs(300);
+const MAX_CLI_LEASES: usize = 4096;
 const MAX_BRIEF_BYTES: usize = 64 * 1024;
 const KEY_PREFIX: &str = "CTX_CAPSULE_KEY=";
 const CLAIM_HINT: &str = "Call MCP tool agent_ctx ctx_capsule (not shell ctx) with action=\"claim\" and key set to the value below as your first tool call. If the launch receipt is pending, retry once. If delivery is unavailable, use the assignment above.";
@@ -78,10 +80,17 @@ pub enum Recipient {
     CodexPath(String),
 }
 
+struct CliLease {
+    session: String,
+    workspace: PathBuf,
+    expires: Instant,
+}
+
 #[derive(Default)]
 struct RegistryState {
     entries: FastHashMap<String, Entry>,
     tickets: FastHashMap<String, (Instant, HostContext, String)>,
+    cli_leases: FastHashMap<String, CliLease>,
     peak: usize,
     full: u64,
     expired: u64,
@@ -114,6 +123,7 @@ impl RegistryState {
         self.entries.retain(|_, entry| entry.expires > now);
         self.expired += (pending - self.entries.len()) as u64;
         self.tickets.retain(|_, (expires, _, _)| *expires > now);
+        self.cli_leases.retain(|_, lease| lease.expires > now);
     }
 }
 
@@ -327,6 +337,45 @@ impl CapsuleRegistry {
             .ok_or_else(|| "ctx host context expired or invalid".into())
     }
 
+    pub fn issue_cli_lease(&self, session: String, workspace: PathBuf) -> Result<String, String> {
+        let session = session.trim().to_string();
+        if session.is_empty() || session.len() > 256 || session.chars().any(char::is_control) {
+            return Err("invalid cli lease session".into());
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ctx cli lease registry unavailable")?;
+        let now = Instant::now();
+        state.prune(now);
+        if state.cli_leases.len() >= MAX_CLI_LEASES {
+            return Err("ctx cli lease registry busy".into());
+        }
+        let token = generate_csprng_token()?;
+        if state.cli_leases.contains_key(&token) {
+            return Err("ctx cli lease key collision".into());
+        }
+        state.cli_leases.insert(
+            token.clone(),
+            CliLease {
+                session,
+                workspace,
+                expires: now + CLI_LEASE_TTL,
+            },
+        );
+        Ok(token)
+    }
+
+    pub fn verify_cli_lease(&self, token: &str) -> Option<(String, PathBuf)> {
+        if token.is_empty() {
+            return None;
+        }
+        let state = self.state.lock().ok()?;
+        let now = Instant::now();
+        let lease = state.cli_leases.get(token)?;
+        (lease.expires > now).then(|| (lease.session.clone(), lease.workspace.clone()))
+    }
+
     pub fn clear(&self) {
         if let Ok(mut state) = self.state.lock() {
             *state = RegistryState::default();
@@ -377,47 +426,17 @@ pub fn key_in_assignment(brief: &str) -> Option<&str> {
     .then_some(key)
 }
 
-fn git_admin(root: &Path) -> Option<PathBuf> {
-    let marker = root.join(".git");
-    if marker.is_dir() {
-        return fs::canonicalize(marker).ok();
-    }
-    let pointer = fs::read_to_string(marker).ok()?;
-    fs::canonicalize(root.join(pointer.trim().strip_prefix("gitdir: ")?)).ok()
-}
-
-fn git_common(admin: &Path) -> Option<PathBuf> {
-    match fs::read_to_string(admin.join("commondir")) {
-        Ok(pointer) => fs::canonicalize(admin.join(pointer.trim())).ok(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(admin.to_owned()),
-        Err(_) => None,
-    }
-}
-
-fn linked_worktree(parent: &Path, child: &Path) -> Option<()> {
-    let common = git_common(&git_admin(parent)?)?;
-    let admin = git_admin(child)?;
-    if !admin.parent().is_some_and(|dir| dir == common.join("worktrees"))
-        || git_common(&admin)? != common
-    {
-        return None;
-    }
-    let backlink = fs::read_to_string(admin.join("gitdir")).ok()?;
-    let actual = fs::canonicalize(admin.join(backlink.trim())).ok()?;
-    (actual == fs::canonicalize(child.join(".git")).ok()?).then_some(())
-}
-
 fn workspace_matches(entry: &Entry, child: &Path) -> bool {
     if entry.parent.workspace == child {
         return entry.mode != WorkspaceMode::Branch;
     }
-    entry.mode != WorkspaceMode::Inherit
-        && linked_worktree(&entry.parent.workspace, child).is_some()
+    entry.mode != WorkspaceMode::Inherit && is_linked_worktree(&entry.parent.workspace, child)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn ctx(host: &'static str, session: &str, agent: Option<&str>, root: &str) -> HostContext {
         HostContext {
@@ -545,8 +564,36 @@ mod tests {
             child.join(".git").to_string_lossy().as_bytes(),
         )
         .unwrap();
-        assert!(linked_worktree(&repository, &child).is_some());
-        assert!(linked_worktree(&repository, &other).is_none());
+        assert!(is_linked_worktree(&repository, &child));
+        assert!(!is_linked_worktree(&repository, &other));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cli_lease_is_reusable_within_ttl_and_rejects_expired_tokens() {
+        let registry = CapsuleRegistry {
+            capacity: 64,
+            state: Mutex::default(),
+        };
+        let ws = PathBuf::from("/tmp/cli-lease-ws");
+        let tok = registry
+            .issue_cli_lease("agy:conv-123".into(), ws.clone())
+            .unwrap();
+        assert_eq!(
+            registry.verify_cli_lease(&tok),
+            Some(("agy:conv-123".into(), ws.clone()))
+        );
+        // Reusable within TTL (does not consume token).
+        assert_eq!(
+            registry.verify_cli_lease(&tok),
+            Some(("agy:conv-123".into(), ws))
+        );
+        assert_eq!(registry.verify_cli_lease("unknown-token"), None);
+
+        // Expire manually and verify fail-closed rejection.
+        if let Some(lease) = registry.state.lock().unwrap().cli_leases.get_mut(&tok) {
+            lease.expires = Instant::now();
+        }
+        assert_eq!(registry.verify_cli_lease(&tok), None);
     }
 }

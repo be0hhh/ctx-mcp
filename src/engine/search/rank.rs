@@ -26,6 +26,7 @@ pub(super) struct OmittedScope {
     pub count: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct SearchHitSet {
     pub hits: Vec<SearchHit>,
     pub total_found: usize,

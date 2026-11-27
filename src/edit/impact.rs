@@ -330,15 +330,17 @@ fn scan_workspace_impact_batch(
         let abs = ws_idx.abs_path(it);
         if is_sensitive_path_with_ws(&abs, Some(ws_root), false) { continue; }
         let Ok(fe) = svc.store.get_full_entry(&abs, Some(ws_root)) else { continue; };
-        let Some(text) = fe.content.as_deref() else { continue; };
+        let Some(text) = fe.content() else { continue; };
+        let fe_offsets = fe.line_offsets();
+        let fe_bloom = fe.content_bloom();
         if has_any_ident && !non_code {
             let mut cleaned: Option<Arc<str>> = None;
             for (ident, group) in &ident_groups {
                 if is_test && !group.iter().any(|&k| include_tests && resolved[idxs[k]].scan.related.len() < MAX_RELATED_FILES && !rel_seen[k].contains_key(rel)) { continue; }
-                if ident.len() >= 3 && ident.is_ascii() && fe.content_bloom != [0, 0] {
-                    if !bloom128_may_contain(fe.content_bloom, trigram_bloom128_ascii_lower(ident.as_bytes())) { continue; }
+                if ident.len() >= 3 && ident.is_ascii() && fe_bloom != [0, 0] {
+                    if !bloom128_may_contain(fe_bloom, trigram_bloom128_ascii_lower(ident.as_bytes())) { continue; }
                 }
-                let raw_lines = search_lines_literals(text, &fe.line_offsets, &[ident.as_str()], true, 64);
+                let raw_lines = search_lines_literals(text, fe_offsets, &[ident.as_str()], true, 64);
                 if raw_lines.is_empty() { continue; }
                 let cbuf_arc = cleaned.get_or_insert_with(|| {
                     let mut eb = [0u8; 16];
@@ -346,7 +348,7 @@ fn scan_workspace_impact_batch(
                 });
                 let cbuf: &str = cbuf_arc.as_ref();
                 for ln in raw_lines {
-                    if !contains_ident_word(line_slice_at(cbuf, &fe.line_offsets, ln), ident, true) { continue; }
+                    if !contains_ident_word(line_slice_at(cbuf, fe_offsets, ln), ident, true) { continue; }
                     if is_test {
                         let mut all_done = true;
                         for &k in group {
@@ -376,7 +378,7 @@ fn scan_workspace_impact_batch(
             let tag = if is_manifest { "manifest" } else { "test" };
             for (needle, group) in &rel_groups {
                 if !group.iter().any(|&k| resolved[idxs[k]].scan.related.len() < MAX_RELATED_FILES && !rel_seen[k].contains_key(rel)) { continue; }
-                let hits = search_lines_literals(text, &fe.line_offsets, &[needle.as_str()], !is_manifest, 4);
+                let hits = search_lines_literals(text, fe_offsets, &[needle.as_str()], !is_manifest, 4);
                 if hits.iter().any(|&ln| contains_ident_word(fe.line_slice(ln), needle, !is_manifest)) {
                     for &k in group {
                         let t = &mut resolved[idxs[k]];

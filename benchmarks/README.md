@@ -1,8 +1,8 @@
-# CTX Benchmarks (`v2.5.0`)
+# CTX Benchmarks (`v2.5.0` – `v2.5.3`)
 
 Headline positioning, quota-drain summary, and full-session Native vs CTX totals are in the
 [main README](../README.md#savings-at-a-glance-native-vs-ctx-v250).
-Every row below is from verified `v2.5.0` runs (`131/131` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv` across `450` Fat-LTO functions, `0` failed edits).
+Sections 1–4 report verified `v2.5.0` single-agent baselines; Sections 5–6 report verified **`v2.5.3`** Fat-LTO load, hot-kernel, `10–100` agent multi-worktree swarm, and live 10-agent parallel A/B runs (`156/156` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv`, `0` failed edits).
 
 ## 1. Cold (Turn 1) vs Warm (Turn 2) Navigation (`30/30` exact `file:line`)
 
@@ -113,45 +113,80 @@ Two multi-file tasks (`cpp_sig_edit` across C++ headers; `py_refactor` lexical r
 
 - **Totals (`24/24` verified, `0` failed edits):** Codex tool calls **`54 → 28` (−48.1%)** (`2.36 ms/call` MCP); AGY tool calls **`42 → 32` (−23.8%)** (`1.80 ms/call` MCP).
 
-## 5. Load & Hot-Kernel Results (`v2.5.0`)
+## 5. Load & Hot-Kernel Results (`v2.5.3`)
 
-Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `rustc`, release Fat-LTO, `0` hardware `div`/`idiv` across `450` `ctx::` functions, `0` `.unwrap()`/`.expect()` in production).
+Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `RUSTFLAGS="-C target-cpu=native"`, release Fat-LTO, `0` hardware `div`/`idiv`, `0` `.unwrap()`/`.expect()` in production).
 
 ### In-process hot kernels (`ctx-bench micro --iters 200`, 19 kernels)
 
 | Kernel | Iterations | ns/op | Throughput |
 |---|---:|---:|---:|
-| `search_exact_256k` (AVX2+BMI1 zero-spill) | 200 | 6,132 | **42,759 MB/s** |
-| `search_ascii_ci_256k` (AVX2+BMI1 inline fold) | 200 | 6,167 | **42,513 MB/s** |
-| `fast_hash64_256k` (2-way ILP 32B fold) | 800 | 15,979 | **16,408 MB/s** |
-| `scan_source_256k` (2-phase AVX2+BMI1) | 200 | 22,018 | **11,908 MB/s** |
-| `line_hash3_4k_lines` (3-hex content anchors) | 200 | 32,307 | **8,528 MB/s** |
-| `json_encode_64k` (single-pass AVX2 stream) | 200 | 14,881 | **4,629 MB/s** |
-| `json_parse_64k` (SIMD escape-free slice) | 200 | 22,204 | **3,102 MB/s** |
-| `clean_code_buf_256k` (AVX2+SSE2 delimiter scrubber, **3.14×** vs v2.4) | 200 | 180,316 | **1,455 MB/s** |
-| `trigram_bloom_6paths` (256B LUT) | 12,800 | 274 | **963 MB/s** |
-| `content_bloom128_256k` (in-RAM 128-bit ASCII-lower bloom) | 400 | 429,664 | **610 MB/s** |
-| `cpp_parse_64k` (symbol extractor) | 200 | 146,393 | **447 MB/s** |
-| `sha256_hex_256k` (pure-Rust SHA-256) | 200 | 727,186 | 360 MB/s |
-| `diag_json_compact_256k` (large JSON/NDJSON schema + error compactor) | 100 | 1,110,739 | 235 MB/s |
-| `search_rank_spread` (multi-file scoring & selection) | 200 | 71,663 | 235 MB/s |
-| `compact_md_json_64k` (lossless Markdown/JSON/YAML compactor) | 200 | 281,956 | 231 MB/s |
-| `diag_log_compress_256k` (SIMD ANSI/CR + template dedup) | 100 | 2,118,735 | 123 MB/s |
-| `push_u64_x1000` (2-digit LUT + branchless len) | 1,600 | 6,477 | 6.5 ns/int |
-| `store_cache_hit` (64-shard `FastHashMap` + stat) | 12,800 | 3,593 | 3.59 µs/hit |
-| `allowlist_admit_file` (lexical + canonicalize) | 1,600 | 7,491 | 7.49 µs/admit |
+| `search_ascii_ci_256k` (AVX2+BMI1 inline fold) | 200 | 7,553 | **34,711 MB/s** |
+| `search_exact_256k` (AVX2+BMI1 zero-spill) | 200 | 8,259 | **31,746 MB/s** |
+| `fast_hash64_256k` (2-way ILP 32B fold) | 800 | 18,097 | **14,488 MB/s** |
+| `scan_source_256k` (2-phase AVX2+BMI1) | 200 | 25,110 | **10,442 MB/s** |
+| `line_hash3_4k_lines` (3-hex content anchors) | 200 | 35,118 | **7,845 MB/s** |
+| `json_encode_64k` (single-pass AVX2 stream) | 200 | 15,385 | **4,477 MB/s** |
+| `json_parse_64k` (SIMD escape-free slice) | 200 | 22,113 | **3,115 MB/s** |
+| `trigram_bloom_6paths` (256B LUT) | 12,800 | 141 | **1,878 MB/s** |
+| `clean_code_buf_256k` (AVX2+SSE2 delimiter scrubber) | 200 | 187,346 | **1,400 MB/s** |
+| `search_rank_spread` (multi-file scoring & selection) | 200 | 26,818 | **628 MB/s** |
+| `content_bloom128_256k` (in-RAM 128-bit ASCII-lower bloom) | 400 | 447,960 | **585 MB/s** |
+| `cpp_parse_64k` (symbol extractor) | 200 | 161,737 | **405 MB/s** |
+| `sha256_hex_256k` (pure-Rust SHA-256) | 200 | 712,117 | 368 MB/s |
+| `diag_json_compact_256k` (large JSON/NDJSON schema + error compactor) | 100 | 1,072,920 | 244 MB/s |
+| `compact_md_json_64k` (lossless Markdown/JSON/YAML compactor) | 200 | 328,727 | 198 MB/s |
+| `diag_log_compress_256k` (SIMD ANSI/CR + template dedup) | 100 | 2,302,263 | 113 MB/s |
+| `push_u64_x1000` (2-digit LUT + branchless len) | 1,600 | 7,185 | 7.2 ns/int |
+| `store_cache_hit` (64-shard `FastHashMap` + stat) | 12,800 | 3,949 | 3.95 µs/hit |
+| `allowlist_admit_file` (lexical + canonicalize) | 1,600 | 8,246 | 8.25 µs/admit |
 
 ### Concurrent TCP daemon waves (`ctx-bench waves --agents 1,10,50,100,200 --ops 20`)
 
-32 worker threads, 64 cache shards, keep-alive RPC, competing same-role capsules:
+64 worker threads, 1024 accept queue, 64 cache shards, keep-alive RPC (`BenchConn`), competing same-role capsules:
 
-| Agents | Total ops | ops/sec | p50 (µs) | p95 (µs) | p99 (µs) | Cache hit | Iso errs | Capsules OK | Misdelivery / Miss / Busy |
+| Agents | Total ops | ops/sec | p50 (µs) | p95 (µs) | p99 (µs) | Cache hit | RPC / Iso errs | Capsules OK | Misdelivery / Miss / Busy |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 20 | 1,750 | 472 | 978 | 978 | 78.6% | 0 | 1 | 0 / 0 / 0 |
-| 10 | 200 | 7,290 | 907 | 3,629 | 5,229 | 97.5% | 0 | 10 | 0 / 0 / 0 |
-| 50 | 1,000 | 9,886 | 2,597 | 13,727 | 22,610 | 99.5% | 0 | 50 | 0 / 0 / 0 |
-| 100 | 2,000 | **11,182** | 3,816 | 23,166 | 38,222 | 99.8% | 0 | 100 | 0 / 0 / 0 |
-| 200 | 4,000 | 7,338 | **4,709** | 82,904 | 283,932 | **99.9%** | **0** | **200** | **0 / 0 / 0** |
+| 1 | 20 | 2,418 | **254** | 830 | 830 | 78.6% | 0 / 0 | 1 | 0 / 0 / 0 |
+| 10 | 200 | **13,664** | **413** | 1,910 | 4,165 | 95.3% | 0 / 0 | 10 | 0 / 0 / 0 |
+| 50 | 1,000 | 9,513 | 2,022 | 19,132 | 35,261 | 99.0% | 0 / 0 | 50 | 0 / 0 / 0 |
+| 100 | 2,000 | 10,093 | 4,091 | 27,615 | 40,192 | 99.6% | 0 / 0 | 100 | 0 / 0 / 0 |
+| 200 | 4,000 | **11,616** | 7,765 | **51,989** | **84,857** | **99.8%** | **0 / 0** | **200** | **0 / 0 / 0** |
+
+## 6. Multi-Agent Swarm Scaling & Live 10-Agent Parallel A/B (`v2.5.3`)
+
+### Tier 1A — Isolated Daemon Swarm Replay (`ctx-bench swarm --agents 10,50,100 --worktrees 8`, 0 LLM tokens)
+
+Measured on an isolated 201-file C++/Rust corpus (`32` files `>=350L`) cloned into a temporary Git repository with **`8` real linked `git worktree`s** sharing one `ctx` daemon (scout publishes Shared Context Pack + memos → `N` concurrent workers run `SessionStart` pack auto-materialization, 4-query batch `search` coalescing, `PreToolUse read_file` Large-Read Gate, cross-worktree `symbols`, `pack_get` dedup, `memo list`, `impact`, `git`, and concurrent edit `ChangeFeed` + `[STALE]` verification):
+
+| Agents | ops/sec | p50 ms | p95 ms | p99 ms | Errors | Large-Read redirects | Pack dedup hits | Cross-WT memos | ChangeFeed visible | Stale detected | **RAM (8 worktrees)** | Peak subprocs | **Payload saved** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|
+| **10** | 803 | 5.99 | 44.52 | 51.04 | **0** | 10/10 | 10/10 | 10/10 | 9/9 | Yes | **2,847 KiB** | 10 | **93.7%** |
+| **50** | 1,354 | 10.68 | 121.81 | 158.82 | **0** | 50/50 | 50/50 | 50/50 | 49/49 | Yes | **2,847 KiB** | 16 | **93.7%** |
+| **100** | **1,532** | 22.64 | 185.04 | 271.24 | **0** | 100/100 | 100/100 | 100/100 | 99/99 | Yes | **2,847 KiB** | 16 | **93.6%** |
+
+- **Flat RAM across 8 linked worktrees:** `ParsedBody` content-addressed deduplication keeps total daemon RAM identical (`2,847 KiB`) across `10`, `50`, and `100` agents spanning all `8` worktrees (`1×` storage instead of `8×`).
+
+### Tier 1B — Offline Multi-Agent Context Replay (`160` source files, `23 >= 350L`, 71.8% inter-agent file overlap)
+
+| Agents | Naive `read_file` | CTX `v2.5.2` | **CTX `v2.5.3`** | Saved vs Naive | Saved vs `v2.5.2` |
+|---:|---:|---:|---:|---:|---:|
+| **10** | 754.8 KB (~193k tok) | 610.3 KB | **122.2 KB (~31k tok)** | **83.8%** | **80.0%** |
+| **50** | 3,810.0 KB (~975k tok) | 3,052.1 KB | **601.9 KB (~154k tok)** | **84.2%** | **80.3%** |
+| **100** | 7,616.7 KB (~1.95M tok) | 6,098.9 KB | **1,201.5 KB (~308k tok)** | **84.2%** | **80.3%** |
+
+### Tier 2 — Live 10-Agent Parallel Antigravity A/B (`Gemini 4 Neon (High)`, `20/20` sessions, `100.0%` exact `file:line`)
+
+Ten parallel headless Antigravity (`agy`) sessions solving distinct two-anchor read-only audit tasks over an isolated C++ subsystem (`unshare` bind-mounted isolated `mcp_config.json` and `hooks.json` per arm):
+- **`baseline_nomcp`:** native `read_file` without MCP or `ctx` hooks (modeling pre-upgrade swarm workers).
+- **`multiagent` (`v2.5.3`):** `8` core eager MCP tools, `AGENT_CTX_LARGE_READ_LINES=350`, shared `ctx` daemon, symbol-first workflow.
+
+| Arm (`10` parallel Neon High agents) | Wall time | Full input | Uncached input | Cached input | Output (thinking) | `read_file` calls | `ctx` calls | Exact `file:line` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`baseline_nomcp`** | 32.30 s | 363,377 | 233,511 | 129,866 | 19,155 (15,958) | 20 | 0 | 20/20 (100.0%) |
+| **`multiagent` (`v2.5.3`)** | **31.15 s (−3.6%)** | **317,487 (−12.6%)** | **182,006 (−22.1%)** | 135,481 (+4.3%) | **17,597 (−8.1%)** (14,761) | **0 (−100.0%)** | **14** | **20/20 (100.0%)** |
+
+<sub>*Across 10 separate sessions, ~130k of uncached input is the fixed host system prompt; dynamic code context ingested into the model dropped by ~50% (`~103k → ~52k` uncached) even on short two-anchor lookups, with zero `read_file` calls and 100% citation accuracy.*</sub>
 
 ## Reproduce
 
@@ -163,6 +198,9 @@ cargo build --release --bins
 
 # 1–200 concurrent agent TCP daemon waves
 ./target/release/ctx-bench waves --ctx-bin ./target/release/ctx --agents 1,10,50,100,200 --ops 20
+
+# 10–100 agent multi-worktree swarm replay (cloned temp repo + 8 linked worktrees, zero live mutations)
+./target/release/ctx-bench swarm --ctx-bin ./target/release/ctx --repo . --agents 10,50,100 --worktrees 8
 
 # In-process hot-kernel microbenchmarks (19 kernels)
 ./target/release/ctx-bench micro --iters 200

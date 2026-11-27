@@ -32,12 +32,15 @@ use std::path::{Path, PathBuf};
 
 const AGY_NATIVE_LINE_CAP: usize = 800;
 const AGY_NATIVE_DELIVERY_BYTE_CAP: usize = 46_080;
-const AGY_WIDEN_MAX_BYTES: u32 = 44_000;
-const STARTUP_BUDGET_BYTES: usize = 2500;
+const AGY_WIDEN_MAX_LINES: usize = 300;
+const AGY_WIDEN_MAX_BYTES: u32 = 16_384;
+const STARTUP_BUDGET_BYTES: usize = 4_000;
 
-const SUBAGENT_STARTUP_DIGEST: &str = "Batch calls: ctx_inspect (dirs), ctx_search (`q`: 1-6 `Mod:pat`), ctx_symbols (full body; `compact=true` <=48L), ctx_read (slices >800L in AGY or full files <=1MiB in Codex); use CLI `ctx inspect|search|outline|sym` if MCP is absent. Finish from search/symbols when sufficient.";
+const SUBAGENT_STARTUP_DIGEST: &str = "CTX-first & symbol-first: ctx_search (`q`: 1-6 `Mod:pat`), ctx_inspect (dirs), ctx_symbols (prefer for >=350L code files; full body or `compact=true` <=48L), ctx_impact (callers/tests before edits), ctx_read (slices or <=1MiB in Codex/CLI), ctx_git (diff/status/log/show), ctx_edit, ctx_memo (memos/changes/packs). Finish from search/symbols when sufficient.";
 
-const AGY_LAZY_MCP_SIGNATURES: &str = "In Antigravity: call eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`) and prefer parallel native `read_file` (<=800L/46KB inline) for full files; use `call_mcp_tool` for lazy tools (`ctx_outline`, `ctx_memo`, `ctx_elf_audit`) or CLI `ctx` when MCP is absent.";
+const AGY_LAZY_MCP_SIGNATURES: &str = "In Antigravity: call the 8 eager mcp_agent_ctx_* tools directly (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_impact`, `ctx_memo`, `ctx_git`, `ctx_edit`); use `call_mcp_tool` only for lazy tools (`ctx_outline`, `ctx_elf_audit`, `ctx_capsule`). For >=350L code files use `ctx_symbols` first; in swarm workers without MCP use CLI `ctx search|inspect|sym|impact|read|git|edit|memo|diag` directly.";
+
+const AGY_WORKER_STARTUP_DIGEST: &str = "CTX CLI-first & symbol-first (swarm workers have no MCP): use `ctx search -q 'Mod:pat'` (1-6 queries, 12-14 KiB batch), `ctx inspect <dirs>`, `ctx sym 'Mod#Sym'` (prefer for >=350L code files), `ctx impact 'Mod#Sym'`, `ctx read <path[:s-e]>`, `ctx git diff|status|log|show`, `ctx edit`, `ctx memo put|list|pack|pack-get|changes`, `ctx diag -- <cmd>`. Finish from search/symbols when sufficient.";
 
 #[inline]
 fn capsule_auto_stage_enabled() -> bool {
@@ -807,13 +810,327 @@ pub(super) fn workspace_grep_redirect_reason(
             format!("ctx search -q \"{escaped}\""),
         )
     };
-    if host == "agy" {
+    let is_worker = svc.store.is_worker_session(sess_key);
+    if host == "agy" && is_worker {
+        Some(format!(
+            "[RAM-Ctx] Use CLI `{cli_cmd}` for workspace search instead of shell `grep`/`rg` (ranked, in-RAM, 1-6 `-q` queries in 1 call). (Repeat this exact command once if raw grep/rg output is strictly required.)"
+        ))
+    } else if host == "agy" {
         Some(format!(
             "[RAM-Ctx] Use `ctx_search` for workspace search instead of shell `grep`/`rg`: `mcp_agent_ctx_ctx_search({mcp_args})` (or `call_mcp_tool(ServerName=\"agent_ctx\", ToolName=\"ctx_search\", Arguments={mcp_args})` / CLI `{cli_cmd}`). (Repeat this exact command once if raw grep/rg output is strictly required.)"
         ))
     } else {
         Some(format!(
             "[RAM-Ctx] Use `ctx_search` for workspace search instead of shell `grep`/`rg`: `ctx_search({mcp_args})` (CLI `{cli_cmd}`). (Repeat this exact command once if raw grep/rg output is strictly required.)"
+        ))
+    }
+}
+
+struct GitRedirectSpec {
+    cli_cmd: String,
+    mcp_args: String,
+}
+
+fn is_simple_git_rev(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && !s.contains(':')
+        && !s.contains('*')
+        && !s.contains('?')
+        && !s.contains('[')
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.' | b'~' | b'^')
+        })
+}
+
+fn escape_json_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn detect_workspace_readonly_git_spec(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<GitRedirectSpec> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\n')
+        || trimmed.contains('|')
+        || trimmed.contains('>')
+        || trimmed.contains('<')
+        || trimmed.contains(';')
+        || trimmed.contains("&&")
+        || trimmed.contains("||")
+        || trimmed.contains("$(")
+        || trimmed.contains('`')
+    {
+        return None;
+    }
+    let tokens = split_shell_tokens(trimmed)?;
+    if tokens.len() < 2 {
+        return None;
+    }
+    let prog = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(tokens[0].as_str());
+    if !matches!(prog, "git" | "git.exe") {
+        return None;
+    }
+    // Reject any global git flag (`-C`, `--git-dir`, `--work-tree`, `-c`, `--no-pager`, etc.)
+    let sub = tokens[1].as_str();
+    if sub.starts_with('-') {
+        return None;
+    }
+    let base = cwd?;
+    if is_internal_ide_path(base) || is_sensitive_path(base) {
+        return None;
+    }
+    let (_canon_base, ws_root) = svc.allowlist.admit_dir(base, Some(base)).ok()?;
+
+    match sub {
+        "status" => {
+            if tokens.len() != 2 {
+                return None;
+            }
+            Some(GitRedirectSpec {
+                cli_cmd: "ctx git status".to_string(),
+                mcp_args: "{\"action\": \"status\"}".to_string(),
+            })
+        }
+        "diff" => {
+            let mut staged = false;
+            let mut stat = false;
+            let mut rev: Option<String> = None;
+            let mut paths: Vec<String> = Vec::new();
+            let mut after_dd = false;
+
+            for tok in &tokens[2..] {
+                let s = tok.as_str();
+                if !after_dd {
+                    if s == "--" {
+                        after_dd = true;
+                        continue;
+                    }
+                    if s == "--staged" || s == "--cached" {
+                        staged = true;
+                        continue;
+                    }
+                    if s == "--stat" {
+                        stat = true;
+                        continue;
+                    }
+                    if s.starts_with('-') {
+                        return None;
+                    }
+                    if s.contains("..") || s.contains(':') || s.contains('*') || s.contains('?') || s.contains('[') {
+                        return None;
+                    }
+                    let cand = resolve_input_path(s, Some(base));
+                    if is_sensitive_path(&cand)
+                        || is_internal_ide_path(&cand)
+                        || fs::symlink_metadata(&cand).is_ok()
+                    {
+                        return None;
+                    }
+                    // Allow a single simple revision before `--` (reject multiple unseparated positionals).
+                    if rev.is_some() {
+                        return None;
+                    }
+                    if !is_simple_git_rev(s) {
+                        return None;
+                    }
+                    rev = Some(s.to_string());
+                } else {
+                    if s.is_empty()
+                        || s.starts_with('-')
+                        || s.contains("..")
+                        || s.contains(':')
+                        || s.contains('*')
+                        || s.contains('?')
+                        || s.contains('[')
+                    {
+                        return None;
+                    }
+                    let p = resolve_input_path(s, Some(base));
+                    if is_sensitive_path(&p) || is_internal_ide_path(&p) {
+                        return None;
+                    }
+                    let rel = if p.is_dir() {
+                        let (canon, wr) = svc.allowlist.admit_dir(&p, Some(base)).ok()?;
+                        if wr != ws_root {
+                            return None;
+                        }
+                        display_workspace_path(&canon, Some(&wr))
+                    } else if p.is_file() {
+                        let (canon, wr) = svc.allowlist.admit_file(&p, Some(base)).ok()?;
+                        if wr != ws_root {
+                            return None;
+                        }
+                        display_workspace_path(&canon, Some(&wr))
+                    } else {
+                        return None;
+                    };
+                    paths.push(rel);
+                }
+            }
+
+            let mut cli = String::from("ctx git diff");
+            let mut mcp_parts = vec!["\"action\": \"diff\"".to_string()];
+            if staged {
+                cli.push_str(" --staged");
+                mcp_parts.push("\"staged\": true".to_string());
+            }
+            if stat {
+                cli.push_str(" --stat");
+                mcp_parts.push("\"stat\": true".to_string());
+            }
+            if let Some(ref r) = rev {
+                cli.push_str(" --rev ");
+                cli.push_str(r);
+                mcp_parts.push(format!("\"rev\": \"{}\"", escape_json_str(r)));
+            }
+            if !paths.is_empty() {
+                for p in &paths {
+                    cli.push(' ');
+                    cli.push_str(p);
+                }
+                let p_json: Vec<String> = paths
+                    .iter()
+                    .map(|p| format!("\"{}\"", escape_json_str(p)))
+                    .collect();
+                mcp_parts.push(format!("\"paths\": [{}]", p_json.join(", ")));
+            }
+            Some(GitRedirectSpec {
+                cli_cmd: cli,
+                mcp_args: format!("{{{}}}", mcp_parts.join(", ")),
+            })
+        }
+        "log" => {
+            let mut limit: Option<usize> = None;
+            let mut i = 2usize;
+            while i < tokens.len() {
+                let s = tokens[i].as_str();
+                if s == "--oneline" {
+                    i += 1;
+                    continue;
+                }
+                if s == "-n" {
+                    if limit.is_some() || i + 1 >= tokens.len() {
+                        return None;
+                    }
+                    let n = tokens[i + 1].parse::<usize>().ok()?;
+                    if !(1..=40).contains(&n) {
+                        return None;
+                    }
+                    limit = Some(n);
+                    i += 2;
+                    continue;
+                }
+                if let Some(rest) = s.strip_prefix("-n").filter(|r| !r.is_empty()) {
+                    if limit.is_some() {
+                        return None;
+                    }
+                    let n = rest.parse::<usize>().ok()?;
+                    if !(1..=40).contains(&n) {
+                        return None;
+                    }
+                    limit = Some(n);
+                    i += 1;
+                    continue;
+                }
+                if let Some(digits) = s
+                    .strip_prefix('-')
+                    .filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    if limit.is_some() {
+                        return None;
+                    }
+                    let n = digits.parse::<usize>().ok()?;
+                    if !(1..=40).contains(&n) {
+                        return None;
+                    }
+                    limit = Some(n);
+                    i += 1;
+                    continue;
+                }
+                return None;
+            }
+            let (cli_cmd, mcp_args) = match limit {
+                Some(n) => (
+                    format!("ctx git log -n {n}"),
+                    format!("{{\"action\": \"log\", \"limit\": {n}}}"),
+                ),
+                None => (
+                    "ctx git log".to_string(),
+                    "{\"action\": \"log\"}".to_string(),
+                ),
+            };
+            Some(GitRedirectSpec { cli_cmd, mcp_args })
+        }
+        "show" => {
+            if tokens.len() != 3 {
+                return None;
+            }
+            let rev = tokens[2].as_str();
+            if !is_simple_git_rev(rev) {
+                return None;
+            }
+            Some(GitRedirectSpec {
+                cli_cmd: format!("ctx git show {rev}"),
+                mcp_args: format!(
+                    "{{\"action\": \"show\", \"rev\": \"{}\"}}",
+                    escape_json_str(rev)
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn detect_workspace_readonly_git(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    detect_workspace_readonly_git_spec(svc, cmd, cwd).map(|s| s.cli_cmd)
+}
+
+pub(super) fn workspace_git_redirect_reason(
+    svc: &BrokerService,
+    host: &str,
+    sess_key: &str,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    let spec = detect_workspace_readonly_git_spec(svc, cmd, cwd)?;
+    let strike_key = format!(
+        "{}:{}:ShellGit:{:016x}",
+        host,
+        sess_key,
+        fast_hash64(cmd.trim().as_bytes())
+    );
+    if svc.store.check_and_mark_dedup(&strike_key) {
+        return None;
+    }
+    let is_worker = svc.store.is_worker_session(sess_key);
+    if host == "agy" && is_worker {
+        Some(format!(
+            "[RAM-Ctx] Use CLI `{}` for compact read-only Git inspection (symbol-aware, secret-filtered, hash-anchored). (Repeat this exact command once if raw git output is strictly required.)",
+            spec.cli_cmd
+        ))
+    } else if host == "agy" {
+        Some(format!(
+            "[RAM-Ctx] Use `ctx_git` for compact read-only Git inspection: `mcp_agent_ctx_ctx_git({})` (CLI `{}`). (Repeat this exact command once if raw git output is strictly required.)",
+            spec.mcp_args, spec.cli_cmd
+        ))
+    } else {
+        Some(format!(
+            "[RAM-Ctx] Use `ctx_git` for compact read-only Git inspection: `ctx_git({})` (CLI `{}`). (Repeat this exact command once if raw git output is strictly required.)",
+            spec.mcp_args, spec.cli_cmd
         ))
     }
 }

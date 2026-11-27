@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(fs::read(&f_calc).unwrap(), b"\xEF\xBB\xBF// compute_fee in comment\r\npub fn calc_fee(x: i32) -> i32 {\r\n    let _ = \"compute_fee in str\";\r\n    compute_fee_extra(x) + pre_compute_fee(x)\r\n}\r\n");
         assert_eq!(fs::read(&f_call).unwrap(), b"fn run_it() -> i32 { calc_fee(calc_fee(1)) }");
         let cached = svc.store.get_full_entry(&fs::canonicalize(&f_calc).unwrap(), Some(&ws)).unwrap();
-        assert!(cached.content.as_deref().unwrap().contains("pub fn calc_fee"));
+        assert!(cached.content().unwrap().contains("pub fn calc_fee"));
         let again = op_refactor_with_write_gate(&svc, &req_default, None, Some(&ws), true).unwrap();
         assert!(again.contains("rename compute_fee -> calc_fee: 0 occurrences across 0 files (remaining_in_scope: 0)"));
         let _ = fs::remove_dir_all(&ws);

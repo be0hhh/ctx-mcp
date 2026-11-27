@@ -7,12 +7,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const SESSION_WINDOW_STEPS: u64 = 30;
-pub const MAX_DELTA_ENTRIES: usize = 64;
-pub const MAX_DELTA_TOTAL_BYTES: usize = 4 << 20;
+pub const MAX_DELTA_ENTRIES: usize = 256;
+pub const MAX_DELTA_TOTAL_BYTES: usize = 16 << 20;
 const MAX_SESSIONS_PER_SHARD: usize = 32; // 2,048 concurrent sessions across 64 shards
 const MAX_READ_SPANS_PER_SESSION: usize = 128; // Hard bound per session (4 KiB max)
+const MAX_LARGE_READ_STRIKES: usize = 32;
 const MAX_STALE_CANDIDATES: usize = 4;
-const DEDUP_RING_SLOTS: usize = 2048;
+const DEDUP_RING_SLOTS: usize = 8192;
 const DEDUP_RING_MASK: usize = DEDUP_RING_SLOTS - 1;
 const DEDUP_PROBE_WAY: usize = 4;
 
@@ -37,6 +38,8 @@ pub struct SessionState {
     pub last_step_ms: u64,
     pub reads: Vec<ReadSpan>,
     pub startup_injected: bool,
+    pub is_worker: bool,
+    pub large_read_strikes: Vec<(PathId, u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +189,66 @@ impl RamStore {
         .unwrap_or(false)
     }
 
+    pub fn mark_worker_session(&self, session: &str) {
+        if session.is_empty() {
+            return;
+        }
+        let _ = self.with_session_mut(session, |sess| {
+            sess.is_worker = true;
+        });
+    }
+
+    pub fn is_worker_session(&self, session: &str) -> bool {
+        if session.is_empty() {
+            return false;
+        }
+        let s_idx = shard_idx_for(session);
+        let Ok(map) = self.sessions[s_idx].lock() else {
+            return false;
+        };
+        map.get(session).is_some_and(|s| s.is_worker)
+    }
+
+    /// Returns `true` if `(path_id, content_hash64)` was already struck within
+    /// `SESSION_WINDOW_STEPS` for `session`; otherwise records Strike 1 and returns `false`.
+    pub fn check_and_mark_large_read_strike(
+        &self,
+        session: &str,
+        path_id: PathId,
+        content_hash64: u64,
+    ) -> bool {
+        if session.is_empty() {
+            return false;
+        }
+        self.with_session_mut(session, |sess| {
+            let cur_step = sess.step_seq;
+            sess.large_read_strikes
+                .retain(|&(_, _, step)| cur_step.saturating_sub(step) <= SESSION_WINDOW_STEPS);
+            if sess
+                .large_read_strikes
+                .iter()
+                .any(|&(pid, h, _)| pid == path_id && h == content_hash64)
+            {
+                return true;
+            }
+            sess.large_read_strikes.retain(|&(pid, _, _)| pid != path_id);
+            if sess.large_read_strikes.len() >= MAX_LARGE_READ_STRIKES {
+                if let Some((oldest_idx, _)) = sess
+                    .large_read_strikes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, &(_, _, step))| step)
+                {
+                    sess.large_read_strikes.swap_remove(oldest_idx);
+                }
+            }
+            sess.large_read_strikes
+                .push((path_id, content_hash64, cur_step));
+            false
+        })
+        .unwrap_or(false)
+    }
+
     pub(super) fn snapshot_delta(&self, path_id: PathId, content_hash64: u64, content: &Arc<str>) {
         if let Ok(mut ring) = self.delta_ring.lock() {
             ring.insert(path_id, content_hash64, Arc::clone(content));
@@ -205,7 +268,7 @@ impl RamStore {
         };
         let pid = entry.path_id;
         let content_hash64 = entry.content_hash64;
-        if let Some(ref content) = entry.content {
+        if let Some(content) = entry.content_arc() {
             self.snapshot_delta(pid, content_hash64, content);
         }
         let s = start_line.max(1) as u32;
@@ -520,16 +583,45 @@ mod tests {
         assert!(ring.get(PathId(8), 9).is_some());
         assert!(ring.get(PathId(9), 10).is_none());
 
-        // Byte cap eviction (5 x 1 MiB > 4 MiB)
+        // Byte cap eviction (17 x 1 MiB > 16 MiB)
         ring.clear();
         let one_mb: Arc<str> = Arc::from("x".repeat(1 << 20));
-        for i in 0..5u32 {
+        for i in 0..17u32 {
             ring.insert(PathId(i), i as u64 + 100, Arc::clone(&one_mb));
         }
         assert!(ring.total_bytes <= MAX_DELTA_TOTAL_BYTES);
-        assert_eq!(ring.entries.len(), 4);
+        assert_eq!(ring.entries.len(), 16);
         assert!(ring.get(PathId(0), 100).is_none());
-        assert!(ring.get(PathId(4), 104).is_some());
+        assert!(ring.get(PathId(16), 116).is_some());
+    }
+
+    #[test]
+    fn worker_session_and_large_read_strike_window_behave_deterministically() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-sess-worker-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let store = RamStore::new(dir.join("snap"));
+
+        assert!(!store.is_worker_session("w1"));
+        store.mark_worker_session("w1");
+        assert!(store.is_worker_session("w1"));
+
+        // Strike 1 records and returns false; Strike 2 returns true.
+        assert!(!store.check_and_mark_large_read_strike("w1", PathId(7), 0x1111));
+        assert!(store.check_and_mark_large_read_strike("w1", PathId(7), 0x1111));
+        // Content hash change resets to Strike 1.
+        assert!(!store.check_and_mark_large_read_strike("w1", PathId(7), 0x2222));
+        assert!(store.check_and_mark_large_read_strike("w1", PathId(7), 0x2222));
+        // Advancing past SESSION_WINDOW_STEPS expires old strike.
+        for _ in 0..=SESSION_WINDOW_STEPS {
+            store.bump_session_step("w1");
+        }
+        assert!(!store.check_and_mark_large_read_strike("w1", PathId(7), 0x2222));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

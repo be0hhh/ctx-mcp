@@ -18,6 +18,10 @@ use crate::base::security::{ensure_private_dir, write_private_0600, WorkspaceAll
 use crate::base::simd::CachePadded;
 use crate::broker::{ClaimError, ContextBroker, WorkspaceMode};
 use crate::edit::{impact::op_impact_with_git, op_edit_with_session, op_git};
+use crate::engine::search::{
+    cache::SearchCache, CLI_BATCH_SEARCH_BYTES, MAX_CLI_SEARCH_RESPONSE_BYTES,
+    SEARCH_RESPONSE_BYTES,
+};
 use crate::engine::{
     cap_text, materialize_pack_for_workspace, op_elf_audit_with_baseline, op_inspect,
     op_memo_full, op_outline_with_options, op_read_for_host, op_search, op_search_batch, op_status,
@@ -26,8 +30,8 @@ use crate::engine::{
 };
 use crate::hooks::handle_hook;
 use crate::store::{
-    now_ms_u64, resolve_input_path, runtime_dir, spawn_background_prewarm, PrewarmTracker,
-    RamStore,
+    now_ms_u64, resolve_input_path, runtime_dir, shared_repo_key, spawn_background_prewarm,
+    PrewarmTracker, RamStore,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -124,6 +128,7 @@ pub struct BrokerService {
     pub broker: ContextBroker,
     pub allowlist: WorkspaceAllowlist,
     pub subproc_sem: SubprocSemaphore,
+    pub search_cache: SearchCache,
     pub write_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     pub prewarm: Arc<PrewarmTracker>,
     pub last_active_ms: CachePadded<AtomicU64>,
@@ -139,6 +144,7 @@ impl BrokerService {
             broker: ContextBroker::new(Some(memo_path)),
             allowlist: WorkspaceAllowlist::new(),
             subproc_sem: SubprocSemaphore::new(MAX_CONCURRENT_SUBPROCS),
+            search_cache: SearchCache::new(),
             write_locks: Mutex::new(HashMap::new()),
             prewarm: Arc::new(PrewarmTracker::default()),
             last_active_ms: CachePadded::new(AtomicU64::new(now_ms_u64())),
@@ -287,7 +293,36 @@ fn execute_request_inner(
             registered_ws = Some(ws_root);
         }
     }
-    let scoped_session = context.as_ref().and_then(|context| context.identity());
+    let mut scoped_session = context.as_ref().and_then(|context| context.identity());
+    if scoped_session.is_none() {
+        if let Some(tok) = req.get_str("cli_token").filter(|s| !s.is_empty()) {
+            if let Some((lease_sess, lease_ws)) = svc.broker.capsules.verify_cli_lease(tok) {
+                let cwd_matches = if let Some(ref c) = cwd {
+                    match (fs::canonicalize(c), fs::canonicalize(&lease_ws)) {
+                        (Ok(canon_cwd), Ok(canon_lease)) => {
+                            if canon_cwd.starts_with(&canon_lease) {
+                                true
+                            } else if let Some(ref cwd_ws) = registered_ws {
+                                let lease_root = svc
+                                    .allowlist
+                                    .register_hint(&canon_lease, false)
+                                    .unwrap_or(canon_lease);
+                                shared_repo_key(cwd_ws) == shared_repo_key(&lease_root)
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if cwd_matches {
+                    scoped_session = Some(lease_sess);
+                }
+            }
+        }
+    }
     let session_key = scoped_session
         .as_deref()
         .or_else(|| req.get_str("session").filter(|s| !s.is_empty()));
@@ -318,6 +353,7 @@ fn execute_request_inner(
                 return request_error("memo_persist", error);
             }
             svc.store.clear_all();
+            svc.search_cache.clear();
             Json::obj(vec![
                 ("ok", Json::Bool(true)),
                 (
@@ -401,17 +437,29 @@ fn execute_request_inner(
         OpCode::Search => {
             let is_agy = context.as_ref().is_some_and(|c| c.host == "agy")
                 || req.get_str("host") == Some("agy");
-            let mut options = SearchOptions::from_request(
-                req,
-                if req.get("q").and_then(Json::as_arr).is_some() || req.get("queries").is_some() {
-                    32
+            let batch_len = req
+                .get("q")
+                .and_then(Json::as_arr)
+                .or_else(|| req.get("queries").and_then(Json::as_arr))
+                .map(|a| a.len());
+            let default_results = if batch_len.is_some() { 32 } else { 40 };
+            let (default_bytes, max_cap) = if is_agy {
+                let def = if batch_len.is_some_and(|n| n >= 2) {
+                    AGY_MCP_DEFAULT_MAX_BYTES
                 } else {
-                    40
-                },
-            );
-            if is_agy {
-                options.max_bytes = options.max_bytes.min(AGY_MCP_DEFAULT_MAX_BYTES);
-            }
+                    SEARCH_RESPONSE_BYTES
+                };
+                (def, AGY_MCP_DEFAULT_MAX_BYTES)
+            } else {
+                let def = if batch_len.is_some_and(|n| (3..=6).contains(&n)) {
+                    CLI_BATCH_SEARCH_BYTES
+                } else {
+                    SEARCH_RESPONSE_BYTES
+                };
+                (def, MAX_CLI_SEARCH_RESPONSE_BYTES)
+            };
+            let options =
+                SearchOptions::from_request_with_cap(req, default_results, default_bytes, max_cap);
             let result = search_request(svc, req, options, cwd.as_deref());
             match result {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -921,5 +969,98 @@ mod tests {
             _ => panic!("expected close-race recovery reply"),
         }
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cli_lease_sets_trusted_author_preserves_cwd_and_cli_budgets_and_degrades_on_invalid() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-rpc-lease-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let big_body = (1..=350)
+            .map(|i| format!("int line_{i:03} = {i}; // padding_0123456789abcdef0123456789\n"))
+            .collect::<String>();
+        assert!(big_body.len() > AGY_MCP_DEFAULT_MAX_BYTES + 2000);
+        fs::write(sub.join("big.cpp"), &big_body).unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let root = svc.allowlist.register_hint(&dir, true).unwrap();
+        let tok = svc
+            .broker
+            .capsules
+            .issue_cli_lease("agy:worker-lease-1".into(), root.clone())
+            .unwrap();
+
+        // 1. Valid cli_token with subdir cwd preserves cwd (`big.cpp` relative to `sub`),
+        //    sets trusted author on memo put, and does NOT apply AGY 9 KB cap to CLI read.
+        let put_rep = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("put".into())),
+                ("cwd", Json::Str(sub.to_string_lossy().into_owned())),
+                ("cli_token", Json::Str(tok.clone())),
+                ("topic", Json::Str("lease-topic".into())),
+                ("summary", Json::Str("verified cli lease".into())),
+                ("paths", Json::Arr(vec![Json::Str("big.cpp".into())])),
+            ]),
+        );
+        assert_eq!(put_rep.get_bool("ok"), Some(true), "{put_rep:?}");
+        let get_rep = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("get".into())),
+                ("cwd", Json::Str(sub.to_string_lossy().into_owned())),
+                ("topic", Json::Str("lease-topic".into())),
+            ]),
+        );
+        assert_eq!(
+            get_rep.get("memo").and_then(|m| m.get_str("author")),
+            Some("agy:worker-lease-1")
+        );
+
+        let read_rep = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(sub.to_string_lossy().into_owned())),
+                ("cli_token", Json::Str(tok.clone())),
+                ("paths", Json::Arr(vec![Json::Str("big.cpp".into())])),
+            ]),
+        );
+        assert_eq!(read_rep.get_bool("ok"), Some(true));
+        assert!(
+            read_rep.get_str("text").unwrap().len() > AGY_MCP_DEFAULT_MAX_BYTES + 1000,
+            "CLI lease must preserve 1 MiB read budget instead of AGY 9 KB cap"
+        );
+
+        // 2. Invalid/expired cli_token degrades gracefully to unverified session for read-only ops.
+        let degraded = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(sub.to_string_lossy().into_owned())),
+                ("session", Json::Str("agy:fallback".into())),
+                ("cli_token", Json::Str("expired-or-bogus-token".into())),
+                ("paths", Json::Arr(vec![Json::Str("big.cpp".into())])),
+            ]),
+        );
+        assert_eq!(degraded.get_bool("ok"), Some(true));
+
+        // 3. `requires_daemon` treats `cli_token` requests as daemon-required.
+        let leased_req = Json::obj(vec![
+            ("op", Json::Str("read".into())),
+            ("cli_token", Json::Str(tok)),
+        ]);
+        assert_eq!(
+            run_inproc(&leased_req).get_str("code"),
+            Some("daemon_unavailable")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

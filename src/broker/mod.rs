@@ -13,11 +13,13 @@ pub use pack::PackStore;
 pub use secret::contains_known_secret;
 
 use crate::base::json::{self, Json, JsonKey};
-use crate::base::security::{admit_file_in_workspace, is_sensitive_path, write_private_0600};
+use crate::base::security::{
+    admit_file_in_workspace, is_sensitive_path_with_ws, write_private_0600,
+};
 use crate::base::simd::{fast_hash64, FastHashMap};
-use crate::store::{now_ms, RamStore};
+use crate::store::{display_workspace_path, now_ms, RamStore};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 const MAX_MEMO_WORKSPACES: usize = 64;
@@ -194,6 +196,11 @@ impl ContextBroker {
         if contains_known_secret(topic) || contains_known_secret(summary) {
             return Err("REFUSED: memo contains known secret material".to_string());
         }
+        for link in &linked_files {
+            if !is_valid_memo_rel_path(&link.rel_path) {
+                return Err("REFUSED: invalid memo linked rel_path".to_string());
+            }
+        }
         let linked_count = linked_files.len();
         let kind = match kind {
             Some(kind) => MemoKind::parse(kind.trim())
@@ -331,15 +338,19 @@ impl ContextBroker {
         let Ok(entries) = self.memo_entries(workspace_norm) else {
             return String::new();
         };
+        let candidate_rel_paths: Vec<String> = candidate_files
+            .iter()
+            .map(|p| display_workspace_path(p, ws_root))
+            .collect();
         let brief_low = brief_text.to_ascii_lowercase();
         let total = entries.len();
         let mut out = String::new();
         for m in entries {
             let topic_match = brief_low.contains(&m.topic.to_ascii_lowercase());
-            let file_match = m
-                .linked_files
-                .iter()
-                .any(|link| candidate_files.contains(&link.abs_path));
+            let file_match = m.linked_files.iter().any(|link| {
+                candidate_files.contains(&link.abs_path)
+                    || candidate_rel_paths.iter().any(|rel| rel == &link.rel_path)
+            });
             if total > 3 && !topic_match && !file_match {
                 continue;
             }
@@ -351,6 +362,53 @@ impl ContextBroker {
             }
         }
         out
+    }
+
+    /// Returns `(topic, clipped_summary <= 200B)` for strictly `[fresh]` memos linked to
+    /// `rel_path` in `ws_root` under `shared_key`, filtering out any secret material.
+    pub fn fresh_memos_for_file(
+        &self,
+        shared_key: &str,
+        ws_root: &Path,
+        rel_path: &str,
+        store: &RamStore,
+        max_items: usize,
+    ) -> Vec<(String, String)> {
+        let target_rel = rel_path.trim().trim_start_matches("./");
+        if max_items == 0 || !is_valid_memo_rel_path(target_rel) {
+            return Vec::new();
+        }
+        let Ok(entries) = self.memo_entries(shared_key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(max_items.min(8));
+        for m in entries {
+            if m.linked_files.is_empty() {
+                continue;
+            }
+            if !m.linked_files.iter().any(|l| l.rel_path == target_rel) {
+                continue;
+            }
+            if contains_known_secret(&m.topic) || contains_known_secret(&m.summary) {
+                continue;
+            }
+            let all_fresh = m
+                .linked_files
+                .iter()
+                .all(|link| !link.status(Some(ws_root), store).1);
+            if !all_fresh {
+                continue;
+            }
+            out.push((m.topic.clone(), clip_memo_summary_utf8(&m.summary, 200)));
+            if out.len() >= max_items {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn list_active_pack_slugs(&self, shared_key: &str, max_items: usize) -> Vec<String> {
+        self.packs.list_active_pack_slugs(shared_key, max_items)
     }
 }
 
@@ -393,31 +451,78 @@ impl MemoEntry {
     }
 }
 
+fn is_valid_memo_rel_path(rel: &str) -> bool {
+    if rel.is_empty()
+        || rel.contains('\\')
+        || rel.chars().any(char::is_control)
+        || contains_known_secret(rel)
+    {
+        return false;
+    }
+    let mut comps = Path::new(rel).components();
+    let Some(first) = comps.next() else {
+        return false;
+    };
+    matches!(first, Component::Normal(_)) && comps.all(|part| matches!(part, Component::Normal(_)))
+}
+
+fn clip_memo_summary_utf8(s: &str, max_bytes: usize) -> String {
+    let mut compact = String::with_capacity(s.len().min(max_bytes));
+    let mut prev_ws = false;
+    for ch in s.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_ws {
+                compact.push(' ');
+                prev_ws = true;
+            }
+        } else {
+            compact.push(ch);
+            prev_ws = false;
+        }
+    }
+    if compact.len() <= max_bytes {
+        return compact;
+    }
+    if max_bytes <= 3 {
+        return ".".repeat(max_bytes);
+    }
+    let mut end = max_bytes - 3;
+    while end > 0 && !compact.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + 3);
+    out.push_str(&compact[..end]);
+    out.push_str("...");
+    out
+}
+
 impl MemoFileLink {
     fn status(&self, ws_root: Option<&Path>, store: &RamStore) -> (String, bool) {
         let Some(root) = ws_root else {
             return ("[unavailable]".to_string(), true);
         };
-        let Ok(rel) = self.abs_path.strip_prefix(root) else {
-            return ("[unavailable]".to_string(), true);
-        };
-        let Some(label) = rel.to_str().filter(|s| !contains_known_secret(s)) else {
-            return ("[unavailable]".to_string(), true);
-        };
-        if rel.as_os_str().is_empty()
-            || !rel
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
-            || is_sensitive_path(&self.abs_path)
-        {
+        if !is_valid_memo_rel_path(&self.rel_path) {
             return ("[unavailable]".to_string(), true);
         }
-        let hash = admit_file_in_workspace(&self.abs_path, root)
-            .ok()
-            .filter(|canon| canon == &self.abs_path)
-            .and_then(|canon| store.current_file_hash64(&canon, Some(root)));
+        let candidate = root.join(&self.rel_path);
+        if is_sensitive_path_with_ws(&candidate, Some(root), false) {
+            return ("[unavailable]".to_string(), true);
+        }
+        let canon = match admit_file_in_workspace(&candidate, root) {
+            Ok(c) => c,
+            Err(err) if err.starts_with("REFUSED") => {
+                return ("[unavailable]".to_string(), true);
+            }
+            Err(_) => {
+                return (self.rel_path.clone(), true);
+            }
+        };
+        if is_sensitive_path_with_ws(&canon, Some(root), false) {
+            return ("[unavailable]".to_string(), true);
+        }
+        let hash = store.current_file_hash64(&canon, Some(root));
         let stale = self.hash64_at_put.is_none() || hash != self.hash64_at_put;
-        (label.to_string(), stale)
+        (self.rel_path.clone(), stale)
     }
 }
 
@@ -547,6 +652,9 @@ fn decode_memo_entry(row: &Json, version: i64) -> Option<MemoEntry> {
                 return None;
             }
             let rel_path = link.get_str("rel_path")?.to_string();
+            if !is_valid_memo_rel_path(&rel_path) {
+                return None;
+            }
             let hash64_at_put = if version == 3 {
                 match link.get("hash64")? {
                     Json::Null => None,
@@ -741,5 +849,155 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.get_str("status"), Some("stale"));
         assert_eq!(fresh.get_str("status"), Some("fresh"));
+    }
+
+    #[test]
+    fn memo_file_link_rejects_traversal_and_sensitive_paths_and_works_cross_worktree() {
+        let temp = TestStateDir::new();
+        let ws_a = temp.0.join("repo-a");
+        let ws_b = temp.0.join("repo-b");
+        fs::create_dir_all(ws_a.join("src")).unwrap();
+        fs::create_dir_all(ws_b.join("src")).unwrap();
+        let f_a = ws_a.join("src/engine.rs");
+        let f_b = ws_b.join("src/engine.rs");
+        let env_a = ws_a.join(".env");
+        fs::write(&f_a, "pub fn tick() -> u64 { 1 }\n").unwrap();
+        fs::write(&f_b, "pub fn tick() -> u64 { 1 }\n").unwrap();
+        fs::write(&env_a, "SECRET=1\n").unwrap();
+
+        let root_a = fs::canonicalize(&ws_a).unwrap();
+        let root_b = fs::canonicalize(&ws_b).unwrap();
+        let store = RamStore::new(temp.0.join("snap.bin"));
+        let broker = ContextBroker::default();
+
+        // Reject traversal / backslash / absolute rel_path in put_memo and decode_memo_entry
+        for bad_rel in ["../outside.rs", "src/../engine.rs", r"src\engine.rs", "/etc/passwd", ""] {
+            let link = MemoFileLink {
+                abs_path: f_a.clone(),
+                rel_path: bad_rel.into(),
+                hash64_at_put: Some(1),
+            };
+            assert!(
+                broker
+                    .put_memo("shared", "bad", "summary", Some("finding"), None, vec![link.clone()])
+                    .is_err(),
+                "must reject {bad_rel}"
+            );
+            assert_eq!(link.status(Some(&root_a), &store), ("[unavailable]".into(), true));
+
+            let raw = Json::obj(vec![
+                ("version", Json::Int(3)),
+                (
+                    "workspaces",
+                    Json::Obj(vec![(
+                        JsonKey::Borrowed("shared"),
+                        Json::Arr(vec![Json::obj(vec![
+                            ("topic", Json::Str("t".into())),
+                            ("summary", Json::Str("s".into())),
+                            ("kind", Json::Str("finding".into())),
+                            ("author", Json::Str("w".into())),
+                            ("updated_ms", Json::Str("100".into())),
+                            (
+                                "linked_files",
+                                Json::Arr(vec![Json::obj(vec![
+                                    ("abs_path", Json::Str(f_a.to_string_lossy().into_owned())),
+                                    ("rel_path", Json::Str(bad_rel.into())),
+                                    ("hash64", Json::Str("0123456789abcdef".into())),
+                                ])]),
+                            ),
+                        ])]),
+                    )]),
+                ),
+            ]);
+            assert!(decode_memos(&raw).is_none(), "decode must reject {bad_rel}");
+        }
+
+        // Sensitive path fails closed as [unavailable] + stale
+        let env_link = MemoFileLink {
+            abs_path: env_a.clone(),
+            rel_path: ".env".into(),
+            hash64_at_put: Some(1),
+        };
+        assert_eq!(env_link.status(Some(&root_a), &store), ("[unavailable]".into(), true));
+
+        // Cross-worktree fresh_memos_for_file + 200B UTF-8 clipping + secret filtering
+        let hash_a = store.current_file_hash64(&f_a, Some(&root_a)).unwrap();
+        let long_summary = format!("Важный инвариант: {}", "я".repeat(160));
+        broker
+            .put_memo(
+                "shared-repo",
+                "engine-note",
+                &long_summary,
+                Some("finding"),
+                Some("worker-a"),
+                vec![MemoFileLink {
+                    abs_path: fs::canonicalize(&f_a).unwrap(),
+                    rel_path: "src/engine.rs".into(),
+                    hash64_at_put: Some(hash_a),
+                }],
+            )
+            .unwrap();
+
+        // Worker in worktree B sees [fresh] relative to ws_b and clipped <= 200 bytes
+        let fresh_b =
+            broker.fresh_memos_for_file("shared-repo", &root_b, "src/engine.rs", &store, 4);
+        assert_eq!(fresh_b.len(), 1);
+        assert_eq!(fresh_b[0].0, "engine-note");
+        assert!(fresh_b[0].1.len() <= 200 && fresh_b[0].1.ends_with("..."));
+
+        // startup_memo_digest matches cross-worktree candidate file by rel_path
+        let digest = broker.startup_memo_digest(
+            "shared-repo",
+            Some(&root_b),
+            "unrelated brief",
+            &[fs::canonicalize(&f_b).unwrap()],
+            &store,
+            1200,
+        );
+        assert!(digest.contains("engine-note") && digest.contains("\"fresh\""), "{digest}");
+
+        // Editing ws_b makes memo stale in ws_b (omitted from fresh_memos_for_file), still fresh in ws_a
+        fs::write(&f_b, "pub fn tick() -> u64 { 2 }\n").unwrap();
+        assert!(broker
+            .fresh_memos_for_file("shared-repo", &root_b, "src/engine.rs", &store, 4)
+            .is_empty());
+        assert_eq!(
+            broker
+                .fresh_memos_for_file("shared-repo", &root_a, "src/engine.rs", &store, 4)
+                .len(),
+            1
+        );
+
+        // Secret material loaded from a persisted snapshot is filtered out by fresh_memos_for_file
+        let sec_path = temp.0.join("secret_memos.json");
+        let sec_doc = Json::obj(vec![
+            ("version", Json::Int(3)),
+            (
+                "workspaces",
+                Json::Obj(vec![(
+                    JsonKey::Borrowed("shared-repo"),
+                    Json::Arr(vec![Json::obj(vec![
+                        ("topic", Json::Str("leaked-note".into())),
+                        ("summary", Json::Str("token ghp_1234567890abcdefghij1234 leaked".into())),
+                        ("kind", Json::Str("finding".into())),
+                        ("author", Json::Str("worker-a".into())),
+                        ("updated_ms", Json::Str(now_ms().to_string())),
+                        (
+                            "linked_files",
+                            Json::Arr(vec![Json::obj(vec![
+                                ("abs_path", Json::Str(fs::canonicalize(&f_a).unwrap().to_string_lossy().into_owned())),
+                                ("rel_path", Json::Str("src/engine.rs".into())),
+                                ("hash64", Json::Str(format!("{hash_a:016x}"))),
+                            ])]),
+                        ),
+                    ])]),
+                )]),
+            ),
+        ]);
+        fs::write(&sec_path, sec_doc.to_json_string()).unwrap();
+        let sec_broker = ContextBroker::new(Some(sec_path));
+        assert!(sec_broker
+            .fresh_memos_for_file("shared-repo", &root_a, "src/engine.rs", &store, 4)
+            .is_empty());
     }
 }

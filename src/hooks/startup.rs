@@ -2,20 +2,23 @@
 //! workspace memo capsule generation for subagent/worker launches.
 
 use super::{
-    is_internal_ide_path, AGY_LAZY_MCP_SIGNATURES, STARTUP_BUDGET_BYTES, SUBAGENT_STARTUP_DIGEST,
+    is_internal_ide_path, AGY_LAZY_MCP_SIGNATURES, AGY_WORKER_STARTUP_DIGEST, STARTUP_BUDGET_BYTES,
+    SUBAGENT_STARTUP_DIGEST,
 };
 use crate::base::json::{self, Json};
 use crate::base::security::is_sensitive_path;
 use crate::broker::HostContext;
-use crate::engine::walk_source_dir;
+use crate::engine::{materialize_pack_for_workspace, walk_source_dir};
 use crate::rpc::BrokerService;
 use crate::store::{
-    is_multimodal_or_binary_ext, norm_key_from_canon, resolve_input_path, MissingResolution,
-    RamStore,
+    is_multimodal_or_binary_ext, resolve_input_path, shared_repo_key, MissingResolution, RamStore,
 };
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+const STARTUP_MEMO_BUDGET_BYTES: usize = 1_200;
+const STARTUP_PACKS_BUDGET_BYTES: usize = 1_800;
 
 fn unwrap_system_tag(raw: &str) -> &str {
     if let Some(s_idx) = raw.find("<SYSTEM_MESSAGE>") {
@@ -89,8 +92,16 @@ pub(super) fn read_first_transcript_entries(path: &Path, max_lines: usize) -> Ve
 pub(super) enum AgyStartupKind {
     RootUser,
     IgnoreAux,
-    Worker { brief: String },
+    Worker { brief: String, cli_only: bool },
+    ForkedWorker,
     Undetermined,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupChannel {
+    Generic,
+    AgyMcp,
+    AgyWorker,
 }
 
 pub(super) fn candidate_agy_messages_dirs(payload: &Json, conv_id: &str) -> Vec<PathBuf> {
@@ -306,7 +317,12 @@ fn inspect_agy_inbox_messages(payload: &Json, conv_id: &str) -> AgyStartupKind {
             }
         }
         if let Some(brief) = best_brief {
-            return AgyStartupKind::Worker { brief };
+            let cli_only = brief.contains("[swarm]")
+                || brief.contains("<swarm_worker>")
+                || brief.contains("You have just started.")
+                || brief.contains("Your assignment")
+                || brief.contains("recorded on the board as #");
+            return AgyStartupKind::Worker { brief, cli_only };
         }
     }
     AgyStartupKind::Undetermined
@@ -320,7 +336,51 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
     {
         let tp = resolve_input_path(tp_str, None);
         if tp.is_file() {
-            let entries = read_first_transcript_entries(&tp, 16);
+            let entries = read_first_transcript_entries(&tp, 64);
+
+            // Fork KV-cache protection: if transcript already has `[RAM-Ctx Startup]` or
+            // prior `PLANNER_RESPONSE` steps, never inject a duplicate startup banner.
+            let has_prior_startup = entries.iter().any(|e| {
+                e.get_str("type") == Some("SYSTEM_MESSAGE")
+                    && e.get_str("content")
+                        .is_some_and(|c| c.contains("[RAM-Ctx Startup]"))
+            });
+            let has_planner_response = entries
+                .iter()
+                .any(|e| e.get_str("type") == Some("PLANNER_RESPONSE"));
+            if has_prior_startup || has_planner_response {
+                let explicit_worker_marker = entries.iter().any(|e| {
+                    e.get_str("source") == Some("SYSTEM")
+                        && e.get_str("content").is_some_and(|c| {
+                            c.contains("<swarm_worker>")
+                                || c.contains("You have just started.")
+                                || c.contains("Your assignment (recorded on the board")
+                                || c.contains("recorded on the board as #")
+                        })
+                });
+                let is_explicit_root = entries
+                    .iter()
+                    .find(|e| {
+                        !(e.get_str("type") == Some("SYSTEM_MESSAGE")
+                            && e.get_str("source") == Some("SYSTEM_SDK"))
+                    })
+                    .is_some_and(|e| {
+                        e.get_str("type") == Some("USER_INPUT")
+                            && e.get_str("source") == Some("USER_EXPLICIT")
+                    });
+                let inbox_is_worker = matches!(
+                    inspect_agy_inbox_messages(payload, conv_id),
+                    AgyStartupKind::Worker { .. }
+                );
+                if explicit_worker_marker
+                    || inbox_is_worker
+                    || (has_prior_startup && !is_explicit_root)
+                {
+                    return AgyStartupKind::ForkedWorker;
+                }
+                return AgyStartupKind::RootUser;
+            }
+
             let mut idx = 0usize;
             while idx < entries.len() {
                 let e = &entries[idx];
@@ -386,7 +446,10 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
                         raw1.contains("sender=") && !raw1.contains(&format!("sender={}", conv_id));
 
                     if is_swarm || is_subagent {
-                        return AgyStartupKind::Worker { brief: combined };
+                        return AgyStartupKind::Worker {
+                            brief: combined,
+                            cli_only: is_swarm,
+                        };
                     }
                 }
             }
@@ -404,9 +467,13 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
     if last_input.contains("<USER_REQUEST>") {
         return AgyStartupKind::RootUser;
     }
-    let is_worker = last_input.contains("[swarm]")
+    let is_swarm = last_input.contains("[swarm]")
         || last_input.contains("<swarm_worker>")
-        || (last_input.contains("[Message]") && last_input.contains("sender="));
+        || last_input.contains("You have just started.")
+        || last_input.contains("Your assignment")
+        || last_input.contains("recorded on the board as #");
+    let is_worker =
+        is_swarm || (last_input.contains("[Message]") && last_input.contains("sender="));
     if is_worker {
         let low = last_input.to_ascii_lowercase();
         if is_narrator_or_monitor(&low) {
@@ -414,6 +481,7 @@ pub(super) fn classify_agy_startup(payload: &Json, conv_id: &str) -> AgyStartupK
         }
         return AgyStartupKind::Worker {
             brief: last_input.to_string(),
+            cli_only: is_swarm,
         };
     }
     AgyStartupKind::Undetermined
@@ -556,12 +624,63 @@ pub(super) fn extract_candidate_paths_from_text(
     found
 }
 
+pub(super) fn extract_pack_tags(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw_tok in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | ',' | ';'
+            )
+    }) {
+        let trimmed = raw_tok.trim_start_matches(|c: char| matches!(c, '.' | ':'));
+        let Some(rest) = trimmed.strip_prefix("pack:") else {
+            continue;
+        };
+        let slug = rest.trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '\'' | '"' | '!' | '?'
+            )
+        });
+        if slug.is_empty()
+            || slug.len() > 96
+            || slug.starts_with('.')
+            || slug.contains("..")
+            || !slug
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-'))
+        {
+            continue;
+        }
+        if !out.iter().any(|existing: &String| existing == slug) {
+            out.push(slug.to_string());
+            if out.len() >= 2 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn clip_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
 pub(super) fn prewarm_and_build_startup_capsule(
     svc: &BrokerService,
     brief: &str,
     cwd: Option<&Path>,
     ws_root: Option<&Path>,
-    include_agy_mcp: bool,
+    session_key: Option<&str>,
+    channel: StartupChannel,
 ) -> String {
     let candidates = extract_candidate_paths_from_text(svc, brief, cwd, ws_root);
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -589,41 +708,141 @@ pub(super) fn prewarm_and_build_startup_capsule(
         }
     }
 
-    let mut msg = String::with_capacity(1200);
+    // Keep the static prefix strictly first (0 dynamic bytes before the first newline)
+    // to maximize LLM KV-cache prefix hits across parallel workers.
+    let mut msg = String::with_capacity(2048);
     msg.push_str("[RAM-Ctx Startup] ");
-    msg.push_str(SUBAGENT_STARTUP_DIGEST);
-    if include_agy_mcp {
-        msg.push(' ');
-        msg.push_str(AGY_LAZY_MCP_SIGNATURES);
+    match channel {
+        StartupChannel::AgyWorker => msg.push_str(AGY_WORKER_STARTUP_DIGEST),
+        StartupChannel::AgyMcp => {
+            msg.push_str(SUBAGENT_STARTUP_DIGEST);
+            msg.push(' ');
+            msg.push_str(AGY_LAZY_MCP_SIGNATURES);
+        }
+        StartupChannel::Generic => msg.push_str(SUBAGENT_STARTUP_DIGEST),
     }
 
     if let Some(root) = ws_root {
-        let ws_norm = norm_key_from_canon(root);
-        let abs_files: Vec<PathBuf> = files.iter().map(|(f, _)| f.clone()).collect();
-        let memo_digest = svc.broker.startup_memo_digest(
-            &ws_norm,
-            Some(root),
-            brief,
-            &abs_files,
-            &svc.store,
-            500,
+        let shared_key = shared_repo_key(root);
+
+        // 1. 1-line active shared packs list
+        let active_packs = svc.broker.list_active_pack_slugs(&shared_key, 8);
+        if !active_packs.is_empty() {
+            let line = format!("\nActive packs: {}", active_packs.join(", "));
+            if msg.len() + line.len() <= STARTUP_BUDGET_BYTES {
+                msg.push_str(&line);
+            }
+        }
+
+        // 2. Materialize explicit `pack:<slug>` tags from brief (max 2 packs, <= 1,800 B total)
+        let pack_tags = extract_pack_tags(brief);
+        if !pack_tags.is_empty() {
+            let header = "\nPre-loaded packs:\n";
+            let avail_total = STARTUP_BUDGET_BYTES
+                .saturating_sub(msg.len() + header.len())
+                .min(STARTUP_PACKS_BUDGET_BYTES);
+            if avail_total >= 128 {
+                let mut packs_buf = String::new();
+                for slug in &pack_tags {
+                    let rem = avail_total.saturating_sub(packs_buf.len());
+                    if rem < 96 {
+                        break;
+                    }
+                    if let Ok(rendered) = materialize_pack_for_workspace(
+                        svc,
+                        root,
+                        slug,
+                        session_key,
+                        false,
+                        false,
+                        rem,
+                    ) {
+                        if rendered.len() <= rem {
+                            packs_buf.push_str(&rendered);
+                            if !packs_buf.ends_with('\n') {
+                                packs_buf.push('\n');
+                            }
+                        } else {
+                            let suffix = "\n... [truncated]\n";
+                            let cut_budget = rem.saturating_sub(suffix.len());
+                            if cut_budget > 0 {
+                                packs_buf.push_str(clip_utf8_bytes(&rendered, cut_budget));
+                                packs_buf.push_str(suffix);
+                            }
+                            break;
+                        }
+                    }
+                }
+                if !packs_buf.is_empty()
+                    && msg.len() + header.len() + packs_buf.len() <= STARTUP_BUDGET_BYTES
+                {
+                    msg.push_str(header);
+                    msg.push_str(&packs_buf);
+                }
+            }
+        }
+
+        // 3. Up to 5 recent workspace ChangeFeed events
+        let recent_changes = svc.broker.changes.recent_changes_summary(&shared_key, 5);
+        if !recent_changes.is_empty() {
+            let header = "\nRecent workspace changes:\n";
+            let mut ch_buf = String::new();
+            for item in recent_changes {
+                let line = format!("- {item}\n");
+                if msg.len() + header.len() + ch_buf.len() + line.len() > STARTUP_BUDGET_BYTES {
+                    break;
+                }
+                ch_buf.push_str(&line);
+            }
+            if !ch_buf.is_empty() {
+                msg.push_str(header);
+                msg.push_str(&ch_buf);
+            }
+        }
+
+        // 4. Shared workspace memos (up to 1,200 B, leaving room for candidate file outlines)
+        let reserve_for_outlines = if files.is_empty() { 0 } else { 512 };
+        let memo_header = "\nShared workspace memos:\n";
+        let memo_budget = STARTUP_MEMO_BUDGET_BYTES.min(
+            STARTUP_BUDGET_BYTES
+                .saturating_sub(msg.len() + memo_header.len() + reserve_for_outlines),
         );
-        if !memo_digest.is_empty() && msg.len() + memo_digest.len() + 24 <= STARTUP_BUDGET_BYTES {
-            msg.push_str("\nShared workspace memos:\n");
-            msg.push_str(&memo_digest);
+        if memo_budget >= 64 {
+            let abs_files: Vec<PathBuf> = files.iter().map(|(f, _)| f.clone()).collect();
+            let memo_digest = svc.broker.startup_memo_digest(
+                &shared_key,
+                Some(root),
+                brief,
+                &abs_files,
+                &svc.store,
+                memo_budget,
+            );
+            if !memo_digest.is_empty()
+                && msg.len() + memo_header.len() + memo_digest.len() <= STARTUP_BUDGET_BYTES
+            {
+                msg.push_str(memo_header);
+                msg.push_str(&memo_digest);
+            }
         }
     }
 
+    // 5. Pre-warmed file outlines for brief-referenced files/dirs
     if !files.is_empty() {
-        msg.push_str("\nPre-warmed file outlines:\n");
+        let header = "\nPre-warmed file outlines:\n";
+        let mut outlines_buf = String::new();
         for (f, root) in files {
             if let Ok(entry) = svc.store.get_outline_entry(&f, Some(&root)) {
                 let line = format!("- {}\n", RamStore::format_outline_compact(&entry, 8));
-                if msg.len() + line.len() > STARTUP_BUDGET_BYTES {
+                if msg.len() + header.len() + outlines_buf.len() + line.len() > STARTUP_BUDGET_BYTES
+                {
                     break;
                 }
-                msg.push_str(&line);
+                outlines_buf.push_str(&line);
             }
+        }
+        if !outlines_buf.is_empty() {
+            msg.push_str(header);
+            msg.push_str(&outlines_buf);
         }
     }
     msg
@@ -636,7 +855,8 @@ pub(super) fn startup_reply(
     root: Option<&Path>,
 ) -> Json {
     let brief = payload.get_str("prompt").unwrap_or_default();
-    let context = prewarm_and_build_startup_capsule(svc, brief, cwd, root, false);
+    let context =
+        prewarm_and_build_startup_capsule(svc, brief, cwd, root, None, StartupChannel::Generic);
     Json::obj(vec![(
         "hookSpecificOutput",
         Json::obj(vec![
@@ -644,4 +864,90 @@ pub(super) fn startup_reply(
             ("additionalContext", Json::Str(context)),
         ]),
     )])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::now_ms_u64;
+
+    #[test]
+    fn extract_pack_tags_strips_punctuation_caps_at_two_and_rejects_traversal() {
+        let text = "Use (pack:alpha:core), then `pack:scope-v1.2;`, plus pack:third. Also ignore pack:../etc/passwd, pack:a..b, pack:bad$char, pack:, pack:.dot, and not_pack:skip.";
+        assert_eq!(
+            extract_pack_tags(text),
+            vec!["alpha:core".to_string(), "scope-v1.2".to_string()]
+        );
+
+        let dedup = "Repeat pack:same-1. and pack:same-1, and pack:second_2!";
+        assert_eq!(
+            extract_pack_tags(dedup),
+            vec!["same-1".to_string(), "second_2".to_string()]
+        );
+
+        let too_long = format!("pack:{}", "a".repeat(97));
+        assert!(extract_pack_tags(&too_long).is_empty());
+        let ok_96 = format!("pack:{}", "a".repeat(96));
+        assert_eq!(extract_pack_tags(&ok_96).len(), 1);
+    }
+
+    #[test]
+    fn startup_capsule_renders_packs_changes_and_stays_within_4000b_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-startup-packs-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let sample = dir.join("engine.rs");
+        fs::write(
+            &sample,
+            "pub fn init_engine() -> i32 {\n    42\n}\n\npub fn run_loop() -> i32 {\n    init_engine()\n}\n",
+        )
+        .unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let root = svc.allowlist.register_hint(&dir, true).unwrap();
+        let shared_key = shared_repo_key(&root);
+
+        svc.broker
+            .packs
+            .put_pack(
+                &shared_key,
+                "swarm-scope",
+                vec!["engine.rs#init_engine".into()],
+                Some("Core engine entrypoint"),
+                "scout",
+            )
+            .unwrap();
+        svc.broker.changes.record_change(
+            &shared_key,
+            "engine.rs",
+            vec!["@run_loop".into()],
+            "agy:worker-a",
+            now_ms_u64(),
+        );
+
+        let msg = prewarm_and_build_startup_capsule(
+            &svc,
+            "Inspect pack:swarm-scope. Also see engine.rs",
+            Some(&root),
+            Some(&root),
+            Some("agy:worker-b"),
+            StartupChannel::AgyWorker,
+        );
+        assert!(
+            msg.starts_with("[RAM-Ctx Startup] "),
+            "static prefix must come first: {msg}"
+        );
+        assert!(msg.len() <= STARTUP_BUDGET_BYTES, "len={}", msg.len());
+        assert!(msg.contains("Active packs: swarm-scope"), "{msg}");
+        assert!(msg.contains("Pre-loaded packs:"), "{msg}");
+        assert!(msg.contains("pub fn init_engine()"), "{msg}");
+        assert!(msg.contains("Recent workspace changes:"), "{msg}");
+        assert!(msg.contains("engine.rs"), "{msg}");
+        assert!(!msg.contains("mcp_agent_ctx_"), "worker startup must be CLI-first: {msg}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

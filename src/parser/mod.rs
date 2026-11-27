@@ -129,6 +129,74 @@ pub struct SymbolSpan {
 #[cfg(target_pointer_width = "64")]
 const _: [(); 48] = [(); std::mem::size_of::<SymbolSpan>()];
 
+/// Unified file parser classifier matching `extract_symbols` (handles `CMakeLists.txt`,
+/// `Makefile`/`GNUmakefile`/`makefile`, `Dockerfile`/`Containerfile`, and all extensions).
+/// Returns distinct non-zero tags so `CMakeLists.txt`, `notes.txt`, `Makefile`, and `Dockerfile`
+/// never collide in content-addressed body deduplication.
+pub(crate) fn file_parser_kind(path: &Path) -> u8 {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let mut ext_buf = [0u8; 16];
+    let ext = lower_ext(path, &mut ext_buf);
+    file_parser_kind_from_parts(fname, ext)
+}
+
+#[inline]
+fn file_parser_kind_from_parts(fname: &str, ext: &str) -> u8 {
+    if fname == "CMakeLists.txt" || ext == "cmake" {
+        1
+    } else if matches!(fname, "Makefile" | "GNUmakefile" | "makefile") || ext == "mk" {
+        2
+    } else if matches!(fname, "Dockerfile" | "Containerfile")
+        || fname.starts_with("Dockerfile.")
+        || fname.starts_with("Containerfile.")
+        || ext == "dockerfile"
+    {
+        3
+    } else {
+        match ext {
+            "h" | "hpp" | "ipp" | "hh" | "hxx" | "c" | "cc" | "cpp" | "cxx" | "inl" | "tpp"
+            | "cu" | "cuh" | "ixx" | "cppm" => 4,
+            "py" | "pyi" => 5,
+            "java" => 6,
+            "cs" => 7,
+            "rs" => 8,
+            "ts" | "tsx" => 9,
+            "js" | "jsx" | "mjs" | "cjs" => 10,
+            "go" => 11,
+            "kt" | "kts" => 12,
+            "swift" => 13,
+            "zig" => 14,
+            "proto" => 15,
+            "sh" | "bash" | "zsh" => 16,
+            "sql" => 17,
+            "md" | "mdx" | "markdown" => 18,
+            "toml" => 19,
+            "json" | "jsonc" => 20,
+            "yml" | "yaml" => 21,
+            _ => 22,
+        }
+    }
+}
+
+/// Returns `true` strictly for code source extensions (excludes `.md`/`.json`/`.toml`/`.yaml`/
+/// `.cmake`/`Makefile`/`Dockerfile`/unknown).
+pub fn is_code_source_ext(path: &Path) -> bool {
+    matches!(file_parser_kind(path), 4..=17)
+}
+
+/// Matches `clean::classify_ext` (plus Go backtick escaping distinction) for dedup key safety.
+pub(crate) fn clean_lang_tag(path: &Path) -> u8 {
+    let mut ext_buf = [0u8; 16];
+    let ext = lower_ext(path, &mut ext_buf);
+    match ext {
+        "rs" => 1,
+        "py" | "pyi" => 2,
+        "go" => 3,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => 4,
+        _ => 0,
+    }
+}
+
 pub fn extract_symbols(path: &Path, text: &str, line_offsets: &[u32]) -> Box<[SymbolSpan]> {
     if text.is_empty() || line_offsets.is_empty() {
         return Box::new([]);
@@ -137,32 +205,22 @@ pub fn extract_symbols(path: &Path, text: &str, line_offsets: &[u32]) -> Box<[Sy
     let mut ext_buf = [0u8; 16];
     let ext = lower_ext(path, &mut ext_buf);
 
-    let vec = if fname == "CMakeLists.txt" || ext == "cmake" {
-        structured::parse_cmake(text, line_offsets)
-    } else if matches!(fname, "Makefile" | "GNUmakefile" | "makefile") || ext == "mk" {
-        infra::parse_makefile(text, line_offsets)
-    } else if matches!(fname, "Dockerfile" | "Containerfile")
-        || fname.starts_with("Dockerfile.")
-        || fname.starts_with("Containerfile.")
-        || ext == "dockerfile"
-    {
-        infra::parse_dockerfile(text, line_offsets)
-    } else {
-        match ext {
-            "h" | "hpp" | "ipp" | "hh" | "hxx" | "c" | "cc" | "cpp" | "cxx" | "inl" | "tpp"
-            | "cu" | "cuh" | "ixx" | "cppm" => cpp::parse_cpp(text, line_offsets),
-            "py" | "pyi" => langs::parse_python(text, line_offsets),
-            "java" | "cs" => langs::parse_java_cs(text, line_offsets, ext == "cs"),
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "go" | "kt" | "kts" | "swift"
-            | "zig" | "proto" => langs::parse_brace_lang(text, line_offsets, ext),
-            "sh" | "bash" | "zsh" => langs::parse_shell(text, line_offsets),
-            "sql" => structured::parse_sql(text, line_offsets),
-            "md" | "mdx" | "markdown" => structured::parse_markdown(text, line_offsets),
-            "toml" => structured::parse_toml(text, line_offsets),
-            "json" | "jsonc" => structured::parse_json(text, line_offsets),
-            "yml" | "yaml" => structured::parse_yaml(text, line_offsets),
-            _ => Vec::new(),
-        }
+    let vec = match file_parser_kind_from_parts(fname, ext) {
+        1 => structured::parse_cmake(text, line_offsets),
+        2 => infra::parse_makefile(text, line_offsets),
+        3 => infra::parse_dockerfile(text, line_offsets),
+        4 => cpp::parse_cpp(text, line_offsets),
+        5 => langs::parse_python(text, line_offsets),
+        6 => langs::parse_java_cs(text, line_offsets, false),
+        7 => langs::parse_java_cs(text, line_offsets, true),
+        8..=15 => langs::parse_brace_lang(text, line_offsets, ext),
+        16 => langs::parse_shell(text, line_offsets),
+        17 => structured::parse_sql(text, line_offsets),
+        18 => structured::parse_markdown(text, line_offsets),
+        19 => structured::parse_toml(text, line_offsets),
+        20 => structured::parse_json(text, line_offsets),
+        21 => structured::parse_yaml(text, line_offsets),
+        _ => Vec::new(),
     };
     vec.into_boxed_slice()
 }
@@ -257,5 +315,25 @@ mod tests {
         assert!(extract_symbols(Path::new("Dockerfile.prod"), &df.text, &df.line_offsets)
             .iter()
             .any(|s| s.kind == SymbolKind::Mod && &*s.name == "builder"));
+
+        // Unified file_parser_kind & is_code_source_ext checks
+        assert_ne!(
+            file_parser_kind(Path::new("CMakeLists.txt")),
+            file_parser_kind(Path::new("notes.txt"))
+        );
+        assert_ne!(
+            file_parser_kind(Path::new("Makefile")),
+            file_parser_kind(Path::new("Dockerfile"))
+        );
+        assert_ne!(file_parser_kind(Path::new("notes.txt")), 0);
+        assert!(is_code_source_ext(Path::new("src/main.rs")));
+        assert!(is_code_source_ext(Path::new("OrderBook.hpp")));
+        assert!(is_code_source_ext(Path::new("query.sql")));
+        assert!(!is_code_source_ext(Path::new("README.md")));
+        assert!(!is_code_source_ext(Path::new("config.json")));
+        assert!(!is_code_source_ext(Path::new("CMakeLists.txt")));
+        assert!(!is_code_source_ext(Path::new("Makefile")));
+        assert!(!is_code_source_ext(Path::new("Dockerfile")));
+        assert!(!is_code_source_ext(Path::new("notes.txt")));
     }
 }

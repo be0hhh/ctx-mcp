@@ -508,7 +508,7 @@ fn search_without_rg(
         let Ok(entry) = collection.svc.store.get_full_entry(&path, Some(&workspace)) else {
             return Ok(false);
         };
-        let Some(text) = entry.content.as_deref() else {
+        let Some(text) = entry.content() else {
             return Ok(false);
         };
         let remaining = collection.cap.saturating_sub(collection.hits.len());
@@ -516,7 +516,7 @@ fn search_without_rg(
             collection.scan_truncated = true;
             return Ok(true);
         }
-        let line_nums = search_lines_literals(text, &entry.line_offsets, &needles, false, remaining);
+        let line_nums = search_lines_literals(text, entry.line_offsets(), &needles, false, remaining);
         for ln in line_nums {
             collection.hits.push(SearchHit {
                 path: path.clone(),

@@ -27,8 +27,8 @@ ctx setup
 ctx install --targets antigravity,codex
 ctx install --all
 
-# Control Antigravity eager tool exposure (default: core = 4 tools)
-ctx install --targets antigravity --eager=core    # ctx_search, ctx_read, ctx_symbols, ctx_inspect
+# Control Antigravity eager tool exposure (default: core = 8 tools)
+ctx install --targets antigravity --eager=core    # ctx_search, ctx_inspect, ctx_read, ctx_symbols, ctx_impact, ctx_memo, ctx_git, ctx_edit
 ctx install --targets antigravity --eager=search  # ctx_search only
 ctx install --targets antigravity --eager=all     # all catalog tools (11 write / 10 read-only)
 ctx install --targets antigravity --eager=none    # lazy via call_mcp_tool
@@ -97,10 +97,18 @@ ctx install --targets claude
 ## CLI Quick Reference
 
 ```bash
-# Batched in-RAM search (1–6 scoped or unscoped queries, smart-case, 8 KiB default cap)
+# Batched in-RAM search (1–6 scoped or unscoped queries, smart-case; 8 KiB single / 12 KiB batch CLI default, up to 14 KiB)
 ctx search -q 'Engine:handleRequest' \
   -q 'AuthService:verifyToken' \
   --max-results 3 --max-bytes 2048
+
+# Optional per-session CLI identity (auto-injected via CliLease in Antigravity hooks)
+ctx read src/Engine.cpp --session my-agent
+ctx sym 'Engine#handleRequest' --session my-agent
+# Environment knobs:
+#   AGENT_CTX_LARGE_READ_LINES=350  # 1-strike Large-Read Symbol-First Gate threshold (0 disables)
+#   AGENT_CTX_SESSION=...           # session ID for dedup/delta reads across CLI calls
+#   AGENT_CTX_CLI_TOKEN=...         # reusable 300s CliLease token for trusted CLI authorship
 
 # Single search with optional context or verbose scopes
 ctx search 'handleRequest' src/ --context-lines 1 --max-results 10

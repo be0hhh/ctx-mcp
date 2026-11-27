@@ -1,6 +1,6 @@
-//! Localhost TCP daemon loop with a 32-thread worker pool, bounded 512-item accept queue,
+//! Localhost TCP daemon loop with a 64-thread worker pool, bounded 1024-item accept queue,
 //! reusable per-worker read buffers (zero `try_clone()` / `BufReader` malloc), and
-//! starvation-free bounded keep-alive (`MAX_KEEPALIVE_WAITERS = WORKER_THREADS / 4`).
+//! starvation-free bounded keep-alive (`MAX_KEEPALIVE_WAITERS = WORKER_THREADS >> 2`).
 
 use super::client::{try_send_fresh, SendOutcome};
 use super::{
@@ -19,9 +19,9 @@ use std::thread;
 use std::time::Duration;
 
 const IDLE_SHUTDOWN_MS: u64 = 4 * 60 * 60 * 1000; // 4 hours idle TTL
-const WORKER_THREADS: usize = 32;
-const MAX_ACCEPT_QUEUE: usize = 512;
-const MAX_KEEPALIVE_WAITERS: usize = WORKER_THREADS / 4;
+const WORKER_THREADS: usize = 64;
+const MAX_ACCEPT_QUEUE: usize = 1024;
+const MAX_KEEPALIVE_WAITERS: usize = WORKER_THREADS >> 2;
 const MAX_KEEPALIVE_REQUESTS: usize = 64;
 const INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_READ_TIMEOUT: Duration = Duration::from_millis(15);
@@ -196,7 +196,7 @@ pub fn run_daemon_forever() -> Result<(), String> {
     let queue = Arc::new(AcceptQueue::new());
     let keepalive_waiters = Arc::new(AtomicUsize::new(0));
 
-    // Spawn bounded pool of 32 worker threads with reusable 8 KiB read buffers.
+    // Spawn bounded pool of 64 worker threads with reusable 8 KiB read buffers.
     for _ in 0..WORKER_THREADS {
         let q = Arc::clone(&queue);
         let svc = Arc::clone(&service);

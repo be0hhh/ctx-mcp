@@ -66,15 +66,17 @@ Measured across 5 models in two-turn **Cold → Warm** sessions (`30/30` exact `
 
 <sub>*Weighted token-cost estimate: **input quota** = `1.0× uncached + 0.10–0.25× cached`; **total quota** adds `4.0–5.0× output`. In long multi-turn chats, avoiding full-file dumps compounds savings on every follow-up turn and delays context compaction.*</sub>
 
-### Additional Verified Suites (`v2.5.0`, 100% Pass, `0` Failed Edits)
+### Additional Verified Suites (`v2.5.0` – `v2.5.3`, 100% Pass, `0` Failed Edits)
 
-| Suite | Scope & Verification | Native → CTX (`v2.5.0`) | Quota / Context Highlight |
+| Suite | Scope & Verification | Native → CTX | Quota / Context Highlight |
 |---|---|---|---|
+| **Multi-Agent Swarm (`v2.5.3`)** | `10 / 50 / 100` concurrent agents across `8` linked git worktrees (`ctx-bench swarm`, `201` files, **`0` errors**) | **`1,532 ops/s`** @ 100 agents · **flat `2,847 KiB` RAM** across all 8 worktrees (`1×` dedup) | **`−93.6%…−93.7%`** swarm payload (`−84.2%` offline vs Naive / `−80.3%` vs `v2.5.2`) |
+| **Live 10-Agent Parallel A/B (`v2.5.3`)** | `10` parallel AGY `Neon High` workers (`20/20` sessions, `100%` exact `file:line`) | `read_file`: **`20 → 0` (−100%)** · Uncached input: **−22.1%** · Full input: **−12.6%** · Output: **−8.1%** | Wall **−3.6%**, `14` `ctx` calls, ~**50%** less dynamic code context per wave |
 | **`ctx diag -- <cmd>` (Deterministic)** | 6 payloads (Clang, cargo, pytest, syslog, JSON, CMake), **6/6** | **`375,634 B → 2,937 B`** (**−99.2%**, **128×**) | **~93,174** tokens saved in **`35.45 ms`** |
 | **`ctx diag -- <cmd>` (Blind Live LLM)** | AGY `Neon XHigh` + Codex `Astra XHigh`, **4/4** | AGY: **−75.4%** input, **−45.0%** wall, `7 → 1` calls · Codex: **−52.0%** input, **−78.1%** uncached | **−51%…−57%** total quota (AGY) · **−60%…−66%** total quota (Codex) |
 | **Atomic Edit & Refactor** | 5 models (`cpp_sig_edit` + `py_refactor`), **20/20**, **0** failed edits | **−31.0%** calls (**−58.1%** Codex: `43 → 18`) · **−45.4%** Codex payload | Up to **−42.0%** input & **−31.9%** wall (`Neon High` `py_refactor`) |
 | **Polyglot 6-Task** | Rust, Go, JSON/TOML/MD, Config+Docs, Script `creates`+`edits`, Shared Pack (**24/24**, **0** failed edits) | Codex: **−48.1%** calls (`54 → 28`) · AGY: **−23.8%** calls (`42 → 32`) | `script_create_edit`: **−67%** calls / **−35%** input / **−32%** wall; `docs_json_nav`: `5 → 1` (`1.1 ms`) |
-| **In-RAM Engine & Load** | 19 AVX2 kernels + `1–200` concurrent agents (`ctx-bench`) | **42.8 GB/s** search · **1,455 MB/s** SIMD clean (**3.14×**) · **11,182 ops/s** @ 100 agents | **99.9%** RAM hit rate, **`4.71 ms`** p50, **`0`** iso errs @ 200 agents |
+| **In-RAM Engine & Load (`v2.5.3`)** | 19 AVX2 kernels + `1–200` concurrent agents (`ctx-bench`, `64` workers / `1024` queue) | **34.7 GB/s** CI search · **13,664 ops/s** @ 10 · **11,616 ops/s** @ 200 agents | **99.8%** RAM hit rate, **`84.9 ms`** p99 @ 200 agents (**3.3×** vs v2.5.0), **`0`** errors |
 
 ## Native vs CTX — Full Session Totals (Cold + Warm)
 
@@ -102,6 +104,17 @@ Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor ta
 | **Codex · GPT-6.2 Astra (XHigh)** | `raw_bash` | PASS | 2 | 67,640 | 12,216 | 196 | 14.2 s | baseline |
 | **Codex · GPT-6.2 Astra (XHigh)** | **`ctx diag`** | **PASS** | **1 (−50.0%)** | **32,502 (−52.0%, 2.1×)** | **2,678 (−78.1%, 4.6×)** | **164 (−16.3%)** | **11.9 s (−16.2%)** | **−60%…−66%** |
 
+## What's New in `v2.5.3`
+
+- **Worktree-unified broker & content-addressed RAM deduplication (`1×` memory across `K` worktrees):** `shared_repo_key` unifies `MemoBoard`, `PackStore`, and `ChangeFeed` across a repository and its linked `git worktree`s using bidirectional backlink verification (with symlink-spoofing protection and full `v3` `memos.json` compatibility). Immutable file contents, line offsets, and symbol tables now live in content-addressed `Arc<ParsedBody>` entries keyed by `(hash64, size, parser_kind, clean_lang)` with exact byte-equality checks and exact refcounted RAM accounting — keeping daemon memory flat (`2,847 KiB` across `8` linked worktrees at `10`, `50`, and `100` agents).
+- **In-flight search coalescing, 2s `mutation_epoch` micro-cache & fair-share CLI batch budgets:** concurrent identical searches coalesce into a single scan (`Arc<SearchHitSet>`, panic-safe RAII waiters, errors never cached, instant invalidation on `mutation_epoch` bump). CLI batch searches (`3–6` `-q` queries) auto-scale to `12 KiB` (`14 KiB` cap) with two-pass zero-div fair-share section quotas so trailing queries never starve, while Antigravity MCP retains its hard `<= 9,000 B` inline cap.
+- **Active Antigravity adoption across MCP, headless/swarm CLI workers, and hooks:**
+  - `--eager=core` now exposes **8** core tools (`ctx_search`, `ctx_inspect`, `ctx_read`, `ctx_symbols`, `ctx_impact`, `ctx_memo`, `ctx_git`, `ctx_edit`), preserving explicit user `{"eager": false}` overrides on upgrade.
+  - Reusable `300s` **`CliLease`** tokens and quote/comment/`$'...'`-aware `PreToolUse` `run_command` injection (strictly `decision: "ask"` + `overwrite`, preserving all arguments and CLI budgets/cwd) bring session dedup, delta reads, and trusted authorship to CLI-only swarm workers.
+  - **1-Strike Large-Read Symbol-First Gate** (`AGENT_CTX_LARGE_READ_LINES`, default `350`, `0` disables): intercepts full-file `read_file` on `>=350L` code files (`>=4` non-namespace symbols, never docs/configs), returning a compact RAM outline (`<=24` symbols), secret-filtered `[untrusted memo]` notes, and channel-accurate `ctx sym`/`ctx_symbols` commands with `SessionState`-backed 1-strike escape; auto-widen narrowed to `<=300L && <=16KB`.
+  - **1-Strike allowlist read-only `git` redirect** (`git status`, `git diff`, `git log`, `git show`, passing through `-C`/`--porcelain`/ranges/paths/pipes), **KV-cache-safe `fork` detection** (skips duplicate `[RAM-Ctx Startup]` on forked workers), fail-closed native-edit `PostToolUse` `ChangeFeed` recording, and `4,000 B` `SessionStart` with automatic `pack:<slug>` materialization (`<=2` packs, `<=1,800 B`).
+- **100–200 agent scaling & `ctx-bench swarm`:** daemon scales to `64` worker threads (`16` keep-alive waiters), `1024` accept queue, `2048` pack dedup slots, `1024` ChangeFeed ring (`64` workspaces), `16 MiB` / `256`-entry delta cache, and `8192` dedup ring — verified with `156/156` Rust tests and the new `ctx-bench swarm` multi-worktree replay suite (`11,616 ops/s`, `p99 84.9 ms`, `0` errors @ `200` agents in `ctx-bench waves`).
+
 ## What's New in `v2.5.1` – `v2.5.2`
 
 - **Bulletproof search without system `rg` (zero silent false `0 matches`):** `ctx` resolves `PATH`, OS package directories, and bundled IDE/Claude `rg` binaries without permanently caching misses (installing `rg` works immediately without restarting the daemon), falls back to `.gitignore`-aware `git grep` and then a nested-`.git`-skipping BFS walker, and explicitly flags `(INCOMPLETE scan)` if a fallback file budget is ever hit. `WorkspaceIndex` (`ctx_impact`, shorthand paths) also uses `git ls-files` / nested-`.git` filtering, and `ctx doctor` reports `search_backend`.
@@ -111,7 +124,7 @@ Two-turn navigation benchmark on an isolated 850-file repo: **Cold** 4-anchor ta
 
 ## Where CTX Wins (and Honest Trade-Offs)
 
-- **Fixed session cost:** loading all 11 MCP tool definitions adds **~6.4 KB** once per conversation (in Antigravity, `--eager=core` loads 4 tools and `--eager=search` loads 1).
+- **Fixed session cost:** loading all 11 MCP tool definitions adds **~6.4 KB** once per conversation (in Antigravity, `--eager=core` loads 8 tools and `--eager=search` loads 1).
 - **Vs. an already-targeted native lookup (`git grep` + exact-line `Read`):** per-hit byte size is roughly even (`−20%` to `+5%`). CTX does not magically compress a line you already know the exact start and end of.
 - **Where CTX actually delivers large savings:**
   - **Unknown symbol boundaries & whole-file reads:** agents natively guess line offsets or read whole files; `ctx_symbols` knows exact `[L_start-L_end]` spans (**−94% to −98%** vs. full-file reads, saving 1–2 tool calls per lookup).
