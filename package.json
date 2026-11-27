@@ -1,6 +1,6 @@
 {
   "name": "ctx-mcp",
-  "version": "2.4.0",
+  "version": "2.5.1",
   "description": "Zero-dependency Rust in-RAM Context Broker & MCP server for Antigravity, Claude Code, and Codex",
   "license": "MIT OR Apache-2.0",
   "repository": {

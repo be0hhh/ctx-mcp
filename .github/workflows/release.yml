@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create/update (e.g. v2.5.0)"
+        description: "Release tag to create/update (e.g. v2.5.1)"
         required: true
-        default: "v2.5.0"
+        default: "v2.5.1"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true

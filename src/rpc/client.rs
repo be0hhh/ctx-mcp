@@ -427,8 +427,9 @@ pub fn call_daemon_or_inproc(req: Json) -> Json {
     }
 
     let _ = spawn_background_daemon_once();
-    for _ in 0..18 {
-        thread::sleep(Duration::from_millis(18));
+    for attempt in 0..46u8 {
+        let wait_ms = if attempt < 10 { 10 } else { 25 };
+        thread::sleep(Duration::from_millis(wait_ms));
         if let Some(info) = read_daemon_info() {
             let outcome = send_with_busy_backoff(&cur_runtime, &info, None, &req);
             if let Some(reply) = complete_attempt(outcome, &req) {

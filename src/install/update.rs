@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock};
 
-pub const CURRENT_VERSION: &str = "2.5.0";
+pub const CURRENT_VERSION: &str = "2.5.1";
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/be0hhh/ctx-mcp/releases/latest";
 const DEFAULT_RELEASE_URL: &str = "https://github.com/be0hhh/ctx-mcp/releases/latest";
 const DEFAULT_UPDATE_TTL_MS: u64 = 21_600_000;

@@ -366,19 +366,6 @@ pub fn op_search_batch(
     if !(1..=6).contains(&queries.len()) {
         return Err(SearchError::Failed("queries must contain 1–6 searches".to_string()));
     }
-    let mut unscoped = 0usize;
-    for item in queries {
-        if let Some(spec) = item.as_str().or_else(|| item.get_str("q")) {
-            if matches!(parse_shorthand_search_spec(spec, false), Ok((_, ref r)) if r.is_empty()) {
-                unscoped += 1;
-                if unscoped > 1 {
-                    return Err(SearchError::Failed(
-                        "batch search allows at most 1 unscoped query; prefix others with 'root:query'".to_string(),
-                    ));
-                }
-            }
-        }
-    }
     let deadline = Instant::now() + SEARCH_TIMEOUT;
     let run = |item: &Json| {
         let options = defaults.for_item(item);
@@ -481,23 +468,50 @@ mod tests {
     }
 
     #[test]
-    fn batch_allows_up_to_six_and_at_most_one_unscoped_query() {
+    fn batch_allows_up_to_six_including_multiple_unscoped_queries() {
         let workspace = temp_ws("batch6");
-        fs::write(workspace.join("a.rs"), "fn alpha() {}\n").unwrap();
+        fs::create_dir_all(workspace.join("sub")).unwrap();
+        fs::write(workspace.join("a.rs"), "// alpha comment\nfn alpha() {}\n").unwrap();
+        fs::write(workspace.join("b.rs"), "fn beta() {}\n").unwrap();
+        fs::write(workspace.join("sub/c.rs"), "fn gamma() {}\n").unwrap();
+        fs::write(workspace.join(".env"), "SECRET_ALPHA=alpha\nSECRET_ONLY=1\n").unwrap();
         let svc = BrokerService::new_ephemeral_inproc(workspace.join("snapshot"));
         svc.allowlist.register_hint(&workspace, true).unwrap();
         let options = SearchOptions::from_request(&Json::Null, 5);
-        let six = [
-            Json::Str("alpha".into()), Json::Str("a.rs:alpha".into()), Json::Str("a.rs:alpha".into()),
-            Json::Str("a.rs:alpha".into()), Json::Str("a.rs:alpha".into()), Json::Str("a.rs:alpha".into()),
+
+        // Mixed unscoped + scoped up to 6
+        let six_mixed = [
+            Json::Str("alpha".into()), Json::Str("beta".into()), Json::Str("sub:gamma".into()),
+            Json::Str("a.rs:alpha".into()), Json::Str("b.rs:beta".into()), Json::Str("sub/c.rs:gamma".into()),
         ];
-        assert!(op_search_batch(&svc, &six, options, Some(&workspace)).unwrap().contains("[6]\n"));
-        let two_unscoped = [Json::Str("alpha".into()), Json::Str("beta".into())];
+        let mixed_out = op_search_batch(&svc, &six_mixed, options, Some(&workspace)).unwrap();
+        assert!(mixed_out.contains("[1]\n") && mixed_out.contains("[6]\n"), "{mixed_out}");
+        assert!(mixed_out.contains("fn alpha() {}") && mixed_out.contains("b.rs:1: fn beta() {}"));
+        assert!(mixed_out.contains("sub/c.rs:1: fn gamma() {}") && !mixed_out.contains("SECRET_ALPHA"));
+
+        // Multiple unscoped queries (up to 6) succeed, hide `.env`, and honor per-item options
+        let six_unscoped = [
+            Json::obj(vec![("q", Json::Str("alpha".into())), ("code_only", Json::Bool(true))]),
+            Json::Str("beta".into()),
+            Json::Str("gamma".into()),
+            Json::Str("SECRET_ONLY".into()),
+            Json::Str("missing_needle".into()),
+            Json::Str("alpha".into()),
+        ];
+        let unscoped_out = op_search_batch(&svc, &six_unscoped, options, Some(&workspace)).unwrap();
+        assert!(unscoped_out.contains("[1]\n") && unscoped_out.contains("[6]\n"), "{unscoped_out}");
+        assert!(unscoped_out.contains("a.rs:2: fn alpha() {}") && unscoped_out.contains("b.rs:1: fn beta() {}"));
+        assert!(unscoped_out.contains("sub/c.rs:1: fn gamma() {}"));
+        assert!(unscoped_out.contains("[4]\n0 matches\n") && unscoped_out.contains("[5]\n0 matches\n"));
+        assert!(unscoped_out.contains("// alpha comment"));
+        assert!(!unscoped_out.contains("SECRET_ONLY") && !unscoped_out.contains(".env"));
+
+        // 0 and 7 queries are still rejected with the 1–6 batch cap
         assert!(matches!(
-            op_search_batch(&svc, &two_unscoped, options, Some(&workspace)),
-            Err(SearchError::Failed(msg)) if msg.contains("at most 1 unscoped")
+            op_search_batch(&svc, &[], options, Some(&workspace)),
+            Err(SearchError::Failed(msg)) if msg.contains("1–6")
         ));
-        let seven = vec![Json::Str("a.rs:alpha".into()); 7];
+        let seven = vec![Json::Str("alpha".into()); 7];
         assert!(matches!(
             op_search_batch(&svc, &seven, options, Some(&workspace)),
             Err(SearchError::Failed(msg)) if msg.contains("1–6")
