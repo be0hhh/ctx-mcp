@@ -31,6 +31,60 @@ pub fn parse_path_slice_spec(spec: &str) -> (&str, Option<(usize, usize)>) {
     (trimmed, None)
 }
 
+fn expand_single_multi_range(spec: &str) -> Option<Vec<String>> {
+    let trimmed = spec.trim();
+    let (path_part, suffix) = trimmed.rsplit_once(':')?;
+    if path_part.len() <= 1 || !suffix.contains(',') {
+        return None;
+    }
+    let mut expanded = Vec::new();
+    for seg in suffix.split(',') {
+        if seg.is_empty() {
+            return None;
+        }
+        if let Some((a, b)) = seg.split_once('-') {
+            if a.is_empty()
+                || b.is_empty()
+                || !a.bytes().all(|c| c.is_ascii_digit())
+                || !b.bytes().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            let (Ok(s), Ok(e)) = (a.parse::<usize>(), b.parse::<usize>()) else {
+                return None;
+            };
+            if s < 1 || e < s {
+                return None;
+            }
+            expanded.push(format!("{path_part}:{s}-{e}"));
+        } else {
+            if !seg.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let Ok(n) = seg.parse::<usize>() else {
+                return None;
+            };
+            if n < 1 {
+                return None;
+            }
+            expanded.push(format!("{path_part}:{n}-{n}"));
+        }
+    }
+    (expanded.len() >= 2).then_some(expanded)
+}
+
+pub fn expand_multi_range_specs(specs: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if let Some(parts) = expand_single_multi_range(spec) {
+            out.extend(parts);
+        } else {
+            out.push(spec.clone());
+        }
+    }
+    out
+}
+
 pub fn op_read_for_host(
     svc: &BrokerService,
     specs: &[String],
@@ -44,12 +98,13 @@ pub fn op_read_for_host(
     if specs.is_empty() {
         return Err("provide at least one file path".to_string());
     }
+    let expanded_specs = expand_multi_range_specs(specs);
     let budget = max_bytes.clamp(1024, DEFAULT_READ_MAX_BYTES << 1);
     let mut out = String::new();
     let mut any_ok = false;
     let mut pending_reads: Vec<(PathBuf, PathBuf, usize, usize)> = Vec::new();
 
-    for (index, spec) in specs.iter().enumerate() {
+    for (index, spec) in expanded_specs.iter().enumerate() {
         let (raw_p, slice) = parse_path_slice_spec(spec);
         let resolved = resolve_input_path(raw_p, cwd);
         if is_sensitive_path(&resolved) {
@@ -133,7 +188,7 @@ pub fn op_read_for_host(
                     None => (1, total),
                 };
 
-                let cap_note = format_cap_note(budget, specs.len() - index - 1, inline_dedup_cap, true);
+                let cap_note = format_cap_note(budget, expanded_specs.len() - index - 1, inline_dedup_cap, true);
                 let content_limit = budget.saturating_sub(cap_note.len() + 1);
                 let other_note = format_other_actor_note(svc, session_key, &ws_root, &entry.rel_path);
                 if let Some(ref delta) = delta_hit {
@@ -160,7 +215,7 @@ pub fn op_read_for_host(
                 if let Some(note) = other_note.as_deref() { section.push_str(note); }
 
                 if out.len() + section.len() > content_limit {
-                    out.push_str(&format_cap_note(budget, specs.len() - index, inline_dedup_cap, false));
+                    out.push_str(&format_cap_note(budget, expanded_specs.len() - index, inline_dedup_cap, false));
                     break;
                 }
                 let mut actual_end = None;
@@ -239,7 +294,7 @@ fn format_cap_note(
             "... [AGY inline cap {budget}B reached; {unread} {qual} unread — prefer ctx_symbols / ctx_read path:start-end slices, or parallel native read_file (<=800L/46KB inline) for full files]\n"
         ),
         Some(_) => format!(
-            "... [AGY CLI inline cap {budget}B reached; {unread} {qual} unread — prefer `ctx sym`, narrow `path:start-end` slices, or `--max-bytes`]\n"
+            "... [AGY CLI inline cap {budget}B reached; {unread} {qual} unread — prefer batched `ctx sym \"File#A\" \"File#B\"`, multi-range `path:s1-e1,s2-e2` slices, or native `read_file` (<=46KB when full file is needed)]\n"
         ),
         None => format!("... [output capped at {budget} bytes; {unread} {qual} left unread]\n"),
     }
@@ -476,7 +531,7 @@ mod tests {
         assert!(dedup.contains("ALREADY IN CONTEXT"));
 
         // 3. Default AGY MCP cap note recommends parallel native read_file;
-        //    AGY CLI cap note recommends `ctx sym`, narrow slices, or `--max-bytes`.
+        //    AGY CLI cap note omits `--max-bytes` and recommends batched `ctx sym`, multi-range slices, or native `read_file`.
         let capped = op_read_for_host(
             &svc, &["large.cpp".into()], AGY_MCP_DEFAULT_MAX_BYTES, true,
             Some("agy-sess-2"), Some(&workspace), Some(AGY_MCP_INLINE_CAP), false,
@@ -492,8 +547,9 @@ mod tests {
                 && cli_capped.len() <= crate::engine::AGY_CLI_INLINE_CAP
                 && cli_capped.contains("AGY CLI inline cap 9200B")
                 && cli_capped.contains("ctx sym")
-                && cli_capped.contains("--max-bytes")
-                && !cli_capped.contains("read_file"),
+                && cli_capped.contains("path:s1-e1,s2-e2")
+                && cli_capped.contains("read_file")
+                && !cli_capped.contains("--max-bytes"),
             "cli_capped={cli_capped}"
         );
 
@@ -608,6 +664,67 @@ mod tests {
         fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
         let full = op_read_for_host(&svc, &["wide.rs".into()], 16_384, false, Some("s2"), Some(&ws), None, false).unwrap();
         assert!(full.contains("(lines 1-40 of 40") && !full.contains("[DELTA"));
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    #[test]
+    fn expand_multi_range_specs_handles_valid_windows_single_line_and_preserves_invalid() {
+        assert_eq!(
+            expand_multi_range_specs(&["src/a.rs:405-415,565-576".into()]),
+            vec!["src/a.rs:405-415", "src/a.rs:565-576"]
+        );
+        assert_eq!(
+            expand_multi_range_specs(&["src/a.rs:10,20-30,45".into()]),
+            vec!["src/a.rs:10-10", "src/a.rs:20-30", "src/a.rs:45-45"]
+        );
+        assert_eq!(
+            expand_multi_range_specs(&[r"C:\dir\file.rs:10-20,30-40".into()]),
+            vec![r"C:\dir\file.rs:10-20", r"C:\dir\file.rs:30-40"]
+        );
+
+        // Paths with commas, Windows drive paths without valid range suffix, and malformed suffixes pass through unchanged.
+        let unchanged = [
+            r"C:\a,b\file.rs",
+            "dir/a,b.rs",
+            "dir/a,b.rs:10-20",
+            "a.rs:10-20,bad",
+            "a.rs:20-10,30-40",
+            "a.rs:0-5,10-15",
+            "a.rs:10-20,",
+            "a.rs:,10-20",
+            "a.rs:10-20,,30-40",
+            "a.rs:10-20-30,40-50",
+            "a.rs:+1-5,6-7",
+        ];
+        for raw in unchanged {
+            assert_eq!(
+                expand_multi_range_specs(&[raw.into()]),
+                vec![raw],
+                "must not mangle `{raw}`"
+            );
+        }
+
+        // End-to-end op_read_for_host with multi-range spec returns exact selected slices only.
+        let (ws, svc) = new_ws("multi-range-read");
+        let lines = make_lines(25);
+        fs::write(ws.join("multi.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+        let out = op_read_for_host(
+            &svc,
+            &["multi.rs:3-4,12-13,18".into()],
+            16_384,
+            false,
+            Some("mr-sess"),
+            Some(&ws),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("(lines 3-4 of 25"), "{out}");
+        assert!(out.contains("3: let value_003 = 3;") && out.contains("4: let value_004 = 4;"), "{out}");
+        assert!(out.contains("(lines 12-13 of 25"), "{out}");
+        assert!(out.contains("12: let value_012 = 12;") && out.contains("13: let value_013 = 13;"), "{out}");
+        assert!(out.contains("(lines 18-18 of 25") && out.contains("18: let value_018 = 18;"), "{out}");
+        assert!(!out.contains("value_005") && !out.contains("value_015"), "{out}");
         fs::remove_dir_all(&ws).unwrap();
     }
 }

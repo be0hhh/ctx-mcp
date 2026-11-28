@@ -811,13 +811,25 @@ pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                     ]);
                 }
 
-                // 2. 1-Strike Large-Read Symbol-First Gate (`>=350L` code file with `>=4` non-namespace symbols)
+                // 2. 1-Strike Large-Read Symbol-First Gate (`>=350L` code file or wide `>=350L` slice with `>=4` non-namespace symbols)
                 let lines = (entry.line_count as usize).max(1);
                 let threshold = large_read_threshold();
-                let is_full_file = (req_start.is_none() && req_end.is_none())
-                    || (req_start == Some(1) && req_end.is_some_and(|e| e >= lines));
+                let requested_span = match (req_start, req_end) {
+                    (Some(s), Some(e)) => {
+                        let start = s.max(1);
+                        let end = e.min(lines);
+                        if end >= start {
+                            end - start + 1
+                        } else {
+                            0
+                        }
+                    }
+                    (Some(s), None) => lines.saturating_sub(s.saturating_sub(1)),
+                    (None, Some(e)) => e.min(lines),
+                    (None, None) => lines,
+                };
                 if threshold > 0
-                    && is_full_file
+                    && requested_span >= threshold
                     && is_code_source_ext(&canon)
                     && (entry.line_count as usize) >= threshold
                 {
@@ -834,21 +846,34 @@ pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                         )
                     {
                         let outline = RamStore::format_outline_compact(&entry, 24);
-                        let sample_sym = entry
+                        let mut non_ns_names = entry
                             .symbols
                             .iter()
-                            .find(|sym| sym.kind != SymbolKind::Namespace)
-                            .map(|sym| sym.name.as_ref())
-                            .unwrap_or("Symbol");
+                            .filter(|sym| sym.kind != SymbolKind::Namespace)
+                            .map(|sym| sym.name.as_ref());
+                        let sample_sym1 = non_ns_names.next().unwrap_or("Sym1");
+                        let sample_sym2 = non_ns_names.next().unwrap_or("Sym2");
                         let cmd_hint = if svc.store.is_worker_session(&sess_key) {
                             format!(
-                                "Use CLI `ctx sym \"{}#{}\"` or `ctx impact \"{}#{}\"` (or `read_file` with `StartLine`/`EndLine`)",
-                                entry.rel_path, sample_sym, entry.rel_path, sample_sym
+                                "Batch symbols in one call via CLI `ctx sym \"{}#{}\" \"{}#{}\"` or `ctx impact \"{}#{}\"` (or a targeted `<{}L` `read_file` slice)",
+                                entry.rel_path,
+                                sample_sym1,
+                                entry.rel_path,
+                                sample_sym2,
+                                entry.rel_path,
+                                sample_sym1,
+                                threshold
                             )
                         } else {
                             format!(
-                                "Use `mcp_agent_ctx_ctx_symbols({{\"requests\": [\"{}#{}\"]}})` or `mcp_agent_ctx_ctx_impact({{\"targets\": [\"{}#{}\"]}})` (or `read_file` with `StartLine`/`EndLine`)",
-                                entry.rel_path, sample_sym, entry.rel_path, sample_sym
+                                "Batch symbols via `mcp_agent_ctx_ctx_symbols({{\"requests\": [\"{}#{}\", \"{}#{}\"]}})` or `mcp_agent_ctx_ctx_impact({{\"targets\": [\"{}#{}\"]}})` (or a targeted `<{}L` `read_file` slice)",
+                                entry.rel_path,
+                                sample_sym1,
+                                entry.rel_path,
+                                sample_sym2,
+                                entry.rel_path,
+                                sample_sym1,
+                                threshold
                             )
                         };
                         let shared_key = shared_repo_key(&root);
@@ -1336,7 +1361,7 @@ mod tests {
         let r2 = handle_agy(&svc, &req2);
         assert_eq!(r2.get_str("decision"), Some("allow"), "{r2:?}");
 
-        // Worker session receives CLI-first `ctx sym` without MCP noise
+        // Worker session receives CLI-first batched `ctx sym` without MCP noise
         svc.store.mark_worker_session("agy:worker-lr-1");
         let req_w = pre_tool_payload(
             "worker-lr-1",
@@ -1351,8 +1376,71 @@ mod tests {
         let rw = handle_agy(&svc, &req_w);
         assert_eq!(rw.get_str("decision"), Some("deny"));
         let w_reason = rw.get_str("reason").unwrap();
-        assert!(w_reason.contains("ctx sym"), "{w_reason}");
+        assert!(
+            w_reason.contains("ctx sym \"big_engine.rs#func_0\" \"big_engine.rs#func_1\"")
+                && w_reason.contains("<350L"),
+            "{w_reason}"
+        );
         assert!(!w_reason.contains("mcp_agent_ctx_"), "{w_reason}");
+        assert!(
+            reason.contains("\"big_engine.rs#func_0\", \"big_engine.rs#func_1\"")
+                && reason.contains("<350L"),
+            "{reason}"
+        );
+
+        // Wide code slices (`requested_span >= 350`) trigger Strike 1 and pass on Strike 2.
+        for (sess, start_opt, end_opt) in [
+            ("wide-1", Some(1i64), Some(350i64)),
+            ("wide-2", Some(1i64), Some(500i64)),
+            ("wide-3", Some(10i64), None),
+            ("wide-4", None, Some(355i64)),
+        ] {
+            let mut fields = vec![("Path", Json::Str(code_file.to_string_lossy().into_owned()))];
+            if let Some(s) = start_opt {
+                fields.push(("StartLine", Json::Int(s)));
+            }
+            if let Some(e) = end_opt {
+                fields.push(("EndLine", Json::Int(e)));
+            }
+            let p1 = pre_tool_payload(sess, &dir, "call-w1", "read_file", Json::obj(fields.clone()));
+            let d1 = handle_agy(&svc, &p1);
+            assert_eq!(
+                d1.get_str("decision"),
+                Some("deny"),
+                "wide slice ({start_opt:?}, {end_opt:?}) must trigger Strike 1: {d1:?}"
+            );
+            let p2 = pre_tool_payload(sess, &dir, "call-w2", "read_file", Json::obj(fields));
+            let d2 = handle_agy(&svc, &p2);
+            assert_eq!(
+                d2.get_str("decision"),
+                Some("allow"),
+                "wide slice ({start_opt:?}, {end_opt:?}) must pass Strike 2: {d2:?}"
+            );
+        }
+
+        // Targeted slices (`requested_span < 350`) remain 100% frictionless on Strike 1.
+        for (sess, start_opt, end_opt) in [
+            ("narrow-1", Some(1i64), Some(349i64)),
+            ("narrow-2", Some(50i64), Some(250i64)),
+            ("narrow-3", Some(100i64), None),
+            ("narrow-4", None, Some(349i64)),
+            ("narrow-5", Some(300i64), Some(999i64)),
+        ] {
+            let mut fields = vec![("Path", Json::Str(code_file.to_string_lossy().into_owned()))];
+            if let Some(s) = start_opt {
+                fields.push(("StartLine", Json::Int(s)));
+            }
+            if let Some(e) = end_opt {
+                fields.push(("EndLine", Json::Int(e)));
+            }
+            let p = pre_tool_payload(sess, &dir, "call-n1", "read_file", Json::obj(fields));
+            let d = handle_agy(&svc, &p);
+            assert_eq!(
+                d.get_str("decision"),
+                Some("allow"),
+                "targeted slice ({start_opt:?}, {end_opt:?}) must allow on Strike 1: {d:?}"
+            );
+        }
 
         // .md files and <4 symbol code files are NEVER blocked by Large-Read Gate
         for skip_path in [&doc_file, &few_sym_file] {

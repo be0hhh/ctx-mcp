@@ -237,6 +237,7 @@ pub fn op_memo(
         false,
         false,
         AGY_MCP_DEFAULT_MAX_BYTES,
+        None,
         cwd,
     )
 }
@@ -254,6 +255,7 @@ pub fn op_memo_full(
     force: bool,
     raw: bool,
     max_bytes: usize,
+    limit: Option<usize>,
     cwd: Option<&Path>,
 ) -> Result<Json, String> {
     let base = cwd
@@ -326,11 +328,95 @@ pub fn op_memo_full(
         }
         "changes" => {
             let since_seq = topic.trim().parse::<u64>().unwrap_or(0);
-            let (head, events) = svc.broker.changes.changes_since(&ws_norm, since_seq, 64);
-            Ok(Json::obj(vec![(
-                "changes",
-                crate::broker::change_feed::ChangeFeed::to_json(head, &events),
-            )]))
+            let eff_limit = limit.unwrap_or(30).clamp(1, 200);
+            let (head, all_events) = svc.broker.changes.changes_since(&ws_norm, since_seq, 1024);
+            let tail_start = all_events.len().saturating_sub(eff_limit);
+            let mut omitted_older = tail_start;
+            let cap = max_bytes.max(256);
+            let mut rows = match crate::broker::change_feed::ChangeFeed::to_json(
+                head,
+                &all_events[tail_start..],
+            ) {
+                Json::Obj(fields) => fields
+                    .into_iter()
+                    .find_map(|(k, v)| match (k.as_ref(), v) {
+                        ("events", Json::Arr(arr)) => Some(arr),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let row_lens: Vec<usize> = rows.iter().map(|r| r.to_json_string().len()).collect();
+            let mut body_bytes: usize = row_lens
+                .iter()
+                .sum::<usize>()
+                .saturating_add(row_lens.len().saturating_sub(1));
+            let head_digits =
+                crate::base::simd::decimal_digits(usize::try_from(head).unwrap_or(usize::MAX));
+            let exact_len = |body: usize, omitted: usize| -> usize {
+                let base = 25usize.saturating_add(head_digits).saturating_add(body);
+                if omitted > 0 {
+                    base.saturating_add(17)
+                        .saturating_add(crate::base::simd::decimal_digits(omitted))
+                } else {
+                    base
+                }
+            };
+            let mut drop_n = 0usize;
+            while drop_n < row_lens.len() && exact_len(body_bytes, omitted_older) > cap {
+                body_bytes = body_bytes.saturating_sub(row_lens[drop_n]);
+                if drop_n + 1 < row_lens.len() {
+                    body_bytes = body_bytes.saturating_sub(1);
+                }
+                drop_n += 1;
+                omitted_older += 1;
+            }
+            if drop_n > 0 {
+                rows.drain(..drop_n);
+            }
+            let build_doc = |ev_rows: Vec<Json>, omitted: usize| -> Json {
+                let mut fields = vec![
+                    (std::borrow::Cow::Borrowed("head_seq"), Json::Int(head as i64)),
+                    (std::borrow::Cow::Borrowed("events"), Json::Arr(ev_rows)),
+                ];
+                if omitted > 0 {
+                    fields.push((
+                        std::borrow::Cow::Borrowed("omitted_older"),
+                        Json::Int(omitted as i64),
+                    ));
+                }
+                Json::Obj(fields)
+            };
+            let mut payload = build_doc(rows, omitted_older);
+            while payload.to_json_string().len() > cap {
+                let Json::Obj(mut fields) = payload else {
+                    break;
+                };
+                let Some(mut ev_rows) = fields.iter_mut().find_map(|(k, v)| {
+                    if k.as_ref() == "events" {
+                        match std::mem::replace(v, Json::Null) {
+                            Json::Arr(arr) => Some(arr),
+                            other => {
+                                *v = other;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }) else {
+                    payload = Json::Obj(fields);
+                    break;
+                };
+                if ev_rows.is_empty() {
+                    payload = build_doc(ev_rows, omitted_older);
+                    break;
+                }
+                ev_rows.remove(0);
+                omitted_older += 1;
+                payload = build_doc(ev_rows, omitted_older);
+            }
+            Ok(Json::obj(vec![("changes", payload)]))
         }
         "pack" => {
             let name = topic.trim();
@@ -757,6 +843,166 @@ mod pack_cap_tests {
             "agy cli outline exceeded budget: {}",
             outline_txt.len()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memo_changes_enforces_limit_tail_selection_since_seq_and_strict_max_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-memo-changes-cap-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let ws = svc.allowlist.register_hint(&dir, true).unwrap();
+        let ws_key = crate::store::paths::shared_repo_key(&ws);
+
+        for i in 1..=50u64 {
+            svc.broker.changes.record_change(
+                &ws_key,
+                &format!("src/subsystem_alpha/component_beta/handler_module_{i:03}.rs"),
+                vec![
+                    format!("@handle_request_entry_{i:03}"),
+                    format!("@validate_payload_frame_{i:03}"),
+                    format!("@commit_state_transition_{i:03}"),
+                ],
+                "agy:worker-changes-test-0123456789abcdef",
+                1_700_000_000_000 + i,
+            );
+        }
+
+        // 1. Default limit (30) returns newest tail (21..=50) with omitted_older=20.
+        let def_res = op_memo_full(
+            &svc,
+            "changes",
+            "0",
+            "",
+            None,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            65_536,
+            None,
+            Some(&ws),
+        )
+        .unwrap();
+        let def_doc = def_res.get("changes").unwrap();
+        let def_evs = def_doc.get("events").and_then(Json::as_arr).unwrap();
+        assert_eq!(def_doc.get_i64("head_seq"), Some(50));
+        assert_eq!(def_evs.len(), 30);
+        assert_eq!(def_evs.first().and_then(|e| e.get_i64("seq")), Some(21));
+        assert_eq!(def_evs.last().and_then(|e| e.get_i64("seq")), Some(50));
+        assert_eq!(def_doc.get_i64("omitted_older"), Some(20));
+
+        // 2. When all events after since_seq fit within limit & max_bytes, omitted_older is absent.
+        let since_res = op_memo_full(
+            &svc,
+            "changes",
+            "40",
+            "",
+            None,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            65_536,
+            None,
+            Some(&ws),
+        )
+        .unwrap();
+        let since_doc = since_res.get("changes").unwrap();
+        let since_evs = since_doc.get("events").and_then(Json::as_arr).unwrap();
+        assert_eq!(since_evs.len(), 10);
+        assert_eq!(since_evs.first().and_then(|e| e.get_i64("seq")), Some(41));
+        assert!(since_doc.get("omitted_older").is_none());
+
+        // 3. Explicit limit=5 with since_seq=30 takes tail (46..=50), omitted_older=15.
+        let lim_res = op_memo_full(
+            &svc,
+            "changes",
+            "30",
+            "",
+            None,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            65_536,
+            Some(5),
+            Some(&ws),
+        )
+        .unwrap();
+        let lim_doc = lim_res.get("changes").unwrap();
+        let lim_evs = lim_doc.get("events").and_then(Json::as_arr).unwrap();
+        assert_eq!(lim_evs.len(), 5);
+        assert_eq!(lim_evs.first().and_then(|e| e.get_i64("seq")), Some(46));
+        assert_eq!(lim_doc.get_i64("omitted_older"), Some(15));
+
+        // 4. limit=0 clamps to 1 (newest event seq=50, omitted_older=49).
+        let zero_res = op_memo_full(
+            &svc,
+            "changes",
+            "0",
+            "",
+            None,
+            None,
+            None,
+            &[],
+            false,
+            false,
+            65_536,
+            Some(0),
+            Some(&ws),
+        )
+        .unwrap();
+        let zero_doc = zero_res.get("changes").unwrap();
+        let zero_evs = zero_doc.get("events").and_then(Json::as_arr).unwrap();
+        assert_eq!(zero_evs.len(), 1);
+        assert_eq!(zero_evs[0].get_i64("seq"), Some(50));
+        assert_eq!(zero_doc.get_i64("omitted_older"), Some(49));
+
+        // 5. Strict max_bytes cap (AGY CLI 9200B & tight 2000B & ultra-tight 256B) produces valid JSON <= cap.
+        for cap in [AGY_CLI_DEFAULT_MAX_BYTES, AGY_MCP_DEFAULT_MAX_BYTES, 2_000, 256] {
+            let capped = op_memo_full(
+                &svc,
+                "changes",
+                "0",
+                "",
+                None,
+                None,
+                None,
+                &[],
+                false,
+                false,
+                cap,
+                Some(200),
+                Some(&ws),
+            )
+            .unwrap();
+            let doc = capped.get("changes").unwrap();
+            let raw = doc.to_json_string();
+            assert!(
+                raw.len() <= cap,
+                "changes JSON exceeded cap={cap}: len={}",
+                raw.len()
+            );
+            let parsed = crate::base::json::parse(&raw).expect("valid JSON");
+            let evs = parsed.get("events").and_then(Json::as_arr).unwrap();
+            let omitted = parsed.get_i64("omitted_older").unwrap_or(0) as usize;
+            assert_eq!(evs.len() + omitted, 50, "cap={cap}");
+            if let Some(last) = evs.last() {
+                assert_eq!(last.get_i64("seq"), Some(50), "must retain newest tail");
+            }
+            if cap == 256 {
+                assert!(evs.is_empty() && omitted == 50, "cap=256: {raw}");
+            }
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

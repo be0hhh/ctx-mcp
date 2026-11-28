@@ -4,7 +4,7 @@ use crate::base::security::is_sensitive_path;
 use crate::base::simd::{decimal_digits, line_hash3, push_usize};
 use crate::parser::{SymbolKind, SymbolSpan};
 use crate::rpc::BrokerService;
-use crate::store::{resolve_input_path, RamStore};
+use crate::store::{is_multimodal_or_binary_ext, resolve_input_path, RamStore};
 use std::path::{Path, PathBuf};
 
 const COMPACT_SYMBOL_MAX_LINES: usize = 48;
@@ -206,10 +206,57 @@ pub fn op_symbols_with_options(
             break;
         }
         let Some((raw_path, sym_query)) = req.split_once('#') else {
-            out.push_str(&format!(
-                "=== {} [ERROR: expected format path#SymbolName] ===\n",
-                req
-            ));
+            let trimmed = req.trim();
+            let mut outlined = false;
+            if !trimmed.is_empty() {
+                let mut resolved = resolve_input_path(trimmed, cwd);
+                if !resolved.exists()
+                    && is_safe_shorthand_candidate(trimmed)
+                    && !is_sensitive_path(&resolved)
+                {
+                    if let Some(ws_hint) = cwd.and_then(|c| svc.allowlist.register_hint(c, false)) {
+                        let found = svc.store.find_workspace_paths(trimmed, &ws_hint, 2);
+                        if found.len() == 1 {
+                            if let Some(first) = found.into_iter().next() {
+                                resolved = first;
+                            }
+                        }
+                    }
+                }
+                if resolved.is_file() && !is_sensitive_path(&resolved) {
+                    if let Ok((canon, ws_root)) = svc.allowlist.admit_file(&resolved, cwd) {
+                        if !is_multimodal_or_binary_ext(&canon) {
+                            if let Ok(entry) = svc.store.get_outline_entry(&canon, Some(&ws_root)) {
+                                any_ok = true;
+                                outlined = true;
+                                let outline = RamStore::format_outline_compact(&entry, 24);
+                                let section = format!(
+                                    "=== {} (outline; no #Symbol) ===\n{}\nHint: pass \"{}#Sym1\" \"{}#Sym2\" in one call to read exact symbol bodies.\n\n",
+                                    entry.rel_path, outline, entry.rel_path, entry.rel_path
+                                );
+                                if out.len() + section.len() <= limit {
+                                    out.push_str(&section);
+                                } else {
+                                    let remain = limit.saturating_sub(out.len());
+                                    let mut end = remain.min(section.len());
+                                    while end > 0 && !section.is_char_boundary(end) {
+                                        end -= 1;
+                                    }
+                                    out.push_str(&section[..end]);
+                                    out.push_str(cap_note);
+                                    return Ok(out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !outlined {
+                out.push_str(&format!(
+                    "=== {} [ERROR: expected format path#SymbolName] ===\n",
+                    req
+                ));
+            }
             continue;
         };
         let (kind_filter, query) = parse_kind_filter(sym_query);
@@ -560,6 +607,100 @@ mod tests {
         let q60 = op_symbols(&svc, &["reconciler.rs#very_long_fn".into()], 16_384, true, None, Some(&workspace), false).unwrap();
         assert!(q60.contains("continue with reconciler.rs:"), "{q60}");
 
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn bare_file_auto_outline_respects_security_budget_and_preserves_error_for_invalid() {
+        let workspace = std::env::temp_dir().join(format!(
+            "ctx-sym-bare-outline-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        let sub = workspace.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let mut src = String::new();
+        for i in 0..8 {
+            src.push_str(&format!("pub fn func_{i}(v: i32) -> i32 {{ v + {i} }}\n"));
+        }
+        fs::write(sub.join("mod_a.rs"), &src).unwrap();
+        fs::write(workspace.join(".env"), "SECRET_TOKEN=top_secret_value\n").unwrap();
+
+        let outside = std::env::temp_dir().join(format!(
+            "ctx-sym-outside-{}-{}.rs",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        fs::write(&outside, "pub fn external_fn() {}\n").unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(workspace.join("snapshot"));
+        svc.allowlist.register_hint(&workspace, true).unwrap();
+
+        // 1. Exact workspace path without `#Symbol` emits compact outline + batching hint.
+        let bare = op_symbols(
+            &svc,
+            &["sub/mod_a.rs".into()],
+            4096,
+            false,
+            None,
+            Some(&workspace),
+            false,
+        )
+        .unwrap();
+        assert!(bare.contains("sub/mod_a.rs") && bare.contains("func_0") && bare.contains("func_7"), "{bare}");
+        assert!(
+            bare.contains("Hint: pass \"sub/mod_a.rs#Sym1\" \"sub/mod_a.rs#Sym2\" in one call to read exact symbol bodies."),
+            "{bare}"
+        );
+
+        // 2. Unique workspace shorthand without `#Symbol` also resolves to compact outline.
+        let short = op_symbols(
+            &svc,
+            &["mod_a.rs".into()],
+            4096,
+            false,
+            None,
+            Some(&workspace),
+            false,
+        )
+        .unwrap();
+        assert!(short.contains("sub/mod_a.rs") && short.contains("func_0"), "{short}");
+
+        // 3. Batching bare file + `file#Symbol` returns both outline and symbol body.
+        let mixed = op_symbols(
+            &svc,
+            &["sub/mod_a.rs".into(), "sub/mod_a.rs#func_2".into()],
+            4096,
+            false,
+            None,
+            Some(&workspace),
+            false,
+        )
+        .unwrap();
+        assert!(mixed.contains("Hint: pass \"sub/mod_a.rs#Sym1\"") && mixed.contains("v + 2"), "{mixed}");
+
+        // 4. Budget enforcement on bare file outlines strictly respects `max_bytes`.
+        let many: Vec<String> = (0..10).map(|_| "sub/mod_a.rs".to_string()).collect();
+        let capped = op_symbols(&svc, &many, 1024, false, None, Some(&workspace), false).unwrap();
+        assert!(capped.len() <= 1024, "len={}", capped.len());
+
+        // 5. Missing file, directory, sensitive `.env`, and outside-workspace path preserve exact error.
+        for bad in [
+            "missing.rs".to_string(),
+            "sub".to_string(),
+            ".env".to_string(),
+            outside.to_string_lossy().into_owned(),
+        ] {
+            let err = op_symbols(&svc, &[bad.clone()], 4096, false, None, Some(&workspace), false)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                format!("=== {bad} [ERROR: expected format path#SymbolName] ==="),
+                "bad={bad}"
+            );
+        }
+
+        let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(&workspace);
     }
 }
