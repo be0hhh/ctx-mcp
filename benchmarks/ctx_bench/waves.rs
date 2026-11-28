@@ -412,7 +412,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
     };
 
     let info_path = rt.join("daemon.json");
-    for _ in 0..80 {
+    for _ in 0..250 {
         if let Ok(txt) = fs::read_to_string(&info_path) {
             if let Ok(parsed) = json::parse(&txt) {
                 if let (Some(p), Some(tok)) = (parsed.get_usize("port"), parsed.get_str("token")) {
@@ -422,7 +422,7 @@ pub fn run_waves_cli(args: &[String]) -> i32 {
                 }
             }
         }
-        thread::sleep(Duration::from_millis(15));
+        thread::sleep(Duration::from_millis(20));
     }
     if guard.port == 0 {
         eprintln!("ctx-bench waves error: isolated daemon did not publish daemon.json");

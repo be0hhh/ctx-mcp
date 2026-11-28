@@ -1,8 +1,8 @@
-# CTX Benchmarks (`v2.5.0` – `v2.5.3`)
+# CTX Benchmarks (`v2.5.0` – `v2.5.5`)
 
 Headline positioning, quota-drain summary, and full-session Native vs CTX totals are in the
 [main README](../README.md#savings-at-a-glance-native-vs-ctx-v250).
-Sections 1–4 report verified `v2.5.0` single-agent baselines; Sections 5–6 report verified **`v2.5.3`** Fat-LTO load, hot-kernel, `10–100` agent multi-worktree swarm, and live 10-agent parallel A/B runs (`156/156` Rust tests, `0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv`, `0` failed edits).
+Sections 1–4 report verified `v2.5.0` single-agent baselines; Sections 5–6 report verified **`v2.5.3` – `v2.5.5`** Fat-LTO load, hot-kernel, `10–100` agent multi-worktree swarm, live 8-agent 3-level hierarchical MCP+CLI A/B, and live 10-agent parallel MCP A/B runs (`0` `.unwrap()`/`.expect()` in production, `0` `div`/`idiv`, `0` failed edits).
 
 ## 1. Cold (Turn 1) vs Warm (Turn 2) Navigation (`30/30` exact `file:line`)
 
@@ -113,7 +113,7 @@ Two multi-file tasks (`cpp_sig_edit` across C++ headers; `py_refactor` lexical r
 
 - **Totals (`24/24` verified, `0` failed edits):** Codex tool calls **`54 → 28` (−48.1%)** (`2.36 ms/call` MCP); AGY tool calls **`42 → 32` (−23.8%)** (`1.80 ms/call` MCP).
 
-## 5. Load & Hot-Kernel Results (`v2.5.3`)
+## 5. Load & Hot-Kernel Results (`v2.5.5`)
 
 Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `RUSTFLAGS="-C target-cpu=native"`, release Fat-LTO, `0` hardware `div`/`idiv`, `0` `.unwrap()`/`.expect()` in production).
 
@@ -147,35 +147,56 @@ Measured on Linux x86-64 (AMD Ryzen 5 5600X, AVX2 + BMI1, `RUSTFLAGS="-C target-
 
 | Agents | Total ops | ops/sec | p50 (µs) | p95 (µs) | p99 (µs) | Cache hit | RPC / Iso errs | Capsules OK | Misdelivery / Miss / Busy |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 20 | 2,418 | **254** | 830 | 830 | 78.6% | 0 / 0 | 1 | 0 / 0 / 0 |
-| 10 | 200 | **13,664** | **413** | 1,910 | 4,165 | 95.3% | 0 / 0 | 10 | 0 / 0 / 0 |
-| 50 | 1,000 | 9,513 | 2,022 | 19,132 | 35,261 | 99.0% | 0 / 0 | 50 | 0 / 0 / 0 |
-| 100 | 2,000 | 10,093 | 4,091 | 27,615 | 40,192 | 99.6% | 0 / 0 | 100 | 0 / 0 / 0 |
-| 200 | 4,000 | **11,616** | 7,765 | **51,989** | **84,857** | **99.8%** | **0 / 0** | **200** | **0 / 0 / 0** |
+| 1 | 20 | 2,424 | **256** | 1,164 | 1,164 | 78.6% | 0 / 0 | 1 | 0 / 0 / 0 |
+| 10 | 200 | **13,443** | **435** | 1,456 | 4,126 | 95.3% | 0 / 0 | 10 | 0 / 0 / 0 |
+| 50 | 1,000 | 11,232 | 1,840 | 18,117 | 22,985 | 99.0% | 0 / 0 | 50 | 0 / 0 / 0 |
+| 100 | 2,000 | **11,851** | 2,976 | 25,549 | 40,336 | 99.6% | 0 / 0 | 100 | 0 / 0 / 0 |
+| 200 | 4,000 | **11,444** | 7,876 | **50,100** | **71,441** | **99.8%** | **0 / 0** | **200** | **0 / 0 / 0** |
 
-## 6. Multi-Agent Swarm Scaling & Live 10-Agent Parallel A/B (`v2.5.3`)
+## 6. Multi-Agent Swarm Scaling & Live Hierarchical A/B (`v2.5.3` – `v2.5.5`)
 
-### Tier 1A — Isolated Daemon Swarm Replay (`ctx-bench swarm --agents 10,50,100 --worktrees 8`, 0 LLM tokens)
+### Tier 1A — Isolated Daemon Swarm Replay (`ctx-bench swarm --agents 10,50,100 --worktrees 8`, 0 LLM tokens, `v2.5.5`)
 
 Measured on an isolated 201-file C++/Rust corpus (`32` files `>=350L`) cloned into a temporary Git repository with **`8` real linked `git worktree`s** sharing one `ctx` daemon (scout publishes Shared Context Pack + memos → `N` concurrent workers run `SessionStart` pack auto-materialization, 4-query batch `search` coalescing, `PreToolUse read_file` Large-Read Gate, cross-worktree `symbols`, `pack_get` dedup, `memo list`, `impact`, `git`, and concurrent edit `ChangeFeed` + `[STALE]` verification):
 
 | Agents | ops/sec | p50 ms | p95 ms | p99 ms | Errors | Large-Read redirects | Pack dedup hits | Cross-WT memos | ChangeFeed visible | Stale detected | **RAM (8 worktrees)** | Peak subprocs | **Payload saved** |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|
-| **10** | 803 | 5.99 | 44.52 | 51.04 | **0** | 10/10 | 10/10 | 10/10 | 9/9 | Yes | **2,847 KiB** | 10 | **93.7%** |
-| **50** | 1,354 | 10.68 | 121.81 | 158.82 | **0** | 50/50 | 50/50 | 50/50 | 49/49 | Yes | **2,847 KiB** | 16 | **93.7%** |
-| **100** | **1,532** | 22.64 | 185.04 | 271.24 | **0** | 100/100 | 100/100 | 100/100 | 99/99 | Yes | **2,847 KiB** | 16 | **93.6%** |
+| **10** | 1,523 | 3.66 | 19.00 | 23.57 | **0** | 10/10 | 10/10 | 10/10 | 9/9 | Yes | **2,880 KiB** | 8 | **93.8%** |
+| **50** | 1,973 | 8.68 | 53.46 | 72.06 | **0** | 50/50 | 50/50 | 50/50 | 49/49 | Yes | **2,880 KiB** | 16 | **93.7%** |
+| **100** | **2,210** | **14.29** | 118.75 | 242.92 | **0** | 100/100 | 100/100 | 100/100 | 99/99 | Yes | **2,880 KiB** | 16 | **93.6%** |
 
-- **Flat RAM across 8 linked worktrees:** `ParsedBody` content-addressed deduplication keeps total daemon RAM identical (`2,847 KiB`) across `10`, `50`, and `100` agents spanning all `8` worktrees (`1×` storage instead of `8×`).
+- **Flat RAM across 8 linked worktrees:** `ParsedBody` content-addressed deduplication keeps total daemon RAM identical (`2,880 KiB`) across `10`, `50`, and `100` agents spanning all `8` worktrees (`1×` storage instead of `8×`).
 
 ### Tier 1B — Offline Multi-Agent Context Replay (`160` source files, `23 >= 350L`, 71.8% inter-agent file overlap)
 
-| Agents | Naive `read_file` | CTX `v2.5.2` | **CTX `v2.5.3`** | Saved vs Naive | Saved vs `v2.5.2` |
+| Agents | Naive `read_file` | CTX `v2.5.2` | **CTX `v2.5.5`** | Saved vs Naive | Saved vs `v2.5.2` |
 |---:|---:|---:|---:|---:|---:|
-| **10** | 754.8 KB (~193k tok) | 610.3 KB | **122.2 KB (~31k tok)** | **83.8%** | **80.0%** |
-| **50** | 3,810.0 KB (~975k tok) | 3,052.1 KB | **601.9 KB (~154k tok)** | **84.2%** | **80.3%** |
-| **100** | 7,616.7 KB (~1.95M tok) | 6,098.9 KB | **1,201.5 KB (~308k tok)** | **84.2%** | **80.3%** |
+| **10** | 805.1 KB (~206k tok) | 650.0 KB | **122.2 KB (~31k tok)** | **84.8%** | **81.2%** |
+| **50** | 4,071.3 KB (~1.04M tok) | 3,241.8 KB | **601.9 KB (~154k tok)** | **85.2%** | **81.4%** |
+| **100** | 8,138.2 KB (~2.08M tok) | 6,470.6 KB | **1,201.5 KB (~308k tok)** | **85.2%** | **81.4%** |
 
-### Tier 2 — Live 10-Agent Parallel Antigravity A/B (`Gemini 4 Neon (High)`, `20/20` sessions, `100.0%` exact `file:line`)
+### Tier 2A — Live 8-Agent 3-Level Hierarchical Swarm A/B (`Gemini 4 Neon XHigh`, `16/16` sessions, `100.0%` exact `file:line`, `v2.5.5`)
+
+Four-wave hierarchical benchmark over an isolated 75-file C++ multi-subsystem corpus (`1` Root Orchestrator → `2` parallel Squad Leads → `4` parallel Executors locating `12` exact anchors → `1` Final Cross-Boundary Reviewer verifying `4` cross-subsystem anchors = **`16` exact verifiable `file:line` targets per arm**):
+- **`baseline_nomcp`:** all 8 `Neon XHigh` agents use native `read_file` (zero MCP, zero `ctx` hooks).
+- **`multiagent` (`v2.5.5`):** models real Antigravity swarm topology 1:1 — **Wave 1 Root** uses 8 eager MCP tools + hooks and publishes `pack:hier-root` (`16` selectors); **Waves 2–4** (2 Squad Leads, 4 Executors, 1 Final Reviewer) run as **CLI-only workers** (empty MCP, `PreToolUse` `AGENT_CTX_CLI_TOKEN` + `9.2 KiB` AGY CLI inline cap + squad Shared Context Packs `squad-runtime` & `squad-exchange`) sharing one isolated `ctx v2.5.5` daemon.
+
+| Wave (`Gemini 4 Neon XHigh`) | Native uncached | **CTX `v2.5.5` uncached** | Uncached delta | Native `read_file` | **CTX `read_file`** | CTX calls | Exact `file:line` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **W1 Root (`1` MCP)** | 131,734 | **61,288** | **−53.5%** | 14 | **1** | 12 MCP | — |
+| **W2 Squad Leads (`2` CLI)** | 144,459 | **87,083** | **−39.7%** | 14 | **1** | 32 CLI | — |
+| **W3 Executors (`4` CLI)** | 200,295 | **132,450** | **−33.9%** | 17 | **0 (−100%)** | 63 CLI | **12/12 (100%)** |
+| **W4 Cross-Boundary Review (`1` CLI)** | 92,994 | **49,057** | **−47.2%** | 12 | **0 (−100%)** | 30 CLI | **4/4 (100%)** |
+| **Total (`8` agents / arm)** | **569,482** | **329,878** | **−42.1%** | **57** | **2 (−96.5%)** | **137** (12+125) | **16/16 (100%)** |
+
+| Arm (`8` `Neon XHigh` agents) | Wall time | Full input | **Uncached input** | Cached input | Weighted input\* | Output (thinking) | **`read_file`** | `ALREADY IN CONTEXT` | `read`/`inspect`/`sym`/`search` truncations | Exact `file:line` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`baseline_nomcp`** | 304.7 s | 1,005,309 | 569,482 | 435,827 | 613,065 | 60,887 (48,736) | 57 | 0 | — | 16/16 (100%) |
+| **`multiagent` (`v2.5.5`)** | 579.1 s | 1,303,044 | **329,878 (−42.1%)** | 973,166 | **427,195 (−30.3%)** | 84,059 (63,027) | **2 (−96.5%)** | **0** | **0 / 101** | **16/16 (100%)** |
+
+<sub>*Weighted input = `uncached + 0.10× cached`. Excluding ~104k fixed host system prompt tokens across 8 sessions, dynamic code context dropped **~51.5%** (`~465k → ~226k`). Wall time on CLI-only workers reflects host shell/hook PTY overhead (~2–4 s per `run_command` across 125 fine-grained CLI calls); batching multiple symbols per `ctx sym` call or using MCP eliminates this overhead (see Tier 2B).*</sub>
+
+### Tier 2B — Live 10-Agent Parallel MCP Antigravity A/B (`Gemini 4 Neon High`, `20/20` sessions, `100.0%` exact `file:line`, `v2.5.3`)
 
 Ten parallel headless Antigravity (`agy`) sessions solving distinct two-anchor read-only audit tasks over an isolated C++ subsystem (`unshare` bind-mounted isolated `mcp_config.json` and `hooks.json` per arm):
 - **`baseline_nomcp`:** native `read_file` without MCP or `ctx` hooks (modeling pre-upgrade swarm workers).

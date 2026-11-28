@@ -5,7 +5,28 @@ use crate::base::json::{self, Json, JsonKey};
 use crate::rpc::workspace_cwd_str;
 use std::borrow::Cow;
 
-pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
+pub const SEARCH_USAGE: &str = "Usage:\n\
+  ctx search -q <ModOrDir:query> [-q ...] [options]\n\
+  ctx search <query> [roots...] [options]\n\
+  ctx search --batch-json '<array>' [options]\n\
+Options:\n\
+  -q, --q <root:query>    Shorthand root-scoped query (repeatable, 1-6)\n\
+  --batch-json <array>    JSON array of search query objects\n\
+  --max-results <n>       Max hits per query\n\
+  --context-lines <n>     Lines of context around hits (0-4)\n\
+  --detail compact|scopes Output detail level\n\
+  --code-only             Search code files only\n\
+  --max-bytes <n>         Max output bytes (up to 14336)\n\
+  --session <id>          Session identifier\n\
+  -h, --help              Show this help";
+
+#[derive(Debug)]
+pub enum SearchCliAction {
+    Request(Json),
+    Help(&'static str),
+}
+
+pub fn parse_search_cli_action(args: &[String]) -> Result<SearchCliAction, String> {
     let mut fields: Vec<(JsonKey, Json)> = vec![
         (Cow::Borrowed("op"), Json::Str("search".into())),
         (Cow::Borrowed("cwd"), Json::Str(workspace_cwd_str(None))),
@@ -25,6 +46,7 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
                 .ok_or_else(|| format!("missing value for {option}"))
         };
         match option {
+            "--help" | "-h" => return Ok(SearchCliAction::Help(SEARCH_USAGE)),
             "-q" | "--q" => shorthand.push(Json::Str(value(&mut args)?)),
             "--batch-json" => {
                 if batch.is_some() {
@@ -94,7 +116,15 @@ pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
     for (k, v) in cli_session_fields(session.as_deref()) {
         fields.push((Cow::Borrowed(k), v));
     }
-    Ok(Json::Obj(fields))
+    Ok(SearchCliAction::Request(Json::Obj(fields)))
+}
+
+#[allow(dead_code)]
+pub fn parse_search_cli(args: &[String]) -> Result<Json, String> {
+    match parse_search_cli_action(args)? {
+        SearchCliAction::Request(req) => Ok(req),
+        SearchCliAction::Help(usage) => Err(usage.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +164,23 @@ mod tests {
 
         assert!(parse_search_cli(&svec(&["-q", "a:b", "positional"])).is_err());
         assert!(parse_search_cli(&svec(&[])).is_err());
+
+        assert!(matches!(
+            parse_search_cli_action(&svec(&["--help"])),
+            Ok(SearchCliAction::Help(msg)) if msg.contains("ctx search -q")
+        ));
+        assert!(matches!(
+            parse_search_cli_action(&svec(&["-h"])),
+            Ok(SearchCliAction::Help(_))
+        ));
+        assert!(matches!(
+            parse_search_cli_action(&svec(&["-q", "Mod:x", "--help"])),
+            Ok(SearchCliAction::Help(_))
+        ));
+        // `-- --help` searches literally for `--help`, and bare `help` searches for `help`.
+        let lit = parse_search_cli(&svec(&["--", "--help"])).expect("literal --help");
+        assert_eq!(lit.get_str("query"), Some("--help"));
+        let bare = parse_search_cli(&svec(&["help"])).expect("literal help");
+        assert_eq!(bare.get_str("query"), Some("help"));
     }
 }

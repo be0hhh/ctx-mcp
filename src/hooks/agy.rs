@@ -1000,10 +1000,28 @@ pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
                             .capsules
                             .issue_cli_lease(sess_key.clone(), context.workspace)
                         {
-                            let updated_cmd = format!(
-                                "export AGENT_CTX_SESSION={} AGENT_CTX_CLI_TOKEN={}; {}",
-                                sess_key, tok, cmd
-                            );
+                            let rt_export = std::env::var("AGENT_CTX_RUNTIME_DIR")
+                                .ok()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| {
+                                    !s.is_empty()
+                                        && !s.contains("..")
+                                        && s.bytes().all(|b| {
+                                            b.is_ascii_alphanumeric()
+                                                || matches!(b, b'/' | b'.' | b'_' | b'-' | b':')
+                                        })
+                                });
+                            let updated_cmd = if let Some(rt_dir) = rt_export {
+                                format!(
+                                    "export AGENT_CTX_SESSION={} AGENT_CTX_CLI_TOKEN={} AGENT_CTX_RUNTIME_DIR={}; {}",
+                                    sess_key, tok, rt_dir, cmd
+                                )
+                            } else {
+                                format!(
+                                    "export AGENT_CTX_SESSION={} AGENT_CTX_CLI_TOKEN={}; {}",
+                                    sess_key, tok, cmd
+                                )
+                            };
                             let new_args =
                                 replace_field(args, "CommandLine", Json::Str(updated_cmd));
                             return Json::obj(vec![

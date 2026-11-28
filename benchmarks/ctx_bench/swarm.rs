@@ -808,7 +808,7 @@ pub fn run_swarm_cli(args: &[String]) -> i32 {
     guard.daemon = Some(child);
 
     let info_path = rt.join("daemon.json");
-    for _ in 0..150 {
+    for _ in 0..250 {
         if let Ok(txt) = fs::read_to_string(&info_path) {
             if let Ok(parsed) = json::parse(&txt) {
                 if let (Some(p), Some(tok)) = (parsed.get_usize("port"), parsed.get_str("token")) {

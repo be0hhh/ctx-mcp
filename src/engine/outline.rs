@@ -340,27 +340,42 @@ pub fn op_inspect(
             warn_l
         ));
     } else {
-        let mut top_flags: Vec<String> = flagged
-            .iter()
-            .take(10)
-            .map(|(lc, path)| {
-                if *lc > 800 {
-                    format!("{} ({}L [OVER 800L])", path, lc)
-                } else {
-                    format!("{} ({}L)", path, lc)
-                }
-            })
-            .collect();
-        if flagged.len() > 10 {
-            top_flags.push(format!("+{} more", flagged.len() - 10));
-        }
-        out.push_str(&format!(
-            "=== Slice Inspect: {} files ({} >= {}L: {}) ===\n",
+        let header_prefix = format!(
+            "=== Slice Inspect: {} files ({} >= {}L: ",
             items.len(),
             flagged.len(),
-            warn_l,
-            top_flags.join(", ")
-        ));
+            warn_l
+        );
+        let header_budget = (budget >> 2).max(160);
+        let max_flag_items = if budget <= 12_288 { 5 } else { 10 };
+        let mut top_flags: Vec<String> = Vec::with_capacity(max_flag_items + 1);
+        let mut used = header_prefix.len();
+        let mut shown = 0usize;
+        for (lc, path) in flagged.iter().take(max_flag_items) {
+            let entry = if *lc > 800 {
+                format!("{} ({}L [OVER 800L])", path, lc)
+            } else {
+                format!("{} ({}L)", path, lc)
+            };
+            let sep = if shown > 0 { 2 } else { 0 };
+            // Reserve 24 bytes for `, +NNN more) ===\n`.
+            if used + sep + entry.len() + 24 > header_budget {
+                break;
+            }
+            used += sep + entry.len();
+            top_flags.push(entry);
+            shown += 1;
+        }
+        if flagged.len() > shown {
+            if shown == 0 {
+                top_flags.push(format!("{} flagged", flagged.len()));
+            } else {
+                top_flags.push(format!("+{} more", flagged.len() - shown));
+            }
+        }
+        out.push_str(&header_prefix);
+        out.push_str(&top_flags.join(", "));
+        out.push_str(") ===\n");
     }
 
     let sym_show = if items.len() > 35 { 4 } else { 6 };
@@ -506,6 +521,55 @@ mod tests {
         let budgeted = op_outline_with_options(&svc, &["exit.rs".into()], 40, 1024, 0, Some(&ws)).unwrap();
         assert!(budgeted.len() <= 1024 + 128, "len={}", budgeted.len());
         assert!(budgeted.contains("omitted at 1024B budget"), "{budgeted}");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn op_inspect_caps_header_and_total_output_on_many_long_flagged_paths() {
+        let ws = std::env::temp_dir().join(format!(
+            "ctx-inspect-cap-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        let deep = ws.join("very_long_subsystem_directory_name_alpha/nested_module_segment_beta/component_gamma");
+        fs::create_dir_all(&deep).unwrap();
+        let body: String = (1..=650).map(|i| format!("pub fn f_{i:03}() {{}}\n")).collect();
+        for idx in 0..30 {
+            let fname = format!("extremely_descriptive_implementation_unit_file_number_{idx:02}.rs");
+            fs::write(deep.join(fname), &body).unwrap();
+        }
+
+        let svc = BrokerService::new_ephemeral_inproc(ws.join("snap.bin"));
+        svc.allowlist.register_hint(&ws, true).unwrap();
+
+        for budget in [1024usize, 9_200usize] {
+            let out = op_inspect(&svc, &[".".into()], 80, budget, 600, Some(&ws)).unwrap();
+            assert!(
+                out.len() <= budget + 128,
+                "budget={budget} exceeded: len={}",
+                out.len()
+            );
+            let header = out.lines().next().unwrap_or("");
+            assert!(
+                header.len() <= (budget >> 2) + 64,
+                "budget={budget} header too large ({}B): {header}",
+                header.len()
+            );
+            assert!(
+                header.contains("30 >= 600L:"),
+                "header missing flagged count: {header}"
+            );
+            // At tight budgets, top_flags must list <= 5 entries and summarize remaining.
+            assert!(
+                header.matches("(650L)").count() <= 5,
+                "too many top_flags at budget={budget}: {header}"
+            );
+            assert!(
+                header.contains("more)") || header.contains("flagged)"),
+                "header should summarize omitted flagged files: {header}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&ws);
     }

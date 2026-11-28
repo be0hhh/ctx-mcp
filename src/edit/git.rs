@@ -210,10 +210,15 @@ fn extract_paths(req: &Json) -> Result<Vec<String>, String> {
         for v in arr {
             let s = v.as_str().map(str::trim).filter(|s| !s.is_empty())
                 .ok_or_else(|| "`paths` entries must be non-empty strings".to_string())?;
+            if s == "--" {
+                continue;
+            }
             out.push(s.to_string());
         }
     } else if let Some(single) = req.get_str("path").map(str::trim).filter(|s| !s.is_empty()) {
-        out.push(single.to_string());
+        if single != "--" {
+            out.push(single.to_string());
+        }
     }
     Ok(out)
 }
@@ -468,6 +473,17 @@ mod tests {
             let req = Json::obj(vec![("action", Json::Str(bad.into()))]);
             assert!(op_git(&svc, &req, None).unwrap_err().contains("REFUSED: unsupported git action"));
         }
+
+        // Defensively ignore bare `--` separator entries from MCP/CLI callers.
+        let with_dd = Json::obj(vec![(
+            "paths",
+            Json::Arr(vec![Json::Str("--".into()), Json::Str("src/a.rs".into())]),
+        )]);
+        assert_eq!(extract_paths(&with_dd).unwrap(), vec!["src/a.rs".to_string()]);
+        let only_dd = Json::obj(vec![("paths", Json::Arr(vec![Json::Str("--".into())]))]);
+        assert!(extract_paths(&only_dd).unwrap().is_empty());
+        let single_dd = Json::obj(vec![("path", Json::Str("--".into()))]);
+        assert!(extract_paths(&single_dd).unwrap().is_empty());
     }
 
     #[test]

@@ -402,7 +402,7 @@ fn execute_request_inner(
         OpCode::Outline => {
             let paths = str_vec(req.get("paths"));
             let max_files = req.get_usize("max_files").unwrap_or(40);
-            let max_bytes = effective_max_bytes(req, is_agy, 0);
+            let max_bytes = effective_host_max_bytes(req, is_agy, is_agy_cli, 0);
             let max_symbols = req.get_usize("max_symbols").unwrap_or(0);
             match op_outline_with_options(svc, &paths, max_files, max_bytes, max_symbols, cwd.as_deref()) {
                 Ok(text) => Json::obj(vec![("ok", Json::Bool(true)), ("text", Json::Str(text))]),
@@ -455,6 +455,8 @@ fn execute_request_inner(
                     SEARCH_RESPONSE_BYTES
                 };
                 (def, AGY_MCP_DEFAULT_MAX_BYTES)
+            } else if is_agy_cli {
+                (AGY_CLI_DEFAULT_MAX_BYTES, MAX_CLI_SEARCH_RESPONSE_BYTES)
             } else {
                 let def = if batch_len.is_some_and(|n| (3..=6).contains(&n)) {
                     CLI_BATCH_SEARCH_BYTES
@@ -503,7 +505,7 @@ fn execute_request_inner(
             let paths = str_vec(req.get("paths"));
             let force = req.get_bool("force").unwrap_or(false);
             let raw = req.get_bool("raw").unwrap_or(false);
-            let max_bytes = effective_max_bytes(req, is_agy, 32_768);
+            let max_bytes = effective_host_max_bytes(req, is_agy, is_agy_cli, 32_768);
             match op_memo_full(
                 svc,
                 action,
@@ -623,7 +625,8 @@ fn execute_request_inner(
             let max_callers = req.get_usize("max_callers").unwrap_or(20);
             let include_tests = req.get_bool("include_tests").unwrap_or(true);
             let include_git_status = req.get_bool("include_git_status").unwrap_or(true);
-            let max_bytes = effective_max_bytes(req, is_agy, DEFAULT_READ_MAX_BYTES);
+            let max_bytes =
+                effective_host_max_bytes(req, is_agy, is_agy_cli, DEFAULT_READ_MAX_BYTES);
             match op_impact_with_git(
                 svc,
                 &targets,
@@ -661,12 +664,12 @@ fn effective_max_bytes(req: &Json, is_agy: bool, non_agy_default: usize) -> usiz
     }
 }
 
-/// Host-aware byte budget for `Read` / `Inspect` / `Symbols`:
+/// Host-aware byte budget for `Read` / `Inspect` / `Symbols` / `Memo` / `Impact`:
 /// - AGY MCP (`is_agy`): hard-clamped to `AGY_MCP_DEFAULT_MAX_BYTES` (`9,000 B`).
 /// - AGY `run_command` CLI (`is_agy_cli`, verified `agy:` `CliLease`): defaults to
-///   `AGY_CLI_DEFAULT_MAX_BYTES` (`14,000 B`) when `max_bytes` is omitted, while respecting an
+///   `AGY_CLI_DEFAULT_MAX_BYTES` (`9,200 B`) when `max_bytes` is omitted, while respecting an
 ///   explicit `--max-bytes` clamped to `DEFAULT_READ_MAX_BYTES` (`1 MiB`).
-/// - Non-AGY CLI: preserves `non_agy_default` (`1 MiB`).
+/// - Non-AGY CLI: preserves `non_agy_default` (e.g., `1 MiB` or `32 KiB`).
 fn effective_host_max_bytes(
     req: &Json,
     is_agy: bool,
@@ -1060,8 +1063,25 @@ mod tests {
         );
         assert_eq!(read_rep.get_bool("ok"), Some(true));
         assert!(
-            read_rep.get_str("text").unwrap().len() > AGY_MCP_DEFAULT_MAX_BYTES + 1000,
-            "CLI lease must preserve 1 MiB read budget instead of AGY 9 KB cap"
+            read_rep.get_str("text").unwrap().len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "AGY CLI lease default read must fit under 9,200 B inline cap"
+        );
+
+        let read_explicit = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("read".into())),
+                ("cwd", Json::Str(sub.to_string_lossy().into_owned())),
+                ("cli_token", Json::Str(tok.clone())),
+                ("max_bytes", Json::Int(65_536)),
+                ("force", Json::Bool(true)),
+                ("paths", Json::Arr(vec![Json::Str("big.cpp".into())])),
+            ]),
+        );
+        assert_eq!(read_explicit.get_bool("ok"), Some(true));
+        assert!(
+            read_explicit.get_str("text").unwrap().len() > AGY_MCP_DEFAULT_MAX_BYTES + 1000,
+            "AGY CLI lease explicit max_bytes must not be hard-clamped to AGY 9 KB MCP cap"
         );
 
         // 2. Invalid/expired cli_token degrades gracefully to unverified session for read-only ops.
@@ -1091,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_cli_lease_uses_14k_default_cap_non_poisoning_dedup_and_preserves_plain_cli_budget() {
+    fn agy_cli_lease_uses_9200b_default_cap_non_poisoning_dedup_and_preserves_plain_cli_budget() {
         let dir = std::env::temp_dir().join(format!(
             "ctx-rpc-agy-cli-cap-{}-{}",
             std::process::id(),
@@ -1113,7 +1133,9 @@ mod tests {
             fs::write(
                 dir.join(format!("mod_{f:02}.rs")),
                 format!(
-                    "pub fn alpha_{f:02}() {{}}\npub fn beta_{f:02}() {{}}\npub fn gamma_{f:02}() {{}}\npub fn delta_{f:02}() {{}}\n"
+                    "pub fn alpha_{f:02}() {{ huge_fn(); /* tok_a_{f:02} tok_b_{f:02} tok_c_{f:02} tok_d_{f:02} pad_0123456789abcdef0123456789abcdef */ }}\n\
+                     pub fn beta_{f:02}() {{ huge_fn(); /* tok_a2_{f:02} tok_b2_{f:02} tok_c2_{f:02} tok_d2_{f:02} pad_0123456789abcdef0123456789abcdef */ }}\n\
+                     pub fn gamma_{f:02}() {{}}\npub fn delta_{f:02}() {{}}\n"
                 ),
             )
             .unwrap();
@@ -1138,7 +1160,7 @@ mod tests {
             .unwrap();
         let cwd_str = dir.to_string_lossy().into_owned();
 
-        // (a) `agy:` CliLease defaults Read / Inspect / Symbols to AGY_CLI_DEFAULT_MAX_BYTES (14,000 B)
+        // (a) `agy:` CliLease defaults Read / Inspect / Symbols / Search / Memo / Impact to AGY_CLI_DEFAULT_MAX_BYTES (9,200 B)
         let agy_read = execute_request(
             &svc,
             &Json::obj(vec![
@@ -1152,8 +1174,8 @@ mod tests {
         let agy_read_txt = agy_read.get_str("text").unwrap();
         assert!(
             agy_read_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES
-                && agy_read_txt.len() > AGY_MCP_DEFAULT_MAX_BYTES + 1_000
-                && agy_read_txt.contains("AGY CLI inline cap")
+                && agy_read_txt.len() > 7_000
+                && agy_read_txt.contains("AGY CLI inline cap 9200B")
                 && agy_read_txt.contains("ctx sym")
                 && !agy_read_txt.contains("read_file"),
             "len={} text_tail={}",
@@ -1196,6 +1218,224 @@ mod tests {
             agy_sym_txt.len()
         );
 
+        // Search: AGY CLI defaults single & batch (`q`) to 9,200 B while allowing explicit `--max-bytes` up to 14 KiB;
+        // non-AGY CLI keeps 12 KiB batch default and AGY MCP keeps 9,000 B hard clamp.
+        let batch_q = Json::Arr(vec![
+            Json::Str(".:tok_a_".into()),
+            Json::Str(".:tok_b_".into()),
+            Json::Str(".:tok_c_".into()),
+            Json::Str(".:tok_d_".into()),
+        ]);
+        let agy_search_batch = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("search".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("q", batch_q.clone()),
+            ]),
+        );
+        assert_eq!(agy_search_batch.get_bool("ok"), Some(true));
+        let agy_search_batch_txt = agy_search_batch.get_str("text").unwrap();
+        assert!(
+            agy_search_batch_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "agy cli batch search len={}",
+            agy_search_batch_txt.len()
+        );
+
+        let agy_search_single = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("search".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("query", Json::Str("pad_0123456789".into())),
+                ("max_results", Json::Int(120)),
+                ("detail", Json::Str("scopes".into())),
+            ]),
+        );
+        assert_eq!(agy_search_single.get_bool("ok"), Some(true));
+        let agy_search_single_txt = agy_search_single.get_str("text").unwrap();
+        assert!(
+            agy_search_single_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "agy cli single search len={}",
+            agy_search_single_txt.len()
+        );
+
+        let agy_search_explicit = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("search".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("max_bytes", Json::Int(MAX_CLI_SEARCH_RESPONSE_BYTES as i64)),
+                ("q", batch_q.clone()),
+            ]),
+        );
+        assert_eq!(agy_search_explicit.get_bool("ok"), Some(true));
+        let agy_search_explicit_len = agy_search_explicit.get_str("text").unwrap().len();
+        assert!(
+            agy_search_explicit_len > AGY_CLI_DEFAULT_MAX_BYTES
+                && agy_search_explicit_len <= MAX_CLI_SEARCH_RESPONSE_BYTES,
+            "agy cli explicit search len={agy_search_explicit_len}"
+        );
+
+        let codex_search_batch = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("search".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(other_tok.clone())),
+                ("q", batch_q.clone()),
+            ]),
+        );
+        assert_eq!(codex_search_batch.get_bool("ok"), Some(true));
+        let codex_search_len = codex_search_batch.get_str("text").unwrap().len();
+        assert!(
+            codex_search_len > AGY_CLI_DEFAULT_MAX_BYTES
+                && codex_search_len <= CLI_BATCH_SEARCH_BYTES,
+            "non-agy cli batch search must preserve 12 KiB default, got len={codex_search_len}"
+        );
+
+        let mcp_search_batch = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("search".into())),
+                ("host", Json::Str("agy".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("max_bytes", Json::Int(MAX_CLI_SEARCH_RESPONSE_BYTES as i64)),
+                ("q", batch_q),
+            ]),
+        );
+        assert_eq!(mcp_search_batch.get_bool("ok"), Some(true));
+        assert!(
+            mcp_search_batch.get_str("text").unwrap().len() <= AGY_MCP_DEFAULT_MAX_BYTES,
+            "agy mcp search must stay hard-clamped at 9,000 B"
+        );
+
+        // Memo (`pack_get`): AGY CLI defaults to 9,200 B, respects explicit `--max-bytes`,
+        // and non-AGY CLI preserves 32 KiB default.
+        let pack_put = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("pack".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("topic", Json::Str("bigpack".into())),
+                ("paths", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+            ]),
+        );
+        assert_eq!(pack_put.get_bool("ok"), Some(true), "{pack_put:?}");
+
+        let agy_pack = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("pack_get".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("topic", Json::Str("bigpack".into())),
+            ]),
+        );
+        assert_eq!(agy_pack.get_bool("ok"), Some(true));
+        let agy_pack_len = agy_pack.get_str("text").unwrap().len();
+        assert!(
+            agy_pack_len <= AGY_CLI_DEFAULT_MAX_BYTES + 128,
+            "agy cli pack_get len={agy_pack_len}"
+        );
+
+        let agy_pack_big = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("pack_get".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("topic", Json::Str("bigpack".into())),
+                ("force", Json::Bool(true)),
+                ("max_bytes", Json::Int(32_768)),
+            ]),
+        );
+        assert_eq!(agy_pack_big.get_bool("ok"), Some(true));
+        assert!(agy_pack_big.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP);
+
+        let codex_pack = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("memo".into())),
+                ("action", Json::Str("pack_get".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(other_tok.clone())),
+                ("topic", Json::Str("bigpack".into())),
+            ]),
+        );
+        assert_eq!(codex_pack.get_bool("ok"), Some(true));
+        assert!(
+            codex_pack.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP,
+            "non-agy cli pack_get must preserve 32 KiB default"
+        );
+        assert_eq!(
+            effective_host_max_bytes(&Json::obj(vec![]), false, true, 32_768),
+            AGY_CLI_DEFAULT_MAX_BYTES
+        );
+        assert_eq!(
+            effective_host_max_bytes(&Json::obj(vec![]), false, false, 32_768),
+            32_768
+        );
+
+        // Impact: AGY CLI defaults to 9,200 B, respects explicit `--max-bytes`,
+        // and non-AGY CLI preserves 1 MiB default.
+        let agy_impact = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("impact".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("targets", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+                ("max_callers", Json::Int(50)),
+                ("include_git_status", Json::Bool(false)),
+            ]),
+        );
+        assert_eq!(agy_impact.get_bool("ok"), Some(true));
+        let agy_impact_len = agy_impact.get_str("text").unwrap().len();
+        assert!(
+            agy_impact_len <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "agy cli impact len={agy_impact_len}"
+        );
+
+        let agy_impact_big = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("impact".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(agy_tok.clone())),
+                ("targets", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+                ("max_callers", Json::Int(50)),
+                ("max_bytes", Json::Int(65_536)),
+                ("include_git_status", Json::Bool(false)),
+            ]),
+        );
+        assert_eq!(agy_impact_big.get_bool("ok"), Some(true));
+        assert!(agy_impact_big.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP);
+
+        let codex_impact = execute_request(
+            &svc,
+            &Json::obj(vec![
+                ("op", Json::Str("impact".into())),
+                ("cwd", Json::Str(cwd_str.clone())),
+                ("cli_token", Json::Str(other_tok.clone())),
+                ("targets", Json::Arr(vec![Json::Str("big.rs#huge_fn".into())])),
+                ("max_callers", Json::Int(50)),
+                ("include_git_status", Json::Bool(false)),
+            ]),
+        );
+        assert_eq!(codex_impact.get_bool("ok"), Some(true));
+        assert!(
+            codex_impact.get_str("text").unwrap().len() > AGY_CLI_INLINE_CAP,
+            "non-agy cli impact must preserve 1 MiB default"
+        );
+
         // Explicit `--max-bytes` is respected on `agy:` CliLease (clamped to 1 MiB)
         let agy_sym_big = execute_request(
             &svc,
@@ -1218,7 +1458,7 @@ mod tests {
             DEFAULT_READ_MAX_BYTES
         );
 
-        // (b) `agy:` CliLease explicit `--max-bytes` returning > 14,800 B must NOT poison dedup
+        // (b) `agy:` CliLease explicit `--max-bytes` returning > 9,600 B must NOT poison dedup
         let oversized = execute_request(
             &svc,
             &Json::obj(vec![
@@ -1250,7 +1490,7 @@ mod tests {
             "oversized AGY CLI read must not poison SessionState: {followup_txt}"
         );
 
-        // Once read inline (<= 14,800 B), subsequent read deduplicates normally
+        // Once read inline (<= 9,600 B), subsequent read deduplicates normally
         let dedup = execute_request(
             &svc,
             &Json::obj(vec![

@@ -180,10 +180,264 @@ fn build_symbols_request(
     Json::obj(fields)
 }
 
+const GIT_USAGE: &str = "Usage: ctx git [diff|status|log|show] [options] [--] [paths...]\n\
+Options:\n\
+  --staged, --cached    Diff staged changes\n\
+  --stat                Show diffstat summary only\n\
+  --rev <ref>           Revision or range (required for show)\n\
+  --symbol, -S <sym>    Filter log commits matching symbol\n\
+  --limit, -n <n>       Max commits for log (default: 10)\n\
+  --max-bytes <n>       Max output bytes (default: 8192)\n\
+  --hashes/--no-hashes  Include/omit line hashes (default: on)\n\
+  --session <id>        Session identifier\n\
+  -h, --help            Show this help";
+
+const MEMO_USAGE: &str = "Usage: ctx memo <action> [options] [paths...]\n\
+Actions: put | get | list | clear | changes | pack | pack-get | packs\n\
+Options:\n\
+  --topic, -t <key>     Memo topic or pack name\n\
+  --summary, -s <text>  Memo or pack summary\n\
+  --kind <kind>         Optional memo kind\n\
+  --since-seq <n>       Start sequence for changes\n\
+  --max-bytes <n>       Max output bytes (pack-get)\n\
+  --force               Force full pack re-delivery\n\
+  --raw                 Disable doc/config compaction\n\
+  --session <id>        Session identifier\n\
+  -h, --help            Show this help";
+
+#[derive(Debug)]
+enum CliParse<T> {
+    Request(T),
+    Help(&'static str),
+    Error(String),
+}
+
+fn build_git_request<F>(args: &[String], cwd: String, session_fields: F) -> CliParse<Json>
+where
+    F: FnOnce(Option<&str>) -> Vec<(&'static str, Json)>,
+{
+    if matches!(args.first().map(String::as_str), Some("--help" | "-h" | "help")) {
+        return CliParse::Help(GIT_USAGE);
+    }
+    let mut action = "diff".to_string();
+    let mut rev: Option<String> = None;
+    let mut staged = false;
+    let mut stat = false;
+    let mut hashes = true;
+    let mut limit: i64 = 10;
+    let mut max_bytes: i64 = 8192;
+    let mut symbol: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut paths = Vec::new();
+    let mut i = 0;
+    if let Some(first) = args.first() {
+        if matches!(first.as_str(), "diff" | "status" | "log" | "show") {
+            action = first.clone();
+            i = 1;
+        }
+    }
+    let mut after_dd = false;
+    while i < args.len() {
+        if !after_dd {
+            match args[i].as_str() {
+                "--help" | "-h" => return CliParse::Help(GIT_USAGE),
+                "--" => {
+                    after_dd = true;
+                    i += 1;
+                    continue;
+                }
+                "--staged" | "--cached" => staged = true,
+                "--stat" => stat = true,
+                "--no-hashes" => hashes = false,
+                "--hashes" => hashes = true,
+                "--rev" => {
+                    if i + 1 >= args.len() {
+                        return CliParse::Error("ctx git: missing value for --rev".to_string());
+                    }
+                    i += 1;
+                    rev = Some(args[i].clone());
+                }
+                "--symbol" | "-S" => {
+                    if i + 1 >= args.len() {
+                        return CliParse::Error(format!("ctx git: missing value for {}", args[i]));
+                    }
+                    i += 1;
+                    symbol = Some(args[i].clone());
+                }
+                "--limit" | "-n" => {
+                    if i + 1 >= args.len() {
+                        return CliParse::Error(format!("ctx git: missing value for {}", args[i]));
+                    }
+                    i += 1;
+                    if let Ok(v) = args[i].parse::<i64>() {
+                        limit = v;
+                    }
+                }
+                "--max-bytes" => {
+                    if i + 1 >= args.len() {
+                        return CliParse::Error(
+                            "ctx git: missing value for --max-bytes".to_string(),
+                        );
+                    }
+                    i += 1;
+                    if let Ok(v) = args[i].parse::<i64>() {
+                        max_bytes = v;
+                    }
+                }
+                "--session" => {
+                    if i + 1 >= args.len() {
+                        return CliParse::Error("ctx git: missing value for --session".to_string());
+                    }
+                    i += 1;
+                    session = Some(args[i].clone());
+                }
+                other if other.starts_with('-') => {
+                    return CliParse::Error(format!(
+                        "ctx git: unknown flag '{other}'; supported: --stat, --staged, --rev <ref>, --symbol <sym>, --limit <n>, --max-bytes <n>, [--] [paths...]"
+                    ));
+                }
+                other => {
+                    if action == "show" && rev.is_none() {
+                        rev = Some(other.to_string());
+                    } else {
+                        paths.push(Json::Str(other.to_string()));
+                    }
+                }
+            }
+        } else {
+            paths.push(Json::Str(args[i].clone()));
+        }
+        i += 1;
+    }
+    let mut fields = vec![
+        ("op", Json::Str("git".to_string())),
+        ("cwd", Json::Str(cwd)),
+        ("action", Json::Str(action)),
+        ("staged", Json::Bool(staged)),
+        ("stat", Json::Bool(stat)),
+        ("hashes", Json::Bool(hashes)),
+        ("limit", Json::Int(limit)),
+        ("max_bytes", Json::Int(max_bytes)),
+        ("paths", Json::Arr(paths)),
+    ];
+    if let Some(r) = rev {
+        fields.push(("rev", Json::Str(r)));
+    }
+    if let Some(s) = symbol {
+        fields.push(("symbol", Json::Str(s)));
+    }
+    fields.extend(session_fields(session.as_deref()));
+    CliParse::Request(Json::obj(fields))
+}
+
+fn build_memo_request<F>(args: &[String], cwd: String, session_fields: F) -> CliParse<Json>
+where
+    F: FnOnce(Option<&str>) -> Vec<(&'static str, Json)>,
+{
+    let raw_action = args.first().map(|s| s.as_str()).unwrap_or("list");
+    if matches!(raw_action, "--help" | "-h" | "help") {
+        return CliParse::Help(MEMO_USAGE);
+    }
+    let action = if raw_action == "pack-get" {
+        "pack_get"
+    } else {
+        raw_action
+    };
+    let mut topic = String::new();
+    let mut summary = String::new();
+    let mut kind = None;
+    let mut since_seq: Option<i64> = None;
+    let mut force = false;
+    let mut raw = false;
+    let mut max_bytes: Option<i64> = None;
+    let mut session: Option<String> = None;
+    let mut paths = Vec::new();
+    let mut after_dd = false;
+    let mut i = 1;
+    while i < args.len() {
+        if !after_dd {
+            match args[i].as_str() {
+                "--help" | "-h" if paths.is_empty() => return CliParse::Help(MEMO_USAGE),
+                "--" => {
+                    after_dd = true;
+                    i += 1;
+                    continue;
+                }
+                "--topic" | "-t" if i + 1 < args.len() => {
+                    i += 1;
+                    topic = args[i].clone();
+                }
+                "--summary" | "-s" if i + 1 < args.len() => {
+                    i += 1;
+                    summary = args[i].clone();
+                }
+                "--kind" if i + 1 < args.len() => {
+                    i += 1;
+                    kind = Some(args[i].clone());
+                }
+                "--since-seq" if i + 1 < args.len() => {
+                    i += 1;
+                    if let Ok(v) = args[i].parse::<i64>() {
+                        since_seq = Some(v);
+                    }
+                }
+                "--max-bytes" if i + 1 < args.len() => {
+                    i += 1;
+                    if let Ok(v) = args[i].parse::<i64>() {
+                        max_bytes = Some(v);
+                    }
+                }
+                "--session" if i + 1 < args.len() => {
+                    i += 1;
+                    session = Some(args[i].clone());
+                }
+                "--force" => force = true,
+                "--raw" => raw = true,
+                "--author" | "-a" if i + 1 < args.len() => {
+                    // Legacy callers may still supply a label; it is not provenance.
+                    i += 1;
+                }
+                other => {
+                    if matches!(action, "get" | "pack" | "pack_get") && topic.is_empty() {
+                        topic = other.to_string();
+                    } else {
+                        paths.push(Json::Str(other.to_string()));
+                    }
+                }
+            }
+        } else {
+            paths.push(Json::Str(args[i].clone()));
+        }
+        i += 1;
+    }
+    let mut fields = vec![
+        ("op", Json::Str("memo".to_string())),
+        ("cwd", Json::Str(cwd)),
+        ("action", Json::Str(action.to_string())),
+        ("topic", Json::Str(topic)),
+        ("summary", Json::Str(summary)),
+        ("kind", kind.map(Json::Str).unwrap_or(Json::Null)),
+        ("paths", Json::Arr(paths)),
+        ("force", Json::Bool(force)),
+        ("raw", Json::Bool(raw)),
+    ];
+    if let Some(seq) = since_seq {
+        fields.push(("since_seq", Json::Int(seq)));
+    }
+    if let Some(mb) = max_bytes {
+        fields.push(("max_bytes", Json::Int(mb)));
+    }
+    fields.extend(session_fields(session.as_deref()));
+    CliParse::Request(Json::obj(fields))
+}
+
 fn extract_cli_session_flag(args: &[String]) -> Option<&str> {
     let mut out = None;
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--" {
+            break;
+        }
         if args[i] == "--session" && i + 1 < args.len() {
             i += 1;
             out = Some(args[i].as_str());
@@ -322,8 +576,9 @@ pub fn dispatch(args: &[String]) -> i32 {
         }
         "outline" => {
             let mut max_files: i64 = 40;
-            let mut max_bytes: i64 = 0;
+            let mut max_bytes: Option<i64> = None;
             let mut max_symbols: i64 = 0;
+            let mut session: Option<String> = None;
             let mut paths = Vec::new();
             let mut i = 1;
             while i < args.len() {
@@ -335,26 +590,33 @@ pub fn dispatch(args: &[String]) -> i32 {
                 } else if args[i] == "--max-bytes" && i + 1 < args.len() {
                     i += 1;
                     if let Ok(v) = args[i].parse::<i64>() {
-                        max_bytes = v;
+                        max_bytes = Some(v);
                     }
                 } else if args[i] == "--max-symbols" && i + 1 < args.len() {
                     i += 1;
                     if let Ok(v) = args[i].parse::<i64>() {
                         max_symbols = v;
                     }
+                } else if args[i] == "--session" && i + 1 < args.len() {
+                    i += 1;
+                    session = Some(args[i].clone());
                 } else {
                     paths.push(Json::Str(args[i].clone()));
                 }
                 i += 1;
             }
-            let reply = call_daemon_or_inproc(Json::obj(vec![
+            let mut fields = vec![
                 ("op", Json::Str("outline".to_string())),
                 ("cwd", Json::Str(workspace_cwd_str(None))),
                 ("max_files", Json::Int(max_files)),
-                ("max_bytes", Json::Int(max_bytes)),
                 ("max_symbols", Json::Int(max_symbols)),
                 ("paths", Json::Arr(paths)),
-            ]));
+            ];
+            if let Some(mb) = max_bytes {
+                fields.push(("max_bytes", Json::Int(mb)));
+            }
+            fields.extend(cli_session_fields(session.as_deref()));
+            let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
         "inspect" => {
@@ -587,87 +849,26 @@ pub fn dispatch(args: &[String]) -> i32 {
             let reply = call_daemon_or_inproc(Json::obj(fields));
             print_reply(&reply)
         }
-        "git" => {
-            let mut action = "diff".to_string();
-            let mut rev: Option<String> = None;
-            let mut staged = false;
-            let mut stat = false;
-            let mut hashes = true;
-            let mut limit: i64 = 10;
-            let mut max_bytes: i64 = 8192;
-            let mut symbol: Option<String> = None;
-            let mut session: Option<String> = None;
-            let mut paths = Vec::new();
-            let mut i = 1;
-            if let Some(first) = args.get(1) {
-                if matches!(first.as_str(), "diff" | "status" | "log" | "show") {
-                    action = first.clone();
-                    i = 2;
-                }
+        "git" => match build_git_request(&args[1..], workspace_cwd_str(None), cli_session_fields) {
+            CliParse::Help(usage) => {
+                println!("{usage}");
+                0
             }
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--staged" | "--cached" => staged = true,
-                    "--stat" => stat = true,
-                    "--no-hashes" => hashes = false,
-                    "--hashes" => hashes = true,
-                    "--rev" if i + 1 < args.len() => {
-                        i += 1;
-                        rev = Some(args[i].clone());
-                    }
-                    "--symbol" | "-S" if i + 1 < args.len() => {
-                        i += 1;
-                        symbol = Some(args[i].clone());
-                    }
-                    "--limit" | "-n" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            limit = v;
-                        }
-                    }
-                    "--max-bytes" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            max_bytes = v;
-                        }
-                    }
-                    "--session" if i + 1 < args.len() => {
-                        i += 1;
-                        session = Some(args[i].clone());
-                    }
-                    other => {
-                        if action == "show" && rev.is_none() {
-                            rev = Some(other.to_string());
-                        } else {
-                            paths.push(Json::Str(other.to_string()));
-                        }
-                    }
-                }
-                i += 1;
+            CliParse::Error(error) => {
+                eprintln!("{error}");
+                2
             }
-            let mut fields = vec![
-                ("op", Json::Str("git".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("action", Json::Str(action)),
-                ("staged", Json::Bool(staged)),
-                ("stat", Json::Bool(stat)),
-                ("hashes", Json::Bool(hashes)),
-                ("limit", Json::Int(limit)),
-                ("max_bytes", Json::Int(max_bytes)),
-                ("paths", Json::Arr(paths)),
-            ];
-            if let Some(r) = rev {
-                fields.push(("rev", Json::Str(r)));
+            CliParse::Request(request) => {
+                let reply = call_daemon_or_inproc(request);
+                print_reply(&reply)
             }
-            if let Some(s) = symbol {
-                fields.push(("symbol", Json::Str(s)));
+        },
+        "search" => match search_args::parse_search_cli_action(&args[1..]) {
+            Ok(search_args::SearchCliAction::Help(usage)) => {
+                println!("{usage}");
+                0
             }
-            fields.extend(cli_session_fields(session.as_deref()));
-            let reply = call_daemon_or_inproc(Json::obj(fields));
-            print_reply(&reply)
-        }
-        "search" => match search_args::parse_search_cli(&args[1..]) {
-            Ok(request) => {
+            Ok(search_args::SearchCliAction::Request(request)) => {
                 let reply = call_daemon_or_inproc(request);
                 if let Some(text) = reply.get_str("text") {
                     print!("{text}");
@@ -681,90 +882,21 @@ pub fn dispatch(args: &[String]) -> i32 {
                 2
             }
         },
-        "memo" => {
-            let raw_action = args.get(1).map(|s| s.as_str()).unwrap_or("list");
-            let action = if raw_action == "pack-get" {
-                "pack_get"
-            } else {
-                raw_action
-            };
-            let mut topic = String::new();
-            let mut summary = String::new();
-            let mut kind = None;
-            let mut since_seq: Option<i64> = None;
-            let mut force = false;
-            let mut raw = false;
-            let mut max_bytes: Option<i64> = None;
-            let mut session: Option<String> = None;
-            let mut paths = Vec::new();
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--topic" | "-t" if i + 1 < args.len() => {
-                        i += 1;
-                        topic = args[i].clone();
-                    }
-                    "--summary" | "-s" if i + 1 < args.len() => {
-                        i += 1;
-                        summary = args[i].clone();
-                    }
-                    "--kind" if i + 1 < args.len() => {
-                        i += 1;
-                        kind = Some(args[i].clone());
-                    }
-                    "--since-seq" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            since_seq = Some(v);
-                        }
-                    }
-                    "--max-bytes" if i + 1 < args.len() => {
-                        i += 1;
-                        if let Ok(v) = args[i].parse::<i64>() {
-                            max_bytes = Some(v);
-                        }
-                    }
-                    "--session" if i + 1 < args.len() => {
-                        i += 1;
-                        session = Some(args[i].clone());
-                    }
-                    "--force" => force = true,
-                    "--raw" => raw = true,
-                    "--author" | "-a" if i + 1 < args.len() => {
-                        // Legacy callers may still supply a label; it is not provenance.
-                        i += 1;
-                    }
-                    other => {
-                        if matches!(action, "pack" | "pack_get") && topic.is_empty() {
-                            topic = other.to_string();
-                        } else {
-                            paths.push(Json::Str(other.to_string()));
-                        }
-                    }
-                }
-                i += 1;
+        "memo" => match build_memo_request(&args[1..], workspace_cwd_str(None), cli_session_fields)
+        {
+            CliParse::Help(usage) => {
+                println!("{usage}");
+                0
             }
-            let mut fields = vec![
-                ("op", Json::Str("memo".to_string())),
-                ("cwd", Json::Str(workspace_cwd_str(None))),
-                ("action", Json::Str(action.to_string())),
-                ("topic", Json::Str(topic)),
-                ("summary", Json::Str(summary)),
-                ("kind", kind.map(Json::Str).unwrap_or(Json::Null)),
-                ("paths", Json::Arr(paths)),
-                ("force", Json::Bool(force)),
-                ("raw", Json::Bool(raw)),
-            ];
-            if let Some(seq) = since_seq {
-                fields.push(("since_seq", Json::Int(seq)));
+            CliParse::Error(error) => {
+                eprintln!("{error}");
+                2
             }
-            if let Some(mb) = max_bytes {
-                fields.push(("max_bytes", Json::Int(mb)));
+            CliParse::Request(request) => {
+                let reply = call_daemon_or_inproc(request);
+                print_reply(&reply)
             }
-            fields.extend(cli_session_fields(session.as_deref()));
-            let reply = call_daemon_or_inproc(Json::obj(fields));
-            print_reply(&reply)
-        }
+        },
         "elf" | "elf-audit" => {
             let mut elf_path = String::new();
             let mut asm_path: Option<String> = None;
@@ -918,7 +1050,7 @@ fn print_usage() {
          \x20 ctx impact <Mod#Symbol...> [--max-callers 20] [--no-tests] [--no-git] [--session ID] [--max-bytes N]\n\
          \x20 ctx edit [--dry-run] [--session ID] --json '<payload>'\n\
          \x20 ctx refactor <old_name> <new_name> <paths...> [--session ID] [--apply]\n\
-         \x20 ctx git [diff|status|log|show] [--staged] [--stat] [--rev R] [--symbol S] [--no-hashes] [--session ID] [paths...]\n\
+         \x20 ctx git [diff|status|log|show] [--staged] [--stat] [--rev R] [--symbol S] [--no-hashes] [--session ID] [--] [paths...]\n\
          \x20 ctx diag [--file PATH] [--hashes] [--max-errors 15] [--context 2] [-- <cmd> [args...]]\n\
          \x20 ctx memo <put|get|list|clear|changes|pack|pack-get|packs> [--topic K] [--summary S] [--since-seq N] [--session ID] [paths...]\n\
          \x20 ctx capsule <claim|prepare> [key] [--assignment TEXT] [--workspace inherit|branch|share]\n\
@@ -942,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_read_inspect_sym_omit_default_max_bytes_attach_lease_and_hit_agy_cli_14k_cap() {
+    fn cli_read_inspect_sym_omit_default_max_bytes_attach_lease_and_hit_agy_cli_9200b_cap() {
         let dir = std::env::temp_dir().join(format!(
             "ctx-cli-rpc-agy-{}-{}",
             std::process::id(),
@@ -1013,13 +1145,13 @@ mod tests {
         assert!(sym_req.get("max_bytes").is_none());
         assert_eq!(sym_req.get_str("cli_token"), Some(tok.as_str()));
 
-        // 2. End-to-end CLI-to-RPC execution applies the 14,000 B default cap on all 3 ops
+        // 2. End-to-end CLI-to-RPC execution applies the 9,200 B default cap on all 3 ops
         //    and respects explicit `--max-bytes`.
         let r_read = execute_request(&svc, &read_req);
         let r_read_txt = r_read.get_str("text").unwrap();
         assert!(
             r_read_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES
-                && r_read_txt.contains("AGY CLI inline cap"),
+                && r_read_txt.contains("AGY CLI inline cap 9200B"),
             "len={}",
             r_read_txt.len()
         );
@@ -1042,5 +1174,130 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_git_memo_search_help_double_dash_and_unknown_flag_handling() {
+        let no_sess = |s: Option<&str>| cli_session_fields_from(s, None, None);
+
+        // `ctx git diff --stat -- src/a.hpp` strips `--` and passes only `src/a.hpp`.
+        let parsed = build_git_request(
+            &svec(&["diff", "--stat", "--", "src/a.hpp"]),
+            "/tmp".into(),
+            no_sess,
+        );
+        match parsed {
+            CliParse::Request(req) => {
+                assert_eq!(req.get_str("action"), Some("diff"));
+                assert_eq!(req.get_bool("stat"), Some(true));
+                let paths: Vec<&str> = req
+                    .get("paths")
+                    .and_then(Json::as_arr)
+                    .unwrap()
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .collect();
+                assert_eq!(paths, vec!["src/a.hpp"]);
+            }
+            other => panic!("expected git request, got {other:?}"),
+        }
+
+        // `ctx git show HEAD -- src/a.hpp` keeps `rev=HEAD` and puts post-`--` args in `paths`.
+        match build_git_request(
+            &svec(&["show", "HEAD", "--", "src/a.hpp"]),
+            "/tmp".into(),
+            no_sess,
+        ) {
+            CliParse::Request(req) => {
+                assert_eq!(req.get_str("action"), Some("show"));
+                assert_eq!(req.get_str("rev"), Some("HEAD"));
+                let paths: Vec<&str> = req
+                    .get("paths")
+                    .and_then(Json::as_arr)
+                    .unwrap()
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .collect();
+                assert_eq!(paths, vec!["src/a.hpp"]);
+            }
+            other => panic!("expected git show request, got {other:?}"),
+        }
+
+        // `ctx git --help` / `-h` / `help` / `diff --help` return Help and dispatch exits 0.
+        for form in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["diff", "--help"],
+            vec!["diff", "-h"],
+        ] {
+            assert!(
+                matches!(
+                    build_git_request(&svec(&form), "/tmp".into(), no_sess),
+                    CliParse::Help(msg) if msg.contains("ctx git")
+                ),
+                "form={form:?}"
+            );
+        }
+        assert_eq!(dispatch(&svec(&["git", "--help"])), 0);
+        assert_eq!(dispatch(&svec(&["git", "diff", "--help"])), 0);
+
+        // Unknown flags before `--` fail cleanly with exit 2 and supported-flag hint.
+        match build_git_request(&svec(&["diff", "--name-only"]), "/tmp".into(), no_sess) {
+            CliParse::Error(err) => {
+                assert!(
+                    err.contains("unknown flag '--name-only'")
+                        && err.contains("supported: --stat, --staged"),
+                    "err={err}"
+                );
+            }
+            other => panic!("expected error for unknown flag, got {other:?}"),
+        }
+        assert_eq!(dispatch(&svec(&["git", "diff", "--name-only"])), 2);
+
+        // `ctx memo` help handling: action or pre-positional `--help` / `-h`.
+        for form in [
+            vec!["--help"],
+            vec!["-h"],
+            vec!["help"],
+            vec!["pack", "--help"],
+            vec!["pack", "my_pack", "--help"],
+            vec!["put", "-t", "k", "-h"],
+        ] {
+            assert!(
+                matches!(
+                    build_memo_request(&svec(&form), "/tmp".into(), no_sess),
+                    CliParse::Help(msg) if msg.contains("pack-get") && msg.contains("changes")
+                ),
+                "memo form={form:?}"
+            );
+        }
+        assert_eq!(dispatch(&svec(&["memo", "--help"])), 0);
+        assert_eq!(dispatch(&svec(&["memo", "pack", "--help"])), 0);
+
+        // Positional `ctx memo get <topic>` sets `topic` cleanly without requiring `--topic`.
+        match build_memo_request(&svec(&["get", "squad:runtime"]), "/tmp".into(), no_sess) {
+            CliParse::Request(req) => {
+                assert_eq!(req.get_str("action"), Some("get"));
+                assert_eq!(req.get_str("topic"), Some("squad:runtime"));
+            }
+            other => panic!("expected positional memo get request, got {other:?}"),
+        }
+
+        // Value of `--summary "--help"` must not trigger help.
+        match build_memo_request(
+            &svec(&["put", "-t", "k", "--summary", "--help", "src/a.rs"]),
+            "/tmp".into(),
+            no_sess,
+        ) {
+            CliParse::Request(req) => {
+                assert_eq!(req.get_str("summary"), Some("--help"));
+            }
+            other => panic!("expected memo request, got {other:?}"),
+        }
+
+        // `ctx search --help` / `-h` exits 0 cleanly.
+        assert_eq!(dispatch(&svec(&["search", "--help"])), 0);
+        assert_eq!(dispatch(&svec(&["search", "-h"])), 0);
     }
 }

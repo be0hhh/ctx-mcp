@@ -44,8 +44,9 @@ use std::sync::atomic::Ordering;
 pub const DEFAULT_READ_MAX_BYTES: usize = 1_048_576; // 1 MiB
 pub const AGY_MCP_DEFAULT_MAX_BYTES: usize = 9_000; // Fits under Antigravity's ~10 KB MCP inline cap
 pub const AGY_MCP_INLINE_CAP: usize = 9_200;
-pub const AGY_CLI_DEFAULT_MAX_BYTES: usize = 14_000; // Fits under Antigravity's ~15.4 KB run_command inline cap
-pub const AGY_CLI_INLINE_CAP: usize = 14_800;
+pub const AGY_CLI_DEFAULT_MAX_BYTES: usize = 9_200; // Fits under Antigravity's ~10,240 B run_command inline cap (incl. wrapper + PTY CRLF)
+pub const AGY_CLI_INLINE_CAP: usize = 9_600;
+const _: () = assert!(AGY_CLI_INLINE_CAP > AGY_MCP_INLINE_CAP);
 
 pub fn is_safe_shorthand_candidate(raw: &str) -> bool {
     let t = raw.trim().trim_matches('"').trim_matches('\'');
@@ -433,14 +434,46 @@ pub fn materialize_pack_for_workspace(
         body.push('\n');
     }
 
+    let format_rem_note = |rem_sels: &[String]| -> String {
+        if rem_sels.is_empty() {
+            return "... [truncated at max_bytes]\n".to_string();
+        }
+        let mut list = String::new();
+        let mut shown = 0usize;
+        for sel in rem_sels.iter().take(4) {
+            let sep_len = if shown > 0 { 2 } else { 0 };
+            if shown > 0 && list.len() + sep_len + sel.len() > 140 {
+                break;
+            }
+            if shown > 0 {
+                list.push_str(", ");
+            }
+            if sel.len() > 140 {
+                let mut end = 140;
+                while end > 0 && !sel.is_char_boundary(end) {
+                    end -= 1;
+                }
+                list.push_str(&sel[..end]);
+                list.push_str("...");
+            } else {
+                list.push_str(sel);
+            }
+            shown += 1;
+        }
+        let hidden = rem_sels.len().saturating_sub(shown);
+        if hidden > 0 {
+            format!("... [truncated at max_bytes; remaining: {list} (+{hidden} more) — fetch via ctx_symbols]\n")
+        } else {
+            format!("... [truncated at max_bytes; remaining: {list} — fetch via ctx_symbols]\n")
+        }
+    };
+
+    // Reserve room for the `[pack:...]` header (~96B) plus the capped truncation footer (~224B).
+    let body_cap = budget.saturating_sub(320).max(512);
     let mut resolved_ok = 0usize;
     for (idx, sel) in selectors.iter().enumerate() {
-        if body.len() >= budget.saturating_sub(96) {
-            let rem_sels: Vec<&str> = selectors[idx..].iter().map(String::as_str).collect();
-            body.push_str(&format!(
-                "... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
-                rem_sels.join(", ")
-            ));
+        if body.len() >= body_cap {
+            body.push_str(&format_rem_note(&selectors[idx..]));
             break;
         }
         let Some((file_part, anchor_kind)) = parse_pack_selector(sel) else {
@@ -512,13 +545,9 @@ pub fn materialize_pack_for_workspace(
             raw_slice
         };
         let header = format!("=== {label} [L{s_ln}-L{e_ln}] ===\n");
-        let avail = budget.saturating_sub(body.len() + 96);
+        let avail = body_cap.saturating_sub(body.len());
         if header.len() >= avail {
-            let rem_sels: Vec<&str> = selectors[idx..].iter().map(String::as_str).collect();
-            body.push_str(&format!(
-                "... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
-                rem_sels.join(", ")
-            ));
+            body.push_str(&format_rem_note(&selectors[idx..]));
             break;
         }
         body.push_str(&header);
@@ -528,23 +557,20 @@ pub fn materialize_pack_for_workspace(
             if !rendered.ends_with('\n') {
                 body.push('\n');
             }
+            resolved_ok += 1;
         } else {
             let mut cut = rem;
             while cut > 0 && !rendered.is_char_boundary(cut) {
                 cut -= 1;
             }
             body.push_str(&rendered[..cut]);
-            let next_sels: Vec<&str> = selectors[idx + 1..].iter().map(String::as_str).collect();
-            if next_sels.is_empty() {
-                body.push_str("\n... [truncated at max_bytes]\n");
-            } else {
-                body.push_str(&format!(
-                    "\n... [truncated at max_bytes; remaining: {} — fetch via ctx_symbols]\n",
-                    next_sels.join(", ")
-                ));
+            if !body.ends_with('\n') {
+                body.push('\n');
             }
+            body.push_str(&format_rem_note(&selectors[idx + 1..]));
+            resolved_ok += 1;
+            break;
         }
-        resolved_ok += 1;
     }
 
     let digest = crate::base::simd::fast_hash64(&digest_seed);
@@ -650,4 +676,88 @@ pub fn op_status(svc: &BrokerService) -> Json {
         ),
         ("snapshot_exists", Json::Bool(svc.store.snapshot_path.is_file())),
     ])
+}
+
+#[cfg(test)]
+mod pack_cap_tests {
+    use super::*;
+    use crate::rpc::execute_request;
+    use std::fs;
+
+    #[test]
+    fn pack_get_and_agy_cli_outline_strictly_stay_within_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-pack-outline-cap-{}-{}",
+            std::process::id(),
+            crate::store::now_ms_u64()
+        ));
+        let deep = dir.join("src/module_alpha/subsystem_beta/component_gamma");
+        fs::create_dir_all(&deep).unwrap();
+        let mut selectors = Vec::new();
+        for i in 0..16 {
+            let fname = format!("long_component_handler_{i:02}.rs");
+            let mut body = String::new();
+            for j in 0..60 {
+                body.push_str(&format!(
+                    "pub fn handle_event_{i:02}_{j:02}(val: u64) -> u64 {{ val.wrapping_add({j}) }}\n"
+                ));
+            }
+            fs::write(deep.join(&fname), &body).unwrap();
+            selectors.push(format!(
+                "src/module_alpha/subsystem_beta/component_gamma/{fname}:1-60"
+            ));
+        }
+
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        let ws = svc.allowlist.register_hint(&dir, true).unwrap();
+        let ws_key = crate::store::paths::shared_repo_key(&ws);
+        svc.broker
+            .packs
+            .put_pack(&ws_key, "big-pack", selectors, Some("Big pack".into()), "test")
+            .unwrap();
+
+        let rendered = materialize_pack_for_workspace(
+            &svc,
+            &ws,
+            "big-pack",
+            Some("agy:test-pack"),
+            false,
+            false,
+            AGY_CLI_DEFAULT_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(
+            rendered.len() <= AGY_CLI_DEFAULT_MAX_BYTES,
+            "pack_get exceeded budget: {} > {}",
+            rendered.len(),
+            AGY_CLI_DEFAULT_MAX_BYTES
+        );
+        assert_eq!(
+            rendered.matches("truncated at max_bytes").count(),
+            1,
+            "duplicate truncation note in:\n{rendered}"
+        );
+
+        let tok = svc
+            .broker
+            .capsules
+            .issue_cli_lease("agy:outline-worker".into(), ws.clone())
+            .unwrap();
+        let outline_req = Json::obj(vec![
+            ("op", Json::Str("outline".into())),
+            ("cwd", Json::Str(ws.to_string_lossy().into_owned())),
+            ("paths", Json::Arr(vec![Json::Str("src".into())])),
+            ("cli_token", Json::Str(tok)),
+        ]);
+        let outline_res = execute_request(&svc, &outline_req);
+        assert_eq!(outline_res.get_bool("ok"), Some(true), "{outline_res:?}");
+        let outline_txt = outline_res.get_str("text").unwrap();
+        assert!(
+            outline_txt.len() <= AGY_CLI_DEFAULT_MAX_BYTES + 128,
+            "agy cli outline exceeded budget: {}",
+            outline_txt.len()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -488,13 +488,31 @@ mod tests {
             Some("agy-cli-2"), Some(&workspace), Some(crate::engine::AGY_CLI_INLINE_CAP), false,
         ).unwrap();
         assert!(
-            cli_capped.len() <= crate::engine::AGY_CLI_INLINE_CAP
-                && cli_capped.contains("AGY CLI inline cap")
+            cli_capped.len() <= crate::engine::AGY_CLI_DEFAULT_MAX_BYTES
+                && cli_capped.len() <= crate::engine::AGY_CLI_INLINE_CAP
+                && cli_capped.contains("AGY CLI inline cap 9200B")
                 && cli_capped.contains("ctx sym")
                 && cli_capped.contains("--max-bytes")
                 && !cli_capped.contains("read_file"),
             "cli_capped={cli_capped}"
         );
+
+        // 4. Oversized AGY CLI read (> AGY_CLI_INLINE_CAP = 9,600 B) must NOT poison SessionState
+        let cli_oversized = op_read_for_host(
+            &svc, &["small.cpp".into(), "large.cpp".into()], 16_384, false,
+            Some("agy-cli-dedup"), Some(&workspace), Some(crate::engine::AGY_CLI_INLINE_CAP), false,
+        ).unwrap();
+        assert!(cli_oversized.len() > crate::engine::AGY_CLI_INLINE_CAP);
+        let cli_retry = op_read_for_host(
+            &svc, &["small.cpp".into()], crate::engine::AGY_CLI_DEFAULT_MAX_BYTES, false,
+            Some("agy-cli-dedup"), Some(&workspace), Some(crate::engine::AGY_CLI_INLINE_CAP), false,
+        ).unwrap();
+        assert!(cli_retry.contains("small_ok = 1;") && !cli_retry.contains("ALREADY IN CONTEXT"));
+        let cli_dedup = op_read_for_host(
+            &svc, &["small.cpp".into()], crate::engine::AGY_CLI_DEFAULT_MAX_BYTES, false,
+            Some("agy-cli-dedup"), Some(&workspace), Some(crate::engine::AGY_CLI_INLINE_CAP), false,
+        ).unwrap();
+        assert!(cli_dedup.contains("ALREADY IN CONTEXT"));
         fs::remove_dir_all(&workspace).unwrap();
     }
 
