@@ -9,11 +9,13 @@ use super::startup::{
     classify_agy_startup, prewarm_and_build_startup_capsule, AgyStartupKind, StartupChannel,
 };
 use super::{
-    capsule_auto_stage_enabled, delivery_notice, detect_shell_file_slicing, extract_cwd,
-    host_context, is_internal_ide_path, is_workspace_mutating_shell, mcp_context_rewrite,
-    passthrough, register_payload_workspaces, replace_field, workspace_git_redirect_reason,
-    workspace_grep_redirect_reason, AGY_NATIVE_DELIVERY_BYTE_CAP, AGY_NATIVE_LINE_CAP,
-    AGY_WIDEN_MAX_BYTES, AGY_WIDEN_MAX_LINES,
+    capsule_auto_stage_enabled, command_basename, delivery_notice, detect_shell_file_slicing,
+    extract_cwd, extract_git_subcommand, extract_shell_segments_ignoring_echo, host_context,
+    is_env_assignment_token, is_internal_ide_path, is_workspace_mutating_shell,
+    mcp_context_rewrite, passthrough, register_payload_workspaces, replace_field,
+    segment_changes_cwd, segment_has_redirects_or_subshell, split_shell_tokens,
+    split_unquoted_pipes, workspace_git_redirect_reason, workspace_grep_redirect_reason,
+    AGY_NATIVE_DELIVERY_BYTE_CAP, AGY_NATIVE_LINE_CAP, AGY_WIDEN_MAX_BYTES, AGY_WIDEN_MAX_LINES,
 };
 use crate::base::json::{Json, JsonKey};
 use crate::base::security::{is_sensitive_path, is_sensitive_path_with_ws};
@@ -522,53 +524,482 @@ fn agy_capsule_rewrite(
     }
 }
 
-fn detect_broad_source_find(
+fn push_utf8_non_ascii(cmd: &str, bytes: &[u8], i: &mut usize, dst: &mut String) {
+    let start = *i;
+    while *i < bytes.len() && bytes[*i] >= 0x80 {
+        *i += 1;
+    }
+    dst.push_str(&cmd[start..*i]);
+}
+
+/// Quote-aware POSIX shell splitter for `MultiCtxChainGate`.
+/// Joins `\\\n` / `\\\r\n` continuations, respects `'...'`, `"..."`, `$'...'`, `\`, and `#`-comments,
+/// splits top-level commands on unquoted `\n`, `;`, `&&`, `||`, and keeps only the primary command
+/// tokens of each segment (ignoring downstream pipe stages and redirect targets).
+fn split_chain_commands(cmd: &str) -> Vec<Vec<String>> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut cmds: Vec<Vec<String>> = Vec::new();
+    let mut cur_cmd: Vec<String> = Vec::new();
+    let mut cur_tok = String::new();
+    let mut in_tok = false;
+    let mut skip_pipe_rest = false;
+    let mut skip_next_tok = false;
+
+    let flush_tok = |cur_tok: &mut String,
+                     in_tok: &mut bool,
+                     cur_cmd: &mut Vec<String>,
+                     skip_pipe_rest: bool,
+                     skip_next_tok: &mut bool| {
+        if *in_tok {
+            let tok = std::mem::take(cur_tok);
+            *in_tok = false;
+            if *skip_next_tok {
+                *skip_next_tok = false;
+            } else if !skip_pipe_rest {
+                cur_cmd.push(tok);
+            }
+        }
+    };
+
+    let flush_cmd = |cur_cmd: &mut Vec<String>,
+                     cmds: &mut Vec<Vec<String>>,
+                     skip_pipe_rest: &mut bool,
+                     skip_next_tok: &mut bool| {
+        if !cur_cmd.is_empty() {
+            cmds.push(std::mem::take(cur_cmd));
+        }
+        *skip_pipe_rest = false;
+        *skip_next_tok = false;
+    };
+
+    while i < len {
+        let b = bytes[i];
+        if b >= 0x80 {
+            push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+            in_tok = true;
+            continue;
+        }
+        if matches!(b, b' ' | b'\t' | b'\r') {
+            flush_tok(
+                &mut cur_tok,
+                &mut in_tok,
+                &mut cur_cmd,
+                skip_pipe_rest,
+                &mut skip_next_tok,
+            );
+            i += 1;
+            continue;
+        }
+        if b == b'#' && !in_tok {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\n' || b == b';' {
+            flush_tok(
+                &mut cur_tok,
+                &mut in_tok,
+                &mut cur_cmd,
+                skip_pipe_rest,
+                &mut skip_next_tok,
+            );
+            flush_cmd(&mut cur_cmd, &mut cmds, &mut skip_pipe_rest, &mut skip_next_tok);
+            i += 1;
+            continue;
+        }
+        if b == b'&' && bytes.get(i + 1) == Some(&b'&') {
+            flush_tok(
+                &mut cur_tok,
+                &mut in_tok,
+                &mut cur_cmd,
+                skip_pipe_rest,
+                &mut skip_next_tok,
+            );
+            flush_cmd(&mut cur_cmd, &mut cmds, &mut skip_pipe_rest, &mut skip_next_tok);
+            i += 2;
+            continue;
+        }
+        if b == b'|' {
+            flush_tok(
+                &mut cur_tok,
+                &mut in_tok,
+                &mut cur_cmd,
+                skip_pipe_rest,
+                &mut skip_next_tok,
+            );
+            if bytes.get(i + 1) == Some(&b'|') {
+                flush_cmd(&mut cur_cmd, &mut cmds, &mut skip_pipe_rest, &mut skip_next_tok);
+                i += 2;
+            } else {
+                skip_pipe_rest = true;
+                skip_next_tok = false;
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'(' && cur_cmd.is_empty() && !in_tok {
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            flush_tok(
+                &mut cur_tok,
+                &mut in_tok,
+                &mut cur_cmd,
+                skip_pipe_rest,
+                &mut skip_next_tok,
+            );
+            i += 1;
+            continue;
+        }
+        if b == b'>' || b == b'<' || (b == b'&' && bytes.get(i + 1) == Some(&b'>')) {
+            if in_tok && cur_tok.bytes().all(|d| d.is_ascii_digit()) {
+                cur_tok.clear();
+                in_tok = false;
+            } else {
+                flush_tok(
+                    &mut cur_tok,
+                    &mut in_tok,
+                    &mut cur_cmd,
+                    skip_pipe_rest,
+                    &mut skip_next_tok,
+                );
+            }
+            let leading_amp = b == b'&';
+            if leading_amp {
+                i += 1;
+            }
+            while i < len && matches!(bytes[i], b'>' | b'<') {
+                i += 1;
+            }
+            if !leading_amp && bytes.get(i) == Some(&b'&') {
+                i += 1;
+                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'-') {
+                    i += 1;
+                }
+            } else {
+                skip_next_tok = true;
+            }
+            continue;
+        }
+        if b == b'$' && bytes.get(i + 1) == Some(&b'\'') {
+            in_tok = true;
+            i += 2;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                    continue;
+                }
+                if c == b'\\' && i + 1 < len {
+                    i += 1;
+                    if bytes[i] >= 0x80 {
+                        push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                    } else {
+                        cur_tok.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if c == b'\'' {
+                    i += 1;
+                    break;
+                }
+                cur_tok.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\'' {
+            in_tok = true;
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                    continue;
+                }
+                if c == b'\'' {
+                    i += 1;
+                    break;
+                }
+                cur_tok.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_tok = true;
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                    continue;
+                }
+                if c == b'\\' {
+                    if bytes.get(i + 1) == Some(&b'\n') {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                        i += 3;
+                        continue;
+                    }
+                    if i + 1 < len {
+                        i += 1;
+                        if bytes[i] >= 0x80 {
+                            push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                        } else {
+                            cur_tok.push(bytes[i] as char);
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                if c == b'"' {
+                    i += 1;
+                    break;
+                }
+                cur_tok.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\\' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                flush_tok(
+                    &mut cur_tok,
+                    &mut in_tok,
+                    &mut cur_cmd,
+                    skip_pipe_rest,
+                    &mut skip_next_tok,
+                );
+                i += 2;
+                continue;
+            }
+            if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                flush_tok(
+                    &mut cur_tok,
+                    &mut in_tok,
+                    &mut cur_cmd,
+                    skip_pipe_rest,
+                    &mut skip_next_tok,
+                );
+                i += 3;
+                continue;
+            }
+            if i + 1 < len {
+                in_tok = true;
+                i += 1;
+                if bytes[i] >= 0x80 {
+                    push_utf8_non_ascii(cmd, bytes, &mut i, &mut cur_tok);
+                } else {
+                    cur_tok.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        cur_tok.push(b as char);
+        in_tok = true;
+        i += 1;
+    }
+
+    flush_tok(
+        &mut cur_tok,
+        &mut in_tok,
+        &mut cur_cmd,
+        skip_pipe_rest,
+        &mut skip_next_tok,
+    );
+    flush_cmd(&mut cur_cmd, &mut cmds, &mut skip_pipe_rest, &mut skip_next_tok);
+    cmds
+}
+
+fn is_heavy_ctx_invocation(args: &[String]) -> bool {
+    let mut idx = 0usize;
+    while idx < args.len() && args[idx].starts_with('-') {
+        idx += 1;
+    }
+    let Some(sub) = args.get(idx).map(String::as_str) else {
+        return false;
+    };
+    if args[idx + 1..].iter().any(|a| a == "--help" || a == "-h") {
+        return false;
+    }
+    match sub {
+        "read" | "inspect" | "outline" | "sym" | "symbols" | "search" | "git" | "impact" => true,
+        "memo" => {
+            let mut midx = idx + 1;
+            while midx < args.len() && args[midx].starts_with('-') {
+                midx += 1;
+            }
+            match args.get(midx).map(String::as_str) {
+                None => true,
+                Some("changes" | "list" | "get" | "pack-get" | "pack_get" | "packs") => true,
+                Some(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_raw_inspect_command(prog: &str, args: &[String]) -> bool {
+    if matches!(prog, "grep" | "egrep" | "fgrep" | "rg" | "find") {
+        return true;
+    }
+    if matches!(prog, "git" | "git.exe") {
+        return matches!(
+            extract_git_subcommand(args),
+            Some("status" | "diff" | "log" | "show" | "grep")
+        );
+    }
+    false
+}
+
+/// Detects chained heavy `ctx` commands (`heavy_ctx >= 2`) or a heavy `ctx` command combined with
+/// a separate raw inspection command (`git` read-only / `grep` / `rg` / `find`) in one shell call.
+fn detect_multi_ctx_chain(cmd: &str) -> Option<(usize, usize)> {
+    let mut heavy_ctx = 0usize;
+    let mut raw_inspect = 0usize;
+    for tokens in split_chain_commands(cmd) {
+        let mut idx = 0usize;
+        while idx < tokens.len() {
+            let tok = tokens[idx].as_str();
+            if is_env_assignment_token(tok)
+                || matches!(
+                    tok,
+                    "time" | "!" | "then" | "do" | "else" | "elif" | "command" | "builtin"
+                )
+            {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        let Some(cmd_tok) = tokens.get(idx) else {
+            continue;
+        };
+        let prog = command_basename(cmd_tok);
+        let args = &tokens[idx + 1..];
+        if matches!(prog, "ctx" | "ctx.exe") {
+            if is_heavy_ctx_invocation(args) {
+                heavy_ctx += 1;
+            }
+        } else if is_raw_inspect_command(prog, args) {
+            raw_inspect += 1;
+        }
+    }
+    if heavy_ctx >= 2 || (heavy_ctx >= 1 && raw_inspect >= 1) {
+        Some((heavy_ctx, raw_inspect))
+    } else {
+        None
+    }
+}
+
+fn is_allowed_broad_find_pipe_stage(stage: &str) -> bool {
+    let Some(tokens) = split_shell_tokens(stage) else {
+        return false;
+    };
+    let Some(cmd_idx) = tokens.iter().position(|t| !is_env_assignment_token(t)) else {
+        return false;
+    };
+    let pipe_prog = command_basename(&tokens[cmd_idx]);
+    if pipe_prog == "sort" {
+        return true;
+    }
+    if pipe_prog == "xargs" {
+        let mut i = cmd_idx + 1;
+        while i < tokens.len() {
+            let tok = tokens[i].as_str();
+            if tok == "--" {
+                i += 1;
+                break;
+            }
+            if matches!(
+                tok,
+                "-d" | "-E"
+                    | "-I"
+                    | "-L"
+                    | "-l"
+                    | "-n"
+                    | "-P"
+                    | "-s"
+                    | "--delimiter"
+                    | "--eof"
+                    | "--replace"
+                    | "--max-lines"
+                    | "--max-args"
+                    | "--max-procs"
+                    | "--max-chars"
+            ) {
+                i += 2;
+                continue;
+            }
+            if tok.starts_with('-') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        return tokens
+            .get(i)
+            .is_some_and(|t| command_basename(t) == "wc");
+    }
+    false
+}
+
+fn detect_single_broad_source_find(
     svc: &BrokerService,
-    cmd: &str,
+    seg: &str,
     cwd: Option<&Path>,
 ) -> Option<Vec<String>> {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty()
-        || trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains("<<")
-        || trimmed.contains(" >")
-        || trimmed.contains(">>")
-        || trimmed.contains("-delete")
-        || trimmed.contains("-exec")
-        || trimmed.contains("-maxdepth 1")
-        || trimmed.contains("-maxdepth 2")
-    {
+    let trimmed = seg.trim();
+    if trimmed.is_empty() || segment_has_redirects_or_subshell(trimmed) {
         return None;
     }
 
-    let stages: Vec<&str> = trimmed.split('|').map(|s| s.trim()).collect();
+    let stages = split_unquoted_pipes(trimmed)?;
     if stages.is_empty() || stages.len() > 2 {
         return None;
     }
-    if stages.len() == 2 {
-        let pipe_prog = stages[1]
-            .split_whitespace()
-            .next()
-            .and_then(|t| Path::new(t).file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if pipe_prog != "sort" {
-            return None;
-        }
-    }
-
-    let tokens: Vec<&str> = stages[0]
-        .split_whitespace()
-        .map(|t| t.trim_matches('"').trim_matches('\''))
-        .collect();
-    if tokens.first().copied() != Some("find") {
+    if stages.len() == 2 && !is_allowed_broad_find_pipe_stage(&stages[1]) {
         return None;
     }
 
+    let tokens = split_shell_tokens(&stages[0])?;
+    if tokens.first().map(|t| command_basename(t)) != Some("find") {
+        return None;
+    }
+
+    let mut idx = 1usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx].as_str();
+        if tok == "-delete" || tok.starts_with("-exec") || tok == "-ok" || tok == "-okdir" {
+            return None;
+        }
+        if tok == "-maxdepth" {
+            if let Some(depth) = tokens.get(idx + 1).map(String::as_str) {
+                if matches!(depth, "0" | "1" | "2") {
+                    return None;
+                }
+            }
+            idx += 2;
+            continue;
+        }
+        if matches!(tok, "-maxdepth0" | "-maxdepth1" | "-maxdepth2") {
+            return None;
+        }
+        idx += 1;
+    }
+
     let mut dir_roots: Vec<(String, PathBuf)> = Vec::new();
-    for &tok in &tokens[1..] {
+    for tok in &tokens[1..] {
+        let tok = tok.as_str();
         if tok.starts_with('-') || tok == "(" || tok == ")" || tok == "!" {
             break;
         }
@@ -600,6 +1031,40 @@ fn detect_broad_source_find(
     } else {
         None
     }
+}
+
+fn detect_broad_source_find(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<Vec<String>> {
+    let segments = extract_shell_segments_ignoring_echo(cmd);
+    if segments.is_empty() {
+        return None;
+    }
+    for seg in &segments {
+        if segment_changes_cwd(seg) {
+            return None;
+        }
+        let first_stage = split_unquoted_pipes(seg)
+            .and_then(|s| s.into_iter().next())
+            .unwrap_or_default();
+        let is_find = split_shell_tokens(&first_stage)
+            .and_then(|toks| {
+                let idx = toks.iter().position(|t| !is_env_assignment_token(t))?;
+                Some(command_basename(&toks[idx]) == "find")
+            })
+            .unwrap_or(false);
+        if !is_find {
+            return None;
+        }
+    }
+    for seg in &segments {
+        if let Some(roots) = detect_single_broad_source_find(svc, seg, cwd) {
+            return Some(roots);
+        }
+    }
+    None
 }
 
 pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
@@ -942,6 +1407,25 @@ pub(super) fn handle_agy(svc: &BrokerService, payload: &Json) -> Json {
 
         if tool_name == "run_command" {
             if let Some(cmd) = args.get_str("CommandLine") {
+                if detect_multi_ctx_chain(cmd).is_some() {
+                    let strike_key = format!(
+                        "agy:{}:MultiCtxChain:{:016x}",
+                        conv_id,
+                        fast_hash64(cmd.trim().as_bytes())
+                    );
+                    if !svc.store.check_and_mark_dedup(&strike_key) {
+                        return Json::obj(vec![
+                            ("decision", Json::Str("deny".to_string())),
+                            (
+                                "reason",
+                                Json::Str(
+                                    "[RAM-Ctx] Avoid chaining multiple heavy `ctx` commands (`&&` / `;` / newlines) in one `run_command` — combined output overflows Antigravity's 10 KiB inline cap into `output.txt`. Issue independent `ctx` calls as parallel `run_command` tool calls instead (repeat this exact command once if strictly required)."
+                                        .to_string(),
+                                ),
+                            ),
+                        ]);
+                    }
+                }
                 let is_worker = svc.store.is_worker_session(&sess_key);
                 if let Some(broad_roots) = detect_broad_source_find(svc, cmd, cwd.as_deref()) {
                     let strike_key = format!(
@@ -1660,6 +2144,179 @@ mod tests {
         assert!(r2.get("injectSteps").is_none(), "must not re-inject: {r2:?}");
         assert!(svc.store.is_worker_session("agy:forked-w2"));
         assert!(svc.store.has_startup_settled("agy:forked-w2"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_ctx_chain_gate_is_one_strike_runs_first_and_allows_lightweight_chains() {
+        // Triggering chains: 2+ heavy ctx OR 1+ heavy ctx + 1+ separate raw inspect
+        assert_eq!(detect_multi_ctx_chain("ctx inspect A && ctx inspect B"), Some((2, 0)));
+        assert_eq!(
+            detect_multi_ctx_chain("ctx sym 'a.rs#f'\nctx read b.rs:1-40"),
+            Some((2, 0))
+        );
+        assert_eq!(
+            detect_multi_ctx_chain("ctx search -q 'foo'; ctx outline src/a.rs"),
+            Some((2, 0))
+        );
+        assert_eq!(
+            detect_multi_ctx_chain("ctx inspect \\\n  src/a && ctx impact src/b.rs#fn_a"),
+            Some((2, 0))
+        );
+        assert_eq!(
+            detect_multi_ctx_chain("ctx memo changes\ngit diff a.rs"),
+            Some((1, 1))
+        );
+        assert_eq!(
+            detect_multi_ctx_chain("ctx memo && find src/ -type f"),
+            Some((1, 1))
+        );
+        assert_eq!(
+            detect_multi_ctx_chain("ctx memo pack-get p1 && rg foo src/"),
+            Some((1, 1))
+        );
+
+        // Non-triggering commands (false-positive guards)
+        for ok_cmd in [
+            "ctx inspect src/",
+            "ctx search -q 'foo' | grep bar",
+            "ctx inspect src/ | head -n 40",
+            "ctx shutdown && sleep 0.3",
+            "ctx status && ctx doctor",
+            "ctx memo put -t a -s b && ctx memo pack -t p src/",
+            "ctx memo put -t a -s b && ctx inspect src/",
+            "ctx memo --help && ctx inspect src/",
+            "ctx edit --help && ctx diag -- cargo test",
+            "cmake -B build && ninja -C build && ctest --test-dir build",
+            "echo \"ctx inspect A && ctx inspect B\"",
+            "git commit -m \"ctx inspect A; ctx search B\"",
+            "echo '=== DIFF ==='\ngit diff src/a.rs",
+        ] {
+            assert!(
+                detect_multi_ctx_chain(ok_cmd).is_none(),
+                "must NOT trigger MultiCtxChainGate for `{ok_cmd}`"
+            );
+        }
+
+        let dir = temp_dir("multi-ctx-chain");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        svc.allowlist.register_hint(&dir, true).unwrap();
+
+        // Strike 1 denies `ctx inspect A && ctx inspect B`, Strike 2 passes cleanly.
+        let chain_cmd = "ctx inspect src/a.rs && ctx read src/a.rs:1-5";
+        let p1 = pre_tool_payload(
+            "worker-chain-1",
+            &dir,
+            "call-c1",
+            "run_command",
+            Json::obj(vec![("CommandLine", Json::Str(chain_cmd.into()))]),
+        );
+        let r1 = handle_agy(&svc, &p1);
+        assert_eq!(r1.get_str("decision"), Some("deny"), "{r1:?}");
+        assert!(
+            r1.get_str("reason")
+                .unwrap()
+                .contains("10 KiB inline cap"),
+            "{r1:?}"
+        );
+
+        let p2 = pre_tool_payload(
+            "worker-chain-1",
+            &dir,
+            "call-c2",
+            "run_command",
+            Json::obj(vec![("CommandLine", Json::Str(chain_cmd.into()))]),
+        );
+        let r2 = handle_agy(&svc, &p2);
+        assert_ne!(r2.get_str("decision"), Some("deny"), "Strike 2 must not deny: {r2:?}");
+
+        // Ordering check: `ctx memo changes\ngit diff src/a.rs` hits MultiCtxChainGate BEFORE git redirect / CLI token injection.
+        let mixed_cmd = "ctx memo changes\ngit diff src/a.rs";
+        let pm = pre_tool_payload(
+            "worker-chain-2",
+            &dir,
+            "call-m1",
+            "run_command",
+            Json::obj(vec![("CommandLine", Json::Str(mixed_cmd.into()))]),
+        );
+        let rm = handle_agy(&svc, &pm);
+        assert_eq!(rm.get_str("decision"), Some("deny"), "{rm:?}");
+        let m_reason = rm.get_str("reason").unwrap();
+        assert!(m_reason.contains("Avoid chaining multiple heavy `ctx` commands"), "{m_reason}");
+        assert!(rm.get("overwrite").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broad_source_find_handles_multiline_echo_and_xargs_wc_while_skipping_safe_variants() {
+        let dir = temp_dir("broad-find");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..45 {
+            fs::write(src.join(format!("mod_{i:02}.rs")), format!("pub fn f_{i}() {{}}\n"))
+                .unwrap();
+        }
+        let svc = BrokerService::new_ephemeral_inproc(dir.join("snap.bin"));
+        svc.allowlist.register_hint(&dir, true).unwrap();
+
+        // Multiline `echo ...\nfind src/ -type f` and `find ... | xargs -0 wc -l` trigger BroadFind.
+        for broad_cmd in [
+            "echo \"=== FILES ===\"\nfind src/ -type f",
+            "echo \"=== COUNT ===\" && find src/ -type f -print0 | xargs -0 wc -l",
+            "find src/ -type f | sort",
+            "find src/ -type f | xargs -n 50 wc -l",
+        ] {
+            let roots = detect_broad_source_find(&svc, broad_cmd, Some(&dir));
+            assert_eq!(
+                roots.as_deref(),
+                Some(&["src".to_string()][..]),
+                "must detect broad find for `{broad_cmd}`"
+            );
+        }
+
+        // Shallow, mutating, redirected, or non-wc xargs commands pass cleanly.
+        for ok_cmd in [
+            "find src/ -maxdepth 1 -type f",
+            "find src/ -maxdepth 2 -type f",
+            "find src/ -type f -delete",
+            "find src/ -type f -exec wc -l {} +",
+            "find src/ -type f | xargs rm -f",
+            "find src/ -type f > list.txt",
+            "find src/ -type f | head -n 10",
+            "cd /tmp && find . -type f",
+        ] {
+            assert!(
+                detect_broad_source_find(&svc, ok_cmd, Some(&dir)).is_none(),
+                "must NOT flag `{ok_cmd}`"
+            );
+        }
+
+        // End-to-end 1-Strike via handle_agy on multiline `echo ...\nfind`.
+        let cmd = "echo \"=== FILES ===\"\nfind src/ -type f";
+        let f1 = pre_tool_payload(
+            "worker-find-1",
+            &dir,
+            "call-f1",
+            "run_command",
+            Json::obj(vec![("CommandLine", Json::Str(cmd.into()))]),
+        );
+        let rf1 = handle_agy(&svc, &f1);
+        assert_eq!(rf1.get_str("decision"), Some("deny"), "{rf1:?}");
+        assert!(rf1.get_str("reason").unwrap().contains("Broad `find`"));
+
+        let f2 = pre_tool_payload(
+            "worker-find-1",
+            &dir,
+            "call-f2",
+            "run_command",
+            Json::obj(vec![("CommandLine", Json::Str(cmd.into()))]),
+        );
+        let rf2 = handle_agy(&svc, &f2);
+        assert_eq!(rf2.get_str("decision"), Some("allow"), "{rf2:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

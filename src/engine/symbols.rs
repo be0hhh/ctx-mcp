@@ -166,6 +166,66 @@ pub(super) fn symbol_matches_query(sym_name: &str, query: &str) -> bool {
     false
 }
 
+enum AutoOutlineOutcome {
+    NotFound,
+    Appended,
+    Truncated,
+}
+
+fn try_auto_outline_file(
+    svc: &BrokerService,
+    raw_path: &str,
+    cwd: Option<&Path>,
+    out: &mut String,
+    limit: usize,
+    cap_note: &str,
+) -> AutoOutlineOutcome {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return AutoOutlineOutcome::NotFound;
+    }
+    let mut resolved = resolve_input_path(trimmed, cwd);
+    if !resolved.exists()
+        && is_safe_shorthand_candidate(trimmed)
+        && !is_sensitive_path(&resolved)
+    {
+        if let Some(ws_hint) = cwd.and_then(|c| svc.allowlist.register_hint(c, false)) {
+            let found = svc.store.find_workspace_paths(trimmed, &ws_hint, 2);
+            if found.len() == 1 {
+                if let Some(first) = found.into_iter().next() {
+                    resolved = first;
+                }
+            }
+        }
+    }
+    if resolved.is_file() && !is_sensitive_path(&resolved) {
+        if let Ok((canon, ws_root)) = svc.allowlist.admit_file(&resolved, cwd) {
+            if !is_multimodal_or_binary_ext(&canon) {
+                if let Ok(entry) = svc.store.get_outline_entry(&canon, Some(&ws_root)) {
+                    let outline = RamStore::format_outline_compact(&entry, 24);
+                    let section = format!(
+                        "=== {} (outline; no #Symbol) ===\n{}\nHint: pass \"{}#Sym1\" \"{}#Sym2\" in one call to read exact symbol bodies.\n\n",
+                        entry.rel_path, outline, entry.rel_path, entry.rel_path
+                    );
+                    if out.len() + section.len() <= limit {
+                        out.push_str(&section);
+                        return AutoOutlineOutcome::Appended;
+                    }
+                    let remain = limit.saturating_sub(out.len());
+                    let mut end = remain.min(section.len());
+                    while end > 0 && !section.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    out.push_str(&section[..end]);
+                    out.push_str(cap_note);
+                    return AutoOutlineOutcome::Truncated;
+                }
+            }
+        }
+    }
+    AutoOutlineOutcome::NotFound
+}
+
 #[allow(dead_code)]
 pub fn op_symbols(
     svc: &BrokerService,
@@ -205,58 +265,33 @@ pub fn op_symbols_with_options(
             }
             break;
         }
+        let auto_outline_target = match req.split_once('#') {
+            None => Some(req.as_str()),
+            Some((raw_path, sym_query))
+                if sym_query.trim().is_empty() || sym_query.trim() == "*" =>
+            {
+                Some(raw_path)
+            }
+            Some(_) => None,
+        };
+        if let Some(target_path) = auto_outline_target {
+            match try_auto_outline_file(svc, target_path, cwd, &mut out, limit, cap_note) {
+                AutoOutlineOutcome::Appended => {
+                    any_ok = true;
+                }
+                AutoOutlineOutcome::Truncated => {
+                    return Ok(out);
+                }
+                AutoOutlineOutcome::NotFound => {
+                    out.push_str(&format!(
+                        "=== {} [ERROR: expected format path#SymbolName] ===\n",
+                        req
+                    ));
+                }
+            }
+            continue;
+        }
         let Some((raw_path, sym_query)) = req.split_once('#') else {
-            let trimmed = req.trim();
-            let mut outlined = false;
-            if !trimmed.is_empty() {
-                let mut resolved = resolve_input_path(trimmed, cwd);
-                if !resolved.exists()
-                    && is_safe_shorthand_candidate(trimmed)
-                    && !is_sensitive_path(&resolved)
-                {
-                    if let Some(ws_hint) = cwd.and_then(|c| svc.allowlist.register_hint(c, false)) {
-                        let found = svc.store.find_workspace_paths(trimmed, &ws_hint, 2);
-                        if found.len() == 1 {
-                            if let Some(first) = found.into_iter().next() {
-                                resolved = first;
-                            }
-                        }
-                    }
-                }
-                if resolved.is_file() && !is_sensitive_path(&resolved) {
-                    if let Ok((canon, ws_root)) = svc.allowlist.admit_file(&resolved, cwd) {
-                        if !is_multimodal_or_binary_ext(&canon) {
-                            if let Ok(entry) = svc.store.get_outline_entry(&canon, Some(&ws_root)) {
-                                any_ok = true;
-                                outlined = true;
-                                let outline = RamStore::format_outline_compact(&entry, 24);
-                                let section = format!(
-                                    "=== {} (outline; no #Symbol) ===\n{}\nHint: pass \"{}#Sym1\" \"{}#Sym2\" in one call to read exact symbol bodies.\n\n",
-                                    entry.rel_path, outline, entry.rel_path, entry.rel_path
-                                );
-                                if out.len() + section.len() <= limit {
-                                    out.push_str(&section);
-                                } else {
-                                    let remain = limit.saturating_sub(out.len());
-                                    let mut end = remain.min(section.len());
-                                    while end > 0 && !section.is_char_boundary(end) {
-                                        end -= 1;
-                                    }
-                                    out.push_str(&section[..end]);
-                                    out.push_str(cap_note);
-                                    return Ok(out);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !outlined {
-                out.push_str(&format!(
-                    "=== {} [ERROR: expected format path#SymbolName] ===\n",
-                    req
-                ));
-            }
             continue;
         };
         let (kind_filter, query) = parse_kind_filter(sym_query);
@@ -684,12 +719,45 @@ mod tests {
         let capped = op_symbols(&svc, &many, 1024, false, None, Some(&workspace), false).unwrap();
         assert!(capped.len() <= 1024, "len={}", capped.len());
 
-        // 5. Missing file, directory, sensitive `.env`, and outside-workspace path preserve exact error.
+        // 5. Wildcard `#*` and empty `#` suffix also trigger auto-outline + batched hint.
+        for req in ["sub/mod_a.rs#*", "mod_a.rs#*", "sub/mod_a.rs#", "sub/mod_a.rs# * "] {
+            let wild = op_symbols(
+                &svc,
+                &[req.into()],
+                4096,
+                false,
+                None,
+                Some(&workspace),
+                false,
+            )
+            .unwrap();
+            assert!(
+                wild.contains("sub/mod_a.rs")
+                    && wild.contains("func_0")
+                    && wild.contains("func_7")
+                    && wild.contains("Hint: pass \"sub/mod_a.rs#Sym1\" \"sub/mod_a.rs#Sym2\""),
+                "req={req} out={wild}"
+            );
+        }
+
+        // 6. Budget enforcement on `#*` wildcard outlines strictly respects `max_bytes`.
+        let many_wild: Vec<String> = (0..10).map(|_| "sub/mod_a.rs#*".to_string()).collect();
+        let capped_wild =
+            op_symbols(&svc, &many_wild, 1024, false, None, Some(&workspace), false).unwrap();
+        assert!(capped_wild.len() <= 1024, "len={}", capped_wild.len());
+
+        // 7. Missing file, directory, sensitive `.env`, and outside-workspace path preserve exact error (bare, `#*`, `#`).
         for bad in [
             "missing.rs".to_string(),
+            "missing.rs#*".to_string(),
+            "missing.rs#".to_string(),
             "sub".to_string(),
+            "sub#*".to_string(),
             ".env".to_string(),
+            ".env#*".to_string(),
+            "#*".to_string(),
             outside.to_string_lossy().into_owned(),
+            format!("{}#*", outside.to_string_lossy()),
         ] {
             let err = op_symbols(&svc, &[bad.clone()], 4096, false, None, Some(&workspace), false)
                 .unwrap_err();

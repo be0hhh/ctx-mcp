@@ -521,28 +521,68 @@ fn detect_shell_file_slicing(
     None
 }
 
-fn split_shell_tokens(raw: &str) -> Option<Vec<String>> {
+pub(super) fn is_env_assignment_token(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    let Some(eq_idx) = bytes.iter().position(|&b| b == b'=') else {
+        return false;
+    };
+    let name = &bytes[..eq_idx];
+    !name.is_empty()
+        && (name[0].is_ascii_alphabetic() || name[0] == b'_')
+        && name[1..]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+pub(super) fn command_basename(tok: &str) -> &str {
+    let after_slash = tok.rsplit('/').next().unwrap_or(tok);
+    after_slash.rsplit('\\').next().unwrap_or(after_slash)
+}
+
+pub(super) fn split_shell_tokens(raw: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_token = false;
     let mut quote: Option<char> = None;
+    let mut ansi_c = false;
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
         if let Some(q) = quote {
-            if ch == '\\' && q == '"' {
+            if ch == '\\' && (q == '"' || ansi_c) {
+                if q == '"' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                    continue;
+                }
+                if q == '"' && chars.peek() == Some(&'\r') {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                        continue;
+                    }
+                    cur.push('\r');
+                    continue;
+                }
                 if let Some(next) = chars.next() {
                     cur.push(next);
                 }
             } else if ch == q {
                 quote = None;
+                ansi_c = false;
             } else {
                 cur.push(ch);
             }
             continue;
         }
         match ch {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                quote = Some('\'');
+                ansi_c = true;
+                in_token = true;
+            }
             '\'' | '"' => {
                 quote = Some(ch);
+                ansi_c = false;
                 in_token = true;
             }
             c if c.is_whitespace() => {
@@ -552,9 +592,29 @@ fn split_shell_tokens(raw: &str) -> Option<Vec<String>> {
                 }
             }
             '\\' => {
-                in_token = true;
-                if let Some(next) = chars.next() {
-                    cur.push(next);
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    if in_token {
+                        out.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else if chars.peek() == Some(&'\r') {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                        if in_token {
+                            out.push(std::mem::take(&mut cur));
+                            in_token = false;
+                        }
+                    } else {
+                        in_token = true;
+                        cur.push('\r');
+                    }
+                } else {
+                    in_token = true;
+                    if let Some(next) = chars.next() {
+                        cur.push(next);
+                    }
                 }
             }
             c => {
@@ -570,6 +630,505 @@ fn split_shell_tokens(raw: &str) -> Option<Vec<String>> {
         out.push(cur);
     }
     Some(out)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteMode {
+    Unquoted,
+    Single,
+    AnsiC,
+    Double,
+}
+
+fn scan_segment_shell_ops(seg: &str, allow_single_pipe: bool) -> bool {
+    let bytes = seg.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut mode = QuoteMode::Unquoted;
+    while i < len {
+        let b = bytes[i];
+        match mode {
+            QuoteMode::Single => {
+                if b == b'\'' {
+                    mode = QuoteMode::Unquoted;
+                }
+                i += 1;
+            }
+            QuoteMode::AnsiC => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'\'' {
+                    mode = QuoteMode::Unquoted;
+                }
+                i += 1;
+            }
+            QuoteMode::Double => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'"' {
+                    mode = QuoteMode::Unquoted;
+                    i += 1;
+                    continue;
+                }
+                if b == b'`' || (b == b'$' && bytes.get(i + 1) == Some(&b'(')) {
+                    return true;
+                }
+                i += 1;
+            }
+            QuoteMode::Unquoted => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'$' && bytes.get(i + 1) == Some(&b'\'') {
+                    mode = QuoteMode::AnsiC;
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    mode = QuoteMode::Single;
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    mode = QuoteMode::Double;
+                    i += 1;
+                    continue;
+                }
+                if b == b'|' {
+                    if !allow_single_pipe || bytes.get(i + 1) == Some(&b'|') {
+                        return true;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if matches!(b, b'>' | b'<' | b'`')
+                    || (b == b'$' && bytes.get(i + 1) == Some(&b'('))
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn segment_has_unsafe_shell_ops(seg: &str) -> bool {
+    scan_segment_shell_ops(seg, false)
+}
+
+pub(super) fn segment_has_redirects_or_subshell(seg: &str) -> bool {
+    scan_segment_shell_ops(seg, true)
+}
+
+fn split_pipes_quote_aware(seg: &str, allow_or_or: bool) -> Option<Vec<&str>> {
+    let bytes = seg.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    let mut mode = QuoteMode::Unquoted;
+    let mut stages = Vec::new();
+
+    while i < len {
+        let b = bytes[i];
+        match mode {
+            QuoteMode::Single => {
+                if b == b'\'' {
+                    mode = QuoteMode::Unquoted;
+                }
+                i += 1;
+            }
+            QuoteMode::AnsiC => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'\'' {
+                    mode = QuoteMode::Unquoted;
+                }
+                i += 1;
+            }
+            QuoteMode::Double => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'"' {
+                    mode = QuoteMode::Unquoted;
+                }
+                i += 1;
+            }
+            QuoteMode::Unquoted => {
+                if b == b'\\' && i + 1 < len {
+                    i += 2;
+                    while i < len && bytes[i] >= 0x80 && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b == b'$' && bytes.get(i + 1) == Some(&b'\'') {
+                    mode = QuoteMode::AnsiC;
+                    i += 2;
+                    continue;
+                }
+                if b == b'\'' {
+                    mode = QuoteMode::Single;
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    mode = QuoteMode::Double;
+                    i += 1;
+                    continue;
+                }
+                if b == b'|' {
+                    let is_or_or = bytes.get(i + 1) == Some(&b'|');
+                    if is_or_or && !allow_or_or {
+                        return None;
+                    }
+                    let piece = seg[start..i].trim();
+                    if piece.is_empty() {
+                        if !allow_or_or {
+                            return None;
+                        }
+                    } else {
+                        stages.push(piece);
+                    }
+                    i += if is_or_or { 2 } else { 1 };
+                    start = i;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    if !allow_or_or && mode != QuoteMode::Unquoted {
+        return None;
+    }
+    let tail = seg[start..].trim();
+    if tail.is_empty() {
+        if !allow_or_or {
+            return None;
+        }
+    } else {
+        stages.push(tail);
+    }
+    Some(stages)
+}
+
+pub(super) fn split_unquoted_pipes(seg: &str) -> Option<Vec<&str>> {
+    split_pipes_quote_aware(seg, false)
+}
+
+fn is_harmless_banner_segment(seg: &str) -> bool {
+    if segment_has_unsafe_shell_ops(seg) {
+        return false;
+    }
+    let Some(tokens) = split_shell_tokens(seg) else {
+        return false;
+    };
+    let Some(cmd_idx) = tokens.iter().position(|t| !is_env_assignment_token(t)) else {
+        return false;
+    };
+    let prog = command_basename(&tokens[cmd_idx]);
+    if prog == "echo" {
+        return true;
+    }
+    if prog == "printf" {
+        // `printf -v VAR ...` mutates a shell variable and is not a pure banner.
+        return !tokens[cmd_idx + 1..]
+            .iter()
+            .any(|t| t == "-v" || t.starts_with("-v"));
+    }
+    false
+}
+
+fn push_non_ascii_run(cmd: &str, bytes: &[u8], i: &mut usize, dst: &mut String) {
+    let start = *i;
+    while *i < bytes.len() && bytes[*i] >= 0x80 {
+        *i += 1;
+    }
+    dst.push_str(&cmd[start..*i]);
+}
+
+/// Quote-aware POSIX shell splitter that joins `\\\n` / `\\\r\n` continuations, splits on
+/// unquoted `\n`, `;`, and `&&`, and drops empty lines, `#`-comments, and harmless `echo`/`printf`
+/// banner segments (with no unquoted pipes, redirects, `$(`, or backticks).
+pub(super) fn extract_shell_segments_ignoring_echo(cmd: &str) -> Vec<String> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut cur = String::new();
+    let mut at_word_start = true;
+    let mut segments = Vec::new();
+
+    let flush = |cur: &mut String, segments: &mut Vec<String>| {
+        let trimmed = cur.trim();
+        if !trimmed.is_empty() && !is_harmless_banner_segment(trimmed) {
+            segments.push(trimmed.to_string());
+        }
+        cur.clear();
+    };
+
+    while i < len {
+        let b = bytes[i];
+        if b >= 0x80 {
+            push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+            at_word_start = false;
+            continue;
+        }
+        if b == b'#' && at_word_start {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\n' || b == b';' {
+            flush(&mut cur, &mut segments);
+            at_word_start = true;
+            i += 1;
+            continue;
+        }
+        if b == b'&' && bytes.get(i + 1) == Some(&b'&') {
+            flush(&mut cur, &mut segments);
+            at_word_start = true;
+            i += 2;
+            continue;
+        }
+        if b == b'$' && bytes.get(i + 1) == Some(&b'\'') {
+            cur.push_str("$'");
+            i += 2;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                    continue;
+                }
+                if c == b'\\' && i + 1 < len {
+                    cur.push('\\');
+                    i += 1;
+                    if bytes[i] >= 0x80 {
+                        push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                    } else {
+                        cur.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    continue;
+                }
+                cur.push(c as char);
+                i += 1;
+                if c == b'\'' {
+                    break;
+                }
+            }
+            at_word_start = false;
+            continue;
+        }
+        if b == b'\'' {
+            cur.push('\'');
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                    continue;
+                }
+                cur.push(c as char);
+                i += 1;
+                if c == b'\'' {
+                    break;
+                }
+            }
+            at_word_start = false;
+            continue;
+        }
+        if b == b'"' {
+            cur.push('"');
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                if c >= 0x80 {
+                    push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                    continue;
+                }
+                if c == b'\\' {
+                    if bytes.get(i + 1) == Some(&b'\n') {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                        i += 3;
+                        continue;
+                    }
+                    if i + 1 < len {
+                        cur.push('\\');
+                        i += 1;
+                        if bytes[i] >= 0x80 {
+                            push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                        } else {
+                            cur.push(bytes[i] as char);
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                cur.push(c as char);
+                i += 1;
+                if c == b'"' {
+                    break;
+                }
+            }
+            at_word_start = false;
+            continue;
+        }
+        if b == b'\\' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                cur.push(' ');
+                i += 2;
+                at_word_start = true;
+                continue;
+            }
+            if bytes.get(i + 1) == Some(&b'\r') && bytes.get(i + 2) == Some(&b'\n') {
+                cur.push(' ');
+                i += 3;
+                at_word_start = true;
+                continue;
+            }
+            if i + 1 < len {
+                cur.push('\\');
+                i += 1;
+                if bytes[i] >= 0x80 {
+                    push_non_ascii_run(cmd, bytes, &mut i, &mut cur);
+                } else {
+                    cur.push(bytes[i] as char);
+                    i += 1;
+                }
+                at_word_start = false;
+                continue;
+            }
+        }
+        cur.push(b as char);
+        at_word_start = matches!(b, b' ' | b'\t' | b'\r');
+        i += 1;
+    }
+    flush(&mut cur, &mut segments);
+    segments
+}
+
+pub(super) fn segment_changes_cwd(seg: &str) -> bool {
+    let Some(tokens) = split_shell_tokens(seg) else {
+        return false;
+    };
+    let Some(first) = tokens.iter().find(|t| !is_env_assignment_token(t)) else {
+        return false;
+    };
+    let clean = first.trim_start_matches('(');
+    matches!(command_basename(clean), "cd" | "pushd" | "popd")
+}
+
+pub(super) fn extract_git_subcommand(args: &[String]) -> Option<&str> {
+    let mut i = 0usize;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if matches!(
+            tok,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(tok);
+    }
+    None
+}
+
+fn segment_invokes_mutating_git(seg: &str) -> bool {
+    let Some(parts) = split_pipes_quote_aware(seg, true) else {
+        return false;
+    };
+
+    for part in parts {
+        let Some(tokens) = split_shell_tokens(part) else {
+            continue;
+        };
+        let mut idx = 0usize;
+        while idx < tokens.len() {
+            let t = tokens[idx].trim_start_matches('(');
+            if is_env_assignment_token(t)
+                || matches!(
+                    t,
+                    "time" | "!" | "then" | "do" | "else" | "elif" | "command" | "builtin"
+                )
+            {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+        let Some(cmd_tok) = tokens.get(idx) else {
+            continue;
+        };
+        let prog = command_basename(cmd_tok.trim_start_matches('('));
+        if !matches!(prog, "git" | "git.exe") {
+            continue;
+        }
+        if let Some(sub) = extract_git_subcommand(&tokens[idx + 1..]) {
+            if matches!(
+                sub,
+                "add"
+                    | "commit"
+                    | "push"
+                    | "pull"
+                    | "fetch"
+                    | "checkout"
+                    | "switch"
+                    | "reset"
+                    | "rebase"
+                    | "merge"
+                    | "cherry-pick"
+                    | "stash"
+                    | "tag"
+                    | "branch"
+                    | "rm"
+                    | "mv"
+                    | "restore"
+                    | "clean"
+                    | "apply"
+                    | "am"
+                    | "bisect"
+                    | "init"
+                    | "clone"
+                    | "submodule"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_single_colon(s: &str) -> bool {
@@ -590,32 +1149,17 @@ fn has_single_colon(s: &str) -> bool {
     false
 }
 
-fn detect_workspace_shell_grep(
+fn detect_single_workspace_shell_grep(
     svc: &BrokerService,
-    cmd: &str,
+    seg: &str,
     cwd: Option<&Path>,
 ) -> Option<(String, String)> {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('\n')
-        || trimmed.contains('|')
-        || trimmed.contains("&&")
-        || trimmed.contains(';')
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-    {
+    let tokens = split_shell_tokens(seg)?;
+    let cmd_idx = tokens.iter().position(|t| !is_env_assignment_token(t))?;
+    if tokens.len() < cmd_idx + 2 {
         return None;
     }
-    let tokens = split_shell_tokens(trimmed)?;
-    if tokens.len() < 2 {
-        return None;
-    }
-    let prog = Path::new(&tokens[0])
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(tokens[0].as_str());
+    let prog = command_basename(&tokens[cmd_idx]);
     if !matches!(prog, "grep" | "egrep" | "fgrep" | "rg") {
         return None;
     }
@@ -623,7 +1167,7 @@ fn detect_workspace_shell_grep(
     let mut pattern: Option<String> = None;
     let mut targets: Vec<String> = Vec::new();
     let mut after_dd = false;
-    let mut i = 1usize;
+    let mut i = cmd_idx + 1;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
         if !after_dd && tok == "--" {
@@ -746,7 +1290,8 @@ fn detect_workspace_shell_grep(
                 return None;
             }
             let p = resolve_input_path(raw_t, cwd);
-            if is_sensitive_path(&p) || is_internal_ide_path(&p) || is_multimodal_or_binary_ext(&p) {
+            if is_sensitive_path(&p) || is_internal_ide_path(&p) || is_multimodal_or_binary_ext(&p)
+            {
                 return None;
             }
             let (canon, ws_root) = if p.is_dir() {
@@ -772,6 +1317,41 @@ fn detect_workspace_shell_grep(
     };
 
     Some((scope_rel, pat))
+}
+
+fn segment_primary_prog(seg: &str) -> Option<String> {
+    let tokens = split_shell_tokens(seg)?;
+    let cmd_idx = tokens.iter().position(|t| !is_env_assignment_token(t))?;
+    Some(command_basename(&tokens[cmd_idx]).to_string())
+}
+
+fn detect_workspace_shell_grep(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<(String, String)> {
+    let segments = extract_shell_segments_ignoring_echo(cmd);
+    if segments.is_empty() {
+        return None;
+    }
+    if segments.iter().any(|seg| {
+        segment_changes_cwd(seg)
+            || !matches!(
+                segment_primary_prog(seg).as_deref(),
+                Some("grep" | "egrep" | "fgrep" | "rg" | "grep.exe" | "rg.exe")
+            )
+    }) {
+        return None;
+    }
+    for seg in &segments {
+        if segment_has_unsafe_shell_ops(seg) {
+            continue;
+        }
+        if let Some(hit) = detect_single_workspace_shell_grep(svc, seg, cwd) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 pub(super) fn workspace_grep_redirect_reason(
@@ -849,33 +1429,46 @@ fn escape_json_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn detect_workspace_readonly_git_spec(
+fn admit_git_diff_path(
     svc: &BrokerService,
-    cmd: &str,
-    cwd: Option<&Path>,
-) -> Option<GitRedirectSpec> {
-    let trimmed = cmd.trim();
-    if trimmed.is_empty()
-        || trimmed.contains('\n')
-        || trimmed.contains('|')
-        || trimmed.contains('>')
-        || trimmed.contains('<')
-        || trimmed.contains(';')
-        || trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains("$(")
-        || trimmed.contains('`')
-    {
+    cand: &Path,
+    base: &Path,
+    ws_root: &Path,
+) -> Option<String> {
+    if is_sensitive_path(cand) || is_internal_ide_path(cand) {
         return None;
     }
-    let tokens = split_shell_tokens(trimmed)?;
+    if cand.is_dir() {
+        let (canon, wr) = svc.allowlist.admit_dir(cand, Some(base)).ok()?;
+        if wr != ws_root {
+            return None;
+        }
+        Some(if canon == wr {
+            ".".to_string()
+        } else {
+            display_workspace_path(&canon, Some(&wr))
+        })
+    } else if cand.is_file() {
+        let (canon, wr) = svc.allowlist.admit_file(cand, Some(base)).ok()?;
+        if wr != ws_root {
+            return None;
+        }
+        Some(display_workspace_path(&canon, Some(&wr)))
+    } else {
+        None
+    }
+}
+
+fn detect_single_workspace_readonly_git_spec(
+    svc: &BrokerService,
+    seg: &str,
+    cwd: Option<&Path>,
+) -> Option<GitRedirectSpec> {
+    let tokens = split_shell_tokens(seg)?;
     if tokens.len() < 2 {
         return None;
     }
-    let prog = Path::new(&tokens[0])
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(tokens[0].as_str());
+    let prog = command_basename(&tokens[0]);
     if !matches!(prog, "git" | "git.exe") {
         return None;
     }
@@ -922,27 +1515,30 @@ fn detect_workspace_readonly_git_spec(
                         stat = true;
                         continue;
                     }
-                    if s.starts_with('-') {
-                        return None;
-                    }
-                    if s.contains("..") || s.contains(':') || s.contains('*') || s.contains('?') || s.contains('[') {
-                        return None;
-                    }
-                    let cand = resolve_input_path(s, Some(base));
-                    if is_sensitive_path(&cand)
-                        || is_internal_ide_path(&cand)
-                        || fs::symlink_metadata(&cand).is_ok()
+                    if s.is_empty()
+                        || s.starts_with('-')
+                        || s.contains("..")
+                        || s.contains(':')
+                        || s.contains('*')
+                        || s.contains('?')
+                        || s.contains('[')
                     {
                         return None;
                     }
-                    // Allow a single simple revision before `--` (reject multiple unseparated positionals).
-                    if rev.is_some() {
+                    let cand = resolve_input_path(s, Some(base));
+                    if is_sensitive_path(&cand) || is_internal_ide_path(&cand) {
                         return None;
                     }
-                    if !is_simple_git_rev(s) {
-                        return None;
+                    if fs::symlink_metadata(&cand).is_ok() {
+                        let rel = admit_git_diff_path(svc, &cand, base, &ws_root)?;
+                        paths.push(rel);
+                    } else {
+                        // Allow a single simple revision before any path / `--`.
+                        if !paths.is_empty() || rev.is_some() || !is_simple_git_rev(s) {
+                            return None;
+                        }
+                        rev = Some(s.to_string());
                     }
-                    rev = Some(s.to_string());
                 } else {
                     if s.is_empty()
                         || s.starts_with('-')
@@ -954,25 +1550,8 @@ fn detect_workspace_readonly_git_spec(
                     {
                         return None;
                     }
-                    let p = resolve_input_path(s, Some(base));
-                    if is_sensitive_path(&p) || is_internal_ide_path(&p) {
-                        return None;
-                    }
-                    let rel = if p.is_dir() {
-                        let (canon, wr) = svc.allowlist.admit_dir(&p, Some(base)).ok()?;
-                        if wr != ws_root {
-                            return None;
-                        }
-                        display_workspace_path(&canon, Some(&wr))
-                    } else if p.is_file() {
-                        let (canon, wr) = svc.allowlist.admit_file(&p, Some(base)).ok()?;
-                        if wr != ws_root {
-                            return None;
-                        }
-                        display_workspace_path(&canon, Some(&wr))
-                    } else {
-                        return None;
-                    };
+                    let cand = resolve_input_path(s, Some(base));
+                    let rel = admit_git_diff_path(svc, &cand, base, &ws_root)?;
                     paths.push(rel);
                 }
             }
@@ -995,7 +1574,13 @@ fn detect_workspace_readonly_git_spec(
             if !paths.is_empty() {
                 for p in &paths {
                     cli.push(' ');
-                    cli.push_str(p);
+                    if p.contains(' ') {
+                        cli.push('"');
+                        cli.push_str(&escape_json_str(p));
+                        cli.push('"');
+                    } else {
+                        cli.push_str(p);
+                    }
                 }
                 let p_json: Vec<String> = paths
                     .iter()
@@ -1088,6 +1673,32 @@ fn detect_workspace_readonly_git_spec(
         }
         _ => None,
     }
+}
+
+fn detect_workspace_readonly_git_spec(
+    svc: &BrokerService,
+    cmd: &str,
+    cwd: Option<&Path>,
+) -> Option<GitRedirectSpec> {
+    let segments = extract_shell_segments_ignoring_echo(cmd);
+    if segments.is_empty()
+        || segments.iter().any(|seg| {
+            segment_changes_cwd(seg)
+                || segment_invokes_mutating_git(seg)
+                || !matches!(segment_primary_prog(seg).as_deref(), Some("git" | "git.exe"))
+        })
+    {
+        return None;
+    }
+    for seg in &segments {
+        if segment_has_unsafe_shell_ops(seg) {
+            continue;
+        }
+        if let Some(spec) = detect_single_workspace_readonly_git_spec(svc, seg, cwd) {
+            return Some(spec);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1393,6 +2004,134 @@ mod tests {
                 "should not redirect `{ok_cmd}`"
             );
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn extract_shell_segments_and_multiline_git_grep_redirects_respect_guards() {
+        let segs = extract_shell_segments_ignoring_echo(concat!(
+            "# leading comment\n",
+            "echo \"=== DIFF; a && b ===\"\n",
+            "printf 'section %s\\n' one && \\\n",
+            "git diff \\\n",
+            "  src/a.rs src/b.rs\n",
+            "echo $'tail\\'s; ok'\n",
+        ));
+        assert_eq!(segs, vec!["git diff    src/a.rs src/b.rs".to_string()]);
+
+        // Unsafe echo/printf (redirects, pipes, subshells) are NOT dropped as harmless banners.
+        let kept = extract_shell_segments_ignoring_echo(
+            "echo hi > out.txt; echo \"$(id)\"; echo ok | cat; printf -v x hi",
+        );
+        assert_eq!(kept.len(), 4, "{kept:?}");
+
+        let base = std::env::temp_dir().join(format!(
+            "ctx-hooks-multi-{}-{}",
+            std::process::id(),
+            now_ms_u64()
+        ));
+        let ws = base.join("repo");
+        let outside = base.join("outside.rs");
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(ws.join("src/a.rs"), "pub fn alpha() -> i32 { 1 }\n").unwrap();
+        fs::write(ws.join("src/b.rs"), "pub fn beta() -> i32 { 2 }\n").unwrap();
+        fs::write(ws.join(".env"), "API_KEY=secret\n").unwrap();
+        fs::write(&outside, "pub fn ext() {}\n").unwrap();
+
+        let svc = BrokerService::new_ephemeral_inproc(base.join("snap.bin"));
+        svc.allowlist.register_hint(&ws, true).unwrap();
+
+        // 1. Multiline `echo ...\ngit diff src/a.rs src/b.rs` and single `git diff src/a.rs` (no `--`) redirect!
+        assert_eq!(
+            detect_workspace_readonly_git(
+                &svc,
+                "echo \"=== DIFF ===\"\ngit diff src/a.rs src/b.rs",
+                Some(&ws),
+            )
+            .as_deref(),
+            Some("ctx git diff src/a.rs src/b.rs")
+        );
+        assert_eq!(
+            detect_workspace_readonly_git(&svc, "git diff src/a.rs", Some(&ws)).as_deref(),
+            Some("ctx git diff src/a.rs")
+        );
+        assert_eq!(
+            detect_workspace_readonly_git(&svc, "git diff --stat src", Some(&ws)).as_deref(),
+            Some("ctx git diff --stat src")
+        );
+        assert_eq!(
+            detect_workspace_readonly_git(&svc, "git diff HEAD src/a.rs", Some(&ws)).as_deref(),
+            Some("ctx git diff --rev HEAD src/a.rs")
+        );
+        assert_eq!(
+            detect_workspace_readonly_git(&svc, "echo \"=== LOG ===\" && git log -n 5", Some(&ws))
+                .as_deref(),
+            Some("ctx git log -n 5")
+        );
+
+        // 2. Mutating git flows, cwd shifts, rev ranges, sensitive/outside paths, and pipes MUST return None.
+        let outside_diff = format!("git diff {}", outside.display());
+        for pass_cmd in [
+            "git add src/a.rs && git status",
+            "git -C /other commit -m \"msg\" && git diff src/a.rs",
+            "git status && git push",
+            "git checkout main; git diff src/a.rs",
+            "git reset --hard && git status",
+            "cd src && git status",
+            "git -C /other status",
+            "git status --porcelain",
+            "git diff HEAD~1..HEAD",
+            "git diff HEAD main",
+            "git diff src/a.rs HEAD",
+            "git diff .env",
+            outside_diff.as_str(),
+            "git diff src/a.rs | grep alpha",
+            "git diff src/a.rs > out.patch",
+            "git status || true",
+        ] {
+            assert!(
+                detect_workspace_readonly_git(&svc, pass_cmd, Some(&ws)).is_none(),
+                "must NOT redirect `{pass_cmd}`"
+            );
+        }
+
+        // 3. Multiline `echo ...\ngrep` and `echo ... && rg` redirect on 1-Strike, then allow on Strike 2.
+        let mgrep = "echo \"=== CHECK ===\"\ngrep -rn alpha src/";
+        let gr1 = workspace_grep_redirect_reason(&svc, "agy", "agy:g1", mgrep, Some(&ws))
+            .expect("multiline grep must redirect on Strike 1");
+        assert!(gr1.contains("src:alpha"), "{gr1}");
+        assert!(
+            workspace_grep_redirect_reason(&svc, "agy", "agy:g1", mgrep, Some(&ws)).is_none(),
+            "multiline grep must pass on Strike 2"
+        );
+
+        let mrg = "echo \"=== RG ===\" && rg beta src/";
+        let rg1 = workspace_grep_redirect_reason(&svc, "agy", "agy:g2", mrg, Some(&ws))
+            .expect("echo && rg must redirect on Strike 1");
+        assert!(rg1.contains("src:beta"), "{rg1}");
+
+        // Piped or cwd-shifted grep stays unblocked.
+        assert!(
+            workspace_grep_redirect_reason(
+                &svc,
+                "agy",
+                "agy:g3",
+                "echo \"=== PIPE ===\"\ngrep -rn alpha src/ | head -n 5",
+                Some(&ws),
+            )
+            .is_none()
+        );
+        assert!(
+            workspace_grep_redirect_reason(
+                &svc,
+                "agy",
+                "agy:g4",
+                "cd /tmp && grep -rn alpha .",
+                Some(&ws),
+            )
+            .is_none()
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
